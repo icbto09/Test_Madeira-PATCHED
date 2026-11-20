@@ -30,6 +30,13 @@ Layout:
 Build:
 - `.github/workflows/build.yml`: the bundle's, with `runs-on: macos-26` and a "Select newest
   Xcode" step in place of the Madeira team's `xcode-27` machine, on all seven jobs.
+- `app/Madeira/MadeiraApp.swift`: the iOS 27 TV/AirPlay scene-accessory registration
+  (`registerSceneAccessory(UISceneAccessory.externalNonInteractive(...))`) is compiled only with
+  `-D MADEIRA_IOS27_SDK`. GitHub's newest Xcode (26.6, iOS 26.5 SDK) doesn't have that API. So
+  this build does not offer an external display on iOS 27 (log: `[display] TV accessory not
+  registered: this build was made without the iOS 27 SDK`).
+- `tests/host/check-control-presets.py`: its Swift harness calls `editorCanvas(canvasScreen,
+  top: 0)`. The nightly gave `editorCanvas` a `top:` parameter without updating this check.
 - `tools/build/build-shader-headers.sh`: asks the Metal compiler which form of
   `__metal_atomic_fetch_add_explicit` it accepts (GitHub's Xcode 26.6 defines the flag macro
   but takes four arguments, so the bundle's `#ifdef` picks the wrong form there).

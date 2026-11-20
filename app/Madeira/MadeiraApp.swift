@@ -140,8 +140,17 @@ enum ExternalDisplay {
         }
         let cfg = UISceneConfiguration(name: "External Display", sessionRole: .windowExternalDisplayNonInteractive)
         cfg.delegateClass = ExternalDisplaySceneDelegate.self
+        // Fork build: UISceneAccessory / registerSceneAccessory exist only in the iOS 27 SDK
+        // (Xcode 27). GitHub's runners have Xcode 26.x (iOS 26.5 SDK), where this line does not
+        // compile, so it is built only with -D MADEIRA_IOS27_SDK. Without it the external display
+        // (TV/AirPlay) is not offered on iOS 27.
+        #if MADEIRA_IOS27_SDK
         registration = vc.registerSceneAccessory(UISceneAccessory.externalNonInteractive(sceneConfiguration: cfg))
         LogStore.shared.log("[display] TV accessory registered (iOS 27)")
+        #else
+        _ = (vc, cfg)
+        LogStore.shared.log("[display] TV accessory not registered: this build was made without the iOS 27 SDK")
+        #endif
     }
 
     /// An external-display scene that connected before the delegate handled it.
