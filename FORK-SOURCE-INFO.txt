@@ -1,0 +1,44 @@
+Source for: Madeira Test 29 Nov 17.ipa (bundle id com.willfaust.madeora, build 90)
+Made: 2026-11-17 01:17 MST
+
+Madeira: branch test/test29b, commit 2134682c1286afcafbfd036ef0673b352379863e
+Submodules (commit, path):
+   2f610441c11cc30fc9b18b49808a2515e6619b46 FEX (heads/queue/t13-fex)
+   b3fb4b9feafcd8d91c5cb510a4775143fdbef02f FEX/External/Catch2 (b3fb4b9)
+   ee2ec5fd83dafce291024683b50dc89219333076 FEX/External/Vulkan-Headers (v1.4.362)
+   3e49836995c1dcb3df709440ad2f270b569c6a5f FEX/External/drm-headers (heads/v5.11-12-g3e49836)
+   c07e2aa4b130b4fd359a1c6455a5201b17af01fa FEX/External/fmt (c07e2aa)
+   8436195ad5e1bc347d9b39743af3d29abee59f06 FEX/External/jemalloc_glibc (5.2.1-51-g8436195)
+   ca1388fb9da8e69314dda222dc7b139ca84e092f FEX/External/range-v3 (0.12.0-47-gca1388f)
+   2dae74bb693e42d850fb0adcc9045c5b71fbdeae FEX/External/range-v3/doc/gh-pages (2dae74bb)
+   f7f3e0bd735c565f3a3e3ad0e47b42ea99c61798 FEX/External/rpmalloc (f7f3e0b)
+   650c98ece70da9e155e7ba1c2b3ee16004aae118 FEX/External/tracy (650c98e)
+   3234af2c03549bc85656bfd3a86993bf1cd8aef1 FEX/External/unordered_dense (3234af2)
+   6561d40650885ad24fbd0aa0cdb20ccb4808d444 FEX/External/vixl (6561d40)
+   e626a72bc2321cd320e953a0ccf1584cad60f363 FEX/External/xxhash (e626a72)
+   9bfadd6a55fc92dbd37fa3ba089bf8b36622df4f FEX/External/zydis (9bfadd6)
+   75a36c45ae1ad382b0f4e0ede0af84c11ee69928 FEX/External/zydis/dependencies/zycore (v1.5.2-7-g75a36c4)
+   9f94388a339fcbb0bc95c17768eb786c85988f6e FEX/Source/Common/cpp-optparse (heads/master)
+   0c5edfa966daacd8a1d3b70098466bc287934f3d dxmt (heads/queue/d3d9-draw-trace)
+   d08488fcc82eef313b0464db37d2955709691e94 dxmt/external/nvapi (d08488f)
+   9df86f2341616ef1888ae59919feaa6d4fad693d dxmt/include/native/directx (heads/main)
+   9ce5d634fd7c72ad32292d007d533de84beb6a56 madeira-dock (upstream-pr/10)
+   a25fc5fdb702f4c42158dc8bd3fbfed0adad889d wine (heads/queue/t29b-mirage)
+
+The files here are the working tree the IPA was built from, so they include these local
+changes on top of the commits above (diffs in local-changes/):
+   M app/Madeira/ConfigCatalog.generated.swift
+   M build/gnutls-ios/build.sh
+   M build/luajit-x64/build.sh
+   M build/win32u-unix/build.sh
+   M build/wineserver/build.sh
+   m dxmt
+   m madeira-dock
+   M tools/build/build-runtime-component.sh
+   M tools/build/build-wine.sh
+   M tools/build/runtime-components.py
+   m wine
+
+Left out: built libraries/DLLs/IPAs, FEX prebuilt test binaries, the private Get Help key.
+MoltenVK in the IPA comes from the official Madeira 0.2.0 release IPA (Apache-2.0).
+build-shims/ holds the scripts used to cross-build on Linux (WSL) with xtool.
