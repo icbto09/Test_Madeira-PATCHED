@@ -28,13 +28,10 @@ Layout:
   (an `rm -f` of the old archive, harmless on macOS).
 
 Build:
-- `.github/workflows/build.yml`: the bundle's, with `runs-on: macos-26` and a "Select newest
-  Xcode" step in place of the Madeira team's `xcode-27` machine, on all seven jobs.
-- `app/Madeira/MadeiraApp.swift`: the iOS 27 TV/AirPlay scene-accessory registration
-  (`registerSceneAccessory(UISceneAccessory.externalNonInteractive(...))`) is compiled only with
-  `-D MADEIRA_IOS27_SDK`. GitHub's newest Xcode (26.6, iOS 26.5 SDK) doesn't have that API. So
-  this build does not offer an external display on iOS 27 (log: `[display] TV accessory not
-  registered: this build was made without the iOS 27 SDK`).
+- `.github/workflows/build.yml`: the bundle's, on the same `xcode-27` runners (GitHub's Xcode 27
+  image), with an extra "Select newest Xcode" step and no submodule updates. An earlier build here
+  used `macos-26` (Xcode 26.6, iOS 26.5 SDK), which can't compile the iOS 27 TV/AirPlay code in
+  `MadeiraApp.swift`.
 - `tests/host/check-control-presets.py`: its Swift harness calls `editorCanvas(canvasScreen,
   top: 0)`. The nightly gave `editorCanvas` a `top:` parameter without updating this check.
 - `tools/build/build-shader-headers.sh`: asks the Metal compiler which form of
