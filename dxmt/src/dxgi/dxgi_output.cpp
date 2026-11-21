@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <numeric>
 #include <atomic>
+#include <cstring>
 #include "util_env.hpp"
 
 #include "com/com_guid.hpp"
@@ -137,6 +138,17 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
   }
 }
 
+static void ZeroTrailingDeviceName(WCHAR (&Name)[32]) {
+  for (size_t i = 0; i < 32; i++) {
+    if (Name[i] == L'\0') {
+      if (i + 1 < 32)
+        std::memset(&Name[i + 1], 0, (32 - i - 1) * sizeof(WCHAR));
+      return;
+    }
+  }
+  Name[31] = L'\0';
+}
+
 class MTLDXGIOutputImpl : public MTLDXGIOutput {
 public:
   MTLDXGIOutputImpl(IMTLDXGIAdapter *adapter, HMONITOR monitor, DxgiOptions &options)
@@ -197,6 +209,8 @@ public:
     if (pDesc == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
+    std::memset(pDesc, 0, sizeof(*pDesc));
+
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
       return E_FAIL;
@@ -207,9 +221,25 @@ public:
       return E_FAIL;
     }
 
+    ZeroTrailingDeviceName(pDesc->DeviceName);
     pDesc->AttachedToDesktop = 1;
-    pDesc->Rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
+    pDesc->Rotation = DXGI_MODE_ROTATION_IDENTITY;
     pDesc->Monitor = monitor_;
+
+    static std::atomic<unsigned> descLogs{0};
+    if (descLogs.fetch_add(1, std::memory_order_relaxed) < 4) {
+      char devName[33] = {};
+      for (size_t i = 0; i < 32 && pDesc->DeviceName[i]; i++) {
+        WCHAR ch = pDesc->DeviceName[i];
+        devName[i] = (ch >= 0x20 && ch < 0x7f) ? static_cast<char>(ch) : '?';
+      }
+      Logger::info(str::format("[dxgi-output-desc] dev=", devName,
+          " monitor=", monitor_,
+          " rc={", pDesc->DesktopCoordinates.left, ",", pDesc->DesktopCoordinates.top, ",",
+          pDesc->DesktopCoordinates.right, ",", pDesc->DesktopCoordinates.bottom, "}",
+          " attached=", pDesc->AttachedToDesktop,
+          " rot=", unsigned(pDesc->Rotation)));
+    }
     return S_OK;
   }
 
@@ -588,6 +618,8 @@ public:
     if (pDesc == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
+    std::memset(pDesc, 0, sizeof(*pDesc));
+
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
       return E_FAIL;
@@ -598,8 +630,9 @@ public:
       return E_FAIL;
     }
 
+    ZeroTrailingDeviceName(pDesc->DeviceName);
     pDesc->AttachedToDesktop = 1;
-    pDesc->Rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
+    pDesc->Rotation = DXGI_MODE_ROTATION_IDENTITY;
     pDesc->Monitor = monitor_;
     if (options_.forceSDR) {
       pDesc->BitsPerColor = 8;
