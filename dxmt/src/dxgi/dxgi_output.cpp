@@ -240,6 +240,29 @@ public:
           " attached=", pDesc->AttachedToDesktop,
           " rot=", unsigned(pDesc->Rotation)));
     }
+
+    if (descLogs.load(std::memory_order_relaxed) == 4) {
+      auto dumpHex = [](const char *tag, const uint8_t *p, size_t len) {
+        static const char hex[] = "0123456789abcdef";
+        for (size_t off = 0; off < len; off += 32) {
+          char line[32 * 3 + 1];
+          size_t chunk = (len - off < 32) ? (len - off) : 32;
+          for (size_t i = 0; i < chunk; i++) {
+            line[i * 3 + 0] = hex[p[off + i] >> 4];
+            line[i * 3 + 1] = hex[p[off + i] & 0xf];
+            line[i * 3 + 2] = ' ';
+          }
+          line[chunk * 3] = '\0';
+          Logger::info(str::format(tag, " +", off, ": ", line));
+        }
+      };
+      MEMORY_BASIC_INFORMATION mbi{};
+      if (VirtualQuery(reinterpret_cast<const void *>(0x154bfbb40), &mbi, sizeof(mbi)) &&
+          mbi.State == MEM_COMMIT) {
+        dumpHex("[fn-dump]", reinterpret_cast<const uint8_t *>(0x154bfbb40), 544);
+      }
+      dumpHex("[stk-dump]", reinterpret_cast<const uint8_t *>(pDesc) - 0x58, 96);
+    }
     return S_OK;
   }
 
