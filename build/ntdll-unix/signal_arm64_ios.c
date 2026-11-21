@@ -2235,6 +2235,43 @@ static uintptr_t ios_write_alias( uintptr_t addr )
     return ios_jit_anon_alias_lookup( addr );
 }
 
+/* Active temporarily-unprotected host page window for writable 4 KB siblings
+ * sharing a 16 KB host page with a VPROT_SMC_TRAP 4 KB sub-page.
+ * Touched ONLY on the single Mach exception-server thread. */
+static uintptr_t ios_smc_sib_active_lo, ios_smc_sib_active_hi;
+
+static uintptr_t ios_mach_write_alias( uintptr_t addr )
+{
+    uintptr_t rw = ios_write_alias( addr );
+    if (rw) return rw;
+    if (ios_smc_sib_active_lo && addr >= ios_smc_sib_active_lo && addr < ios_smc_sib_active_hi)
+        return addr;
+    return 0;
+}
+
+/* Exact byte width of single-register ARM64 stores so a store near the end of
+ * a writable 4 KB sub-page only escalates to the next 4 KB sub-page when its
+ * bytes actually cross the 4 KB boundary (never false-positives on STRB at +0xfff).
+ * Pairs (STP/CASP) validate every spanned 4 KB sub-page themselves via ios_alias_write. */
+static unsigned ios_smc_single_store_width( uint32_t insn )
+{
+    if ((insn & 0x3f200000u) == 0x38000000u ||     /* STR/STUR/STR(imm/reg) GPR */
+        (insn & 0x3ffffc00u) == 0x089ffc00u ||     /* STLR{B,H,W,X} */
+        (insn & 0x3fe00c00u) == 0x19000000u ||     /* STLUR{B,H,W,X} */
+        (insn & 0x3fe07c00u) == 0x08007c00u ||     /* STXR/STLXR */
+        (insn & 0x3f20fc00u) == 0x38208000u ||     /* SWP */
+        (insn & 0x3f20cc00u) == 0x38200000u ||     /* LD<OP> */
+        (insn & 0x3fa07c00u) == 0x08a07c00u)       /* CAS */
+        return 1u << ((insn >> 30) & 3u);
+    if ((insn & 0x3b000000u) == 0x3c000000u)       /* SIMD/FP STR/STUR */
+    {
+        unsigned sz = (insn >> 30) & 3u;
+        if (sz == 0 && (insn & 0x00800000u)) return 16u; /* Q-reg */
+        return 1u << sz;
+    }
+    return 0;
+}
+
 /* The writable alias is a host implementation detail, not permission to
  * bypass a guest protection fault. FEX removes logical write permission
  * while a guest page has cached translations. Let its normal exception
@@ -2281,7 +2318,7 @@ static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uin
     if (!size || size > MAX_STORE || addr > UINTPTR_MAX - (size - 1)) return 0;
     while (done < size)
     {
-        uintptr_t at = addr + done, rw = ios_write_alias( at );
+        uintptr_t at = addr + done, rw = ios_mach_write_alias( at );
         size_t length = PAGE - (at & (PAGE - 1));
         if (length > size - done) length = size - done;
         /* A store can cross a 4KB Wine protection boundary within one
@@ -2298,7 +2335,7 @@ static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uin
             return 0;
         }
         if (!rw || rw > UINTPTR_MAX - (length - 1) ||
-            ios_write_alias( at + length - 1 ) != rw + length - 1) return 0;
+            ios_mach_write_alias( at + length - 1 ) != rw + length - 1) return 0;
         destinations[count] = rw;
         lengths[count++] = length;
         done += length;
@@ -3225,8 +3262,8 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
         a = ea + done;
         if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
         part_rw[parts] = (rx && rw && len <= sz && a >= rx && a - rx <= sz - len)
-                         ? rw + (a - rx) : ios_write_alias( (uintptr_t)a );
-        if (part_rw[parts] && ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1)
+                         ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
+        if (part_rw[parts] && ios_mach_write_alias( a + len - 1 ) != part_rw[parts] + len - 1)
             return -1;
         if (part_rw[parts] && honor_guest_prot)
         {
@@ -5310,6 +5347,88 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p (wine prot %d) for the store at pc=%p errno=%d\n",
                                  (void *)ios_watch_page, watch_prot, (void *)(uintptr_t)fault_pc, errno );
                 }
+                /* Sub-page SMC sibling write: the 16 KB host page is PROT_READ
+                 * because another 4 KB sub-page has VPROT_SMC_TRAP, while this
+                 * 4 KB sub-page is logically writable. Temporarily unprotect the
+                 * host page (never PROT_EXEC), emulate the store, and re-arm. */
+                int smc_sib_hit = 0, was_smc_sib = 0;
+                uintptr_t smc_sib_hpage = 0, smc_sib_hpage2 = 0;
+                if (!rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                {
+                    extern int ios_page_has_smc_sibling( const void *addr );
+                    extern int ios_page_expected_prot( const void *addr );
+                    if (ios_page_has_smc_sibling( (const void *)fault_addr ))
+                    {
+                        int want = ios_page_expected_prot( (const void *)fault_addr );
+                        if (want > 0 && (want & PROT_WRITE))
+                        {
+                            uint32_t probe_insn = 0;
+                            unsigned sw;
+                            ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &probe_insn );
+                            sw = ios_smc_single_store_width( probe_insn );
+                            if (sw > 1 && (fault_addr & 0xfff) + sw > 0x1000)
+                            {
+                                uintptr_t next_4k = ((uintptr_t)fault_addr & ~(uintptr_t)0xfff) + 0x1000;
+                                if (ios_alias_write_is_trapped( next_4k ))
+                                {
+                                    fault_addr = next_4k;
+                                    goto dispatch_guest_fault;
+                                }
+                            }
+                            uintptr_t hp = (uintptr_t)fault_addr & ~(uintptr_t)0x3fff;
+                            if (mprotect( (void *)hp, 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                            {
+                                uintptr_t act_lo = hp, act_hi = hp + 0x4000;
+                                if ((fault_addr & 0x3fff) >= 0x3fe0)
+                                {
+                                    int nwant = ios_page_expected_prot( (const void *)(hp + 0x4000) );
+                                    if (nwant > 0 && (nwant & PROT_WRITE))
+                                    {
+                                        if (!ios_page_has_smc_sibling( (const void *)(hp + 0x4000) ))
+                                            act_hi = hp + 0x8000;
+                                        else if (mprotect( (void *)(hp + 0x4000), 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                                        {
+                                            smc_sib_hpage2 = hp + 0x4000;
+                                            act_hi = hp + 0x8000;
+                                        }
+                                    }
+                                }
+                                else if ((fault_addr & 0x3fff) < 0x20 && hp >= 0x4000)
+                                {
+                                    int pwant = ios_page_expected_prot( (const void *)(hp - 0x1000) );
+                                    if (pwant > 0 && (pwant & PROT_WRITE))
+                                    {
+                                        if (!ios_page_has_smc_sibling( (const void *)(hp - 0x4000) ))
+                                            act_lo = hp - 0x4000;
+                                        else if (mprotect( (void *)(hp - 0x4000), 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                                        {
+                                            smc_sib_hpage2 = hp - 0x4000;
+                                            act_lo = hp - 0x4000;
+                                        }
+                                    }
+                                }
+                                rw_addr = fault_addr;
+                                smc_sib_hit = 1;
+                                was_smc_sib = 1;
+                                smc_sib_hpage = hp;
+                                ios_smc_sib_active_lo = act_lo;
+                                ios_smc_sib_active_hi = act_hi;
+                            }
+                        }
+                    }
+                }
+#define IOS_SMC_SIB_CLEANUP() do { \
+    if (smc_sib_hit) { \
+        extern int ios_page_has_smc_sibling( const void *addr ); \
+        ios_smc_sib_active_lo = 0; \
+        ios_smc_sib_active_hi = 0; \
+        if (ios_page_has_smc_sibling( (const void *)smc_sib_hpage )) \
+            mprotect( (void *)smc_sib_hpage, 0x4000, PROT_READ ); \
+        if (smc_sib_hpage2 && ios_page_has_smc_sibling( (const void *)smc_sib_hpage2 )) \
+            mprotect( (void *)smc_sib_hpage2, 0x4000, PROT_READ ); \
+        smc_sib_hit = 0; \
+    } \
+} while (0)
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
                  * decode, and the two need opposite fixes. Without this the
@@ -5374,6 +5493,7 @@ static void *ios_mach_exception_thread( void *arg )
                     if (trapped_alias_logs++ < 16)
                         dprintf( 2, "[alias-protection] dispatching guest write fault pc=%llx addr=%llx\n",
                                  (unsigned long long)fault_pc, (unsigned long long)fault_addr );
+                    IOS_SMC_SIB_CLEANUP();
                     goto dispatch_guest_fault;
                 }
                 if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
@@ -5843,7 +5963,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
                                 part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
-                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                                 ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
                                 done += len;
@@ -5931,7 +6051,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
                                 part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
-                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                                 ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
                                 done += len;
@@ -6274,9 +6394,9 @@ static void *ios_mach_exception_thread( void *arg )
                         unsigned casp_width = (insn & 0x40000000u) ? 16 : 8;
                         uint64_t base = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
                                         rn == 29 ? state.__fp : state.__x[rn];
-                        uintptr_t casp_rw = ios_write_alias( (uintptr_t)base );
+                        uintptr_t casp_rw = ios_mach_write_alias( (uintptr_t)base );
                         if (fault_addr >= base && fault_addr - base < casp_width &&
-                            casp_rw && ios_write_alias( (uintptr_t)base + casp_width - 1 ) ==
+                            casp_rw && ios_mach_write_alias( (uintptr_t)base + casp_width - 1 ) ==
                                        casp_rw + casp_width - 1 &&
                             !(honor_guest_prot && ios_alias_write_is_trapped( (uintptr_t)base )) &&
                             ios_mach_emulate_casp( insn, casp_rw, state.__x ))
@@ -6289,6 +6409,7 @@ static void *ios_mach_exception_thread( void *arg )
                                          (unsigned long long)base, (unsigned long long)casp_rw );
                         }
                     }
+                    IOS_SMC_SIB_CLEANUP();
                     if (!emulated && alias_fault && honor_guest_prot)
                     {
                         fault_addr = alias_fault;
@@ -6325,6 +6446,16 @@ static void *ios_mach_exception_thread( void *arg )
                          * translation is NOT invalidated here (the ARM64EC path would call
                          * HandleRWXAccessViolation); this counter is what proves whether a
                          * page was filled AFTER its translation was compiled. */
+                        if (was_smc_sib)
+                        {
+                            static unsigned int smc_sib_emul_n;
+                            if (++smc_sib_emul_n <= 16)
+                                dprintf( STDERR_FILENO,
+                                         "[smc-subpage] emulated sibling write #%u pc=0x%llx insn=0x%08x addr=0x%llx\n",
+                                         smc_sib_emul_n, (unsigned long long)fault_pc, insn,
+                                         (unsigned long long)fault_addr );
+                        }
+                        if (!was_smc_sib)
                         {
                             extern void ios_jit_anon_alias_note_write( unsigned long long );
                             ios_jit_anon_alias_note_write( (unsigned long long)fault_addr );
@@ -6685,7 +6816,7 @@ wx_done: ;
                                 __sync_lock_release(&fc_lock);
                             }
                         }
-                        if (madeira_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
+                        if (!was_smc_sib && madeira_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
                         {   /* ml649: the readback below touches both aliases */
                             /* Verify dual-map sharing: read back via the RX
                              * (original) address and compare to what we wrote
@@ -6704,6 +6835,8 @@ wx_done: ;
                         }
                     }
                 }
+                IOS_SMC_SIB_CLEANUP();
+#undef IOS_SMC_SIB_CLEANUP
             }
 
             /* iOS-Madeira RECLAIM RECOVERY (FEX-2607 Thumper): a page that Wine/FEX
@@ -16008,8 +16141,10 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      * writes so it invalidates translated code before patching
                      * the RW alias. Healing here skips that invalidation and
                      * leaves CoreCLR repeatedly executing its old prestub. */
+                    extern int ios_page_has_smc_sibling( const void *addr );
                     int aliased = ios_write_alias( (uintptr_t)siginfo->si_addr ) != 0;
-                    int stripped = (is_write && (want & PROT_WRITE) && !aliased &&
+                    int smc_sib = ios_page_has_smc_sibling( siginfo->si_addr );
+                    int stripped = (is_write && (want & PROT_WRITE) && !aliased && !smc_sib &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                     ++wr_seen;
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
@@ -16018,6 +16153,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             wr_seen, siginfo->si_addr, pc, (unsigned long long)esr,
                             is_write, want, host_prot,
                             aliased ? "(intentional alias protection)" :
+                            smc_sib ? "(intentional SMC sub-page protection)" :
                             stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
                             wr_seen, wr_healed);
 
