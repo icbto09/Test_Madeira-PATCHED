@@ -152,6 +152,8 @@ static inline uint64_t IosNowNs() {
  * frontend (Module.cpp) which owns the thread registry. extern "C" so the
  * cross-layer reference has no namespace in its linkage name. */
 extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread);
+/* madeira kuser-remap: implemented in the ARM64EC frontend (IosJitAlias.cpp). */
+extern "C" int IosKuserWantsInsn(uint64_t Rip);
 #endif
 
 namespace FEXCore::Context {
@@ -1330,7 +1332,13 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+          Thread->OpDispatcher->SetIosKuserInsn(IosKuserWantsInsn(InstAddress) != 0);   // madeira kuser-remap
+#endif
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+          Thread->OpDispatcher->SetIosKuserInsn(false);
+#endif
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {

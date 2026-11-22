@@ -3918,6 +3918,80 @@ static void *ios_mach_exception_thread( void *arg )
              * legitimately own it. An address outside every registered window
              * falls through untouched, so non-sub-floor faults keep their exact
              * current ordering. */
+            /* madeira kuser-remap: env.MADEIRA_KUSER_REMAP = 1 hands a KUSER_SHARED_DATA read
+             * made by FEX-compiled code (pool PC) to FEX instead of emulating it here: FEX
+             * learns the guest instruction, recompiles it with the address translated inline,
+             * and resumes the guest at it (FEX ResetToConsistentState, IosKuserRemapFault). The
+             * delivery is the ordinary guest-exception path below (dispatch_guest_fault), as for
+             * any other JIT fault FEX handles. Each host PC is handed over at most 3 times; after
+             * that -- FEX gave up on the instruction, or something keeps faulting -- this handler
+             * emulates it as before, so the worst case is the old behaviour. */
+            if (!handled && req->exception == EXC_BAD_ACCESS && thread_teb &&
+                fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u)
+            {
+                static int kr_on = -1;
+                extern volatile int ios_fex_rip_resolved;
+                if (kr_on < 0)
+                {
+                    const char *e = getenv( "MADEIRA_KUSER_REMAP" );
+                    kr_on = (e && e[0] == '1') ? 1 : 0;
+                    if (kr_on)
+                        dprintf( 2, "[kuser-remap] MADEIRA_KUSER_REMAP=1: KUSER_SHARED_DATA reads from JIT code go to FEX "
+                                    "(learn + recompile), at most 3 times per site, then emulated here\n" );
+                }
+                if (kr_on && ios_fex_rip_resolved)
+                {
+                    extern void *ios_jit_rx_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uintptr_t kr_rx = (uintptr_t)ios_jit_rx_base_global;
+                    size_t kr_sz = ios_jit_pool_size_global;
+                    uint64_t kr_pc = (uint64_t)__darwin_arm_thread_state64_get_pc( state );
+                    if ((kr_rx && kr_pc >= kr_rx && kr_pc < kr_rx + kr_sz) || ios_jit_low_contains( (uintptr_t)kr_pc ))
+                    {
+                        /* Only this (single) Mach exception thread touches the table. */
+                        enum { KR_SLOTS = 8192 };
+                        static uint64_t kr_pcs[KR_SLOTS];
+                        static unsigned char kr_cnt[KR_SLOTS];
+                        static unsigned kr_used, kr_deferred, kr_capped;
+                        unsigned kr_i = (unsigned)((kr_pc >> 2) * 0x9E3779B1u) & (KR_SLOTS - 1), kr_n;
+                        int kr_defer = 0;
+
+                        for (kr_n = 0; kr_n < KR_SLOTS; kr_n++, kr_i = (kr_i + 1) & (KR_SLOTS - 1))
+                        {
+                            if (kr_pcs[kr_i] == kr_pc) break;
+                            if (!kr_pcs[kr_i])
+                            {
+                                if (kr_used >= KR_SLOTS * 3 / 4) { kr_n = KR_SLOTS; break; }   /* full: stop handing over */
+                                kr_pcs[kr_i] = kr_pc;
+                                kr_used++;
+                                break;
+                            }
+                        }
+                        if (kr_n < KR_SLOTS)
+                        {
+                            if (kr_cnt[kr_i] < 3) { kr_cnt[kr_i]++; kr_defer = 1; }
+                            else if (kr_cnt[kr_i] == 3)
+                            {
+                                kr_cnt[kr_i] = 4;
+                                kr_capped++;
+                                if (kr_capped <= 16 || !(kr_capped & (kr_capped - 1)))
+                                    dprintf( 2, "[kuser-remap] pc=%#llx addr=%#llx handed to FEX 3 times: emulated here from now on "
+                                                "(%u sites so far)\n", (unsigned long long)kr_pc,
+                                             (unsigned long long)fault_addr, kr_capped );
+                            }
+                        }
+                        if (kr_defer)
+                        {
+                            kr_deferred++;
+                            if (kr_deferred <= 16 || !(kr_deferred & (kr_deferred - 1)))
+                                dprintf( 2, "[kuser-remap] #%u pc=%#llx addr=%#llx -> FEX (%u sites seen)\n", kr_deferred,
+                                         (unsigned long long)kr_pc, (unsigned long long)fault_addr, kr_used );
+                            goto dispatch_guest_fault;
+                        }
+                    }
+                }
+            }
+
             if (!handled && req->exception == EXC_BAD_ACCESS)
             {
                 /* ml1205: the faulting thread's own process decides the window */

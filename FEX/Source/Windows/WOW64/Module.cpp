@@ -2255,4 +2255,12 @@ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr) {
 extern "C" int IosSubfloorWindowForCode(uint64_t, uint64_t*, uint64_t*, uint64_t*) {
   return 0;
 }
+/* madeira kuser-remap: the 32-bit view keeps KUSER_SHARED_DATA mapped at 0x7ffe0000 inside its
+ * own window, so there is nothing to learn or translate here. */
+extern "C" int IosKuserWindow(uint64_t*, uint64_t*, uint64_t*) {
+  return 0;
+}
+extern "C" int IosKuserWantsInsn(uint64_t) {
+  return 0;
+}
 #endif
