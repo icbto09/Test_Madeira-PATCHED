@@ -10734,8 +10734,12 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * invalidation are fixed by re-execution and were free retries under
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
-     * Single server thread services all messages: no atomics needed. */
-    if (!is_align)
+     * Single server thread services all messages: no atomics needed.
+     * madeira kuser-remap: a KUSER_SHARED_DATA read only gets here when the Mach
+     * handler handed it to FEX on purpose, once per site; it is not a race, and the
+     * retry is emulated by the Mach handler, so it must be dispatched the FIRST time
+     * (with the debounce, FEX never saw one: log 2026-11-22 14:04). */
+    if (!is_align && !(fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u))
     {
         static struct { uint64_t key; uint32_t n; } rep[16];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
