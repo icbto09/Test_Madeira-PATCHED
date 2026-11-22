@@ -525,6 +525,19 @@ static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static int g_lzlib = -1;   /* madeira-bcd pso-lazy-libs, see mad_lzlib_on */
 static volatile LONG g_lzlib_dropped, g_lzlib_kept, g_lzlib_restored, g_lzlib_failed;
+/* madeira pso-evict-idle / pso-mem-log (opt-in), see mad_ev_tick */
+struct mad_pso;
+static int g_ev = -1;                        /* pso-evict-idle seconds, 0 = off, -1 = not read yet */
+static int g_pml = -1;                       /* pso-mem-log */
+static volatile LONG g_ev_now = 1;           /* seconds since the first present + 1; stamped on a pipeline at each use */
+static SRWLOCK g_ev_replay = SRWLOCK_INIT;   /* every list replay holds it shared; a scan only TRIES it exclusive */
+static volatile LONG g_pm_psos, g_pm_rps, g_pm_var, g_pm_cps;   /* pipeline objects alive; built render / variant / compute states */
+static volatile LONG g_ev_evicted_r, g_ev_evicted_c, g_ev_evicted_libs, g_ev_rebuilt, g_ev_scans, g_ev_busy, g_ev_unshared;
+static void mad_ev_config(void);
+static void mad_ev_note_built(struct mad_pso *p);
+static void mad_ev_forget(struct mad_pso *p);
+static void mad_ev_tick(void);
+#define MAD_EV_STAMP(p_) do { if (g_ev > 0 && (p_)->ev_last != g_ev_now) (p_)->ev_last = g_ev_now; } while (0)
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
@@ -1131,6 +1144,12 @@ static void mad_acct_report(void) {
         d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), %ld read "
                   "them back at first use (%ld failed)\n", (long)g_lzlib_dropped, (long)g_lzlib_kept, (long)g_lzlib_restored,
                   (long)g_lzlib_failed);
+    if (g_ev > 0 || g_pml > 0)   /* madeira pso-evict-idle / pso-mem-log */
+        d3d12_log("[pso-evict] session: %ld render and %ld compute pipelines let go (%ld with their shader libraries, %ld shared-table "
+                  "entries), %ld built again; %ld scans, %ld waited for a replay. Alive now: %ld pipelines, %ld render + %ld variant "
+                  "+ %ld compute states built\n", (long)g_ev_evicted_r, (long)g_ev_evicted_c, (long)g_ev_evicted_libs,
+                  (long)g_ev_unshared, (long)g_ev_rebuilt, (long)g_ev_scans, (long)g_ev_busy, (long)g_pm_psos, (long)g_pm_rps,
+                  (long)g_pm_var, (long)g_pm_cps);
 }
 static void mad_smpdesc_put(UINT64 id, UINT filter, UINT au, UINT av, UINT aw, UINT aniso, UINT cmp, UINT border,
                             float minlod, float maxlod, float bias) {   /* madeira-bcd: see g_smpdesc */
@@ -1376,6 +1395,13 @@ struct mad_pso {
     struct madeira_ir_air_range *ps_air;
     struct mad_tess *tess;                          /* ml1083: hull/domain as an object/mesh pipeline, NULL if not built */
     struct mad_tess *tess_strip;                    /* ml1147b: a DXBC geometry pipeline's STRIP-topology variant */
+    /* madeira pso-evict-idle: on the list of built lazy pipelines while it holds a
+     * Metal pipeline (mad_ev_note_built); ev_last = g_ev_now at its last draw,
+     * dispatch or build; ev_count = times its Metal objects were let go.
+     * pm_r / pm_c: rps / cps is counted in the pso-mem-log census. */
+    struct mad_pso *ev_prev, *ev_next; int ev_in;
+    volatile LONG ev_last; LONG ev_count;
+    UINT8 pm_r, pm_c;
 };
 
 /* ml1083: TESSELLATION.
@@ -6225,6 +6251,7 @@ static enum WMTPrimitiveType mad_prim(D3D12_PRIMITIVE_TOPOLOGY t) {
 static volatile LONG g_pso_lazy_built, g_pso_lazy_failed;
 static int mad_lzlib_restore(struct mad_pso *p);   /* madeira-bcd pso-lazy-libs */
 static obj_handle_t mad_pso_realize(struct mad_pso *p) {
+    int built_now = 0;   /* madeira pso-evict-idle */
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
     if (!p->rps && p->lazy) {
@@ -6234,6 +6261,7 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
             built = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
                               : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
         if (built) { MemoryBarrier(); p->rps = built; }   /* pso-async: draws on other threads read rps without the lock */
+        if (built) { built_now = 1; p->pm_r = 1; InterlockedIncrement(&g_pm_rps); }   /* madeira pso-mem-log */
         if (err) mad_log_nserror(p->vs_name, err);
         InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
@@ -6248,10 +6276,12 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
         }
     }
     ReleaseSRWLockExclusive(&p->rlock);
+    if (built_now) mad_ev_note_built(p);   /* madeira pso-evict-idle: on the list, stamped as just used */
     return p->rps;
 }
 
 static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
+    int built_now = 0;   /* madeira pso-evict-idle */
     if (p->cps || !p->lazy_cs) return p->cps;
     AcquireSRWLockExclusive(&p->rlock);
     if (!p->cps && p->lazy_cs) {
@@ -6266,9 +6296,10 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy_cs = 0;   /* dispatches with it are skipped from now on */
             if (n <= 8) d3d12_log("[madeira-d3d12] lazy compute pipeline failed at first dispatch (%s); its dispatches are skipped\n", p->vs_name);
-        } else InterlockedIncrement(&g_pso_lazy_built);
+        } else { InterlockedIncrement(&g_pso_lazy_built); built_now = 1; p->pm_c = 1; InterlockedIncrement(&g_pm_cps); }
     }
     ReleaseSRWLockExclusive(&p->rlock);
+    if (built_now) mad_ev_note_built(p);   /* madeira pso-evict-idle */
     return p->cps;
 }
 
@@ -6477,7 +6508,8 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides[16
                                   strides[0], p->vb_stride[0], strides[1]);
         LeaveCriticalSection(&p->var_lock); return p->rps;
     }
-    if (p->nvar < 8) { memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++; }
+    if (p->nvar < 8) { memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++;
+                       InterlockedIncrement(&g_pm_var); }   /* madeira pso-mem-log */
     else { NSObject_release(p->var[0].rps); memmove(&p->var[0], &p->var[1], sizeof p->var[0] * 7);
            memcpy(p->var[7].strides, strides, sizeof p->var[0].strides); p->var[7].rps = rps; }
     if (said < 8) { said++; d3d12_log("[madeira-d3d12] pipeline stride variant built (%u variants cached)\n", p->nvar); }
@@ -8603,6 +8635,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
+    MAD_EV_STAMP(e->pso);   /* madeira pso-evict-idle: in use */
     if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution */
         if (mad_fault_skip_pso(e->pso)) { MAD_SKIP(e); return; }
         mad_fault_note(e, e->pso);
@@ -9970,6 +10003,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
+    MAD_EV_STAMP(e->cpso);   /* madeira pso-evict-idle: in use */
     /* ml930: pre-dispatch captures FIRST. exec_capture_cs blits through
      * exec_begin_blit, which ends every open encoder; doing it after the
      * compute encoder was created left e->cenc = 0 and the dispatch encoded
@@ -10593,7 +10627,11 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         }
         if (rp_k.renc && l != rp_want) mad_rp_close(q);   /* madeira-bcd rp-carry: handed to a list that is not this one */
         q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next; q->rp_idx = i;
-        if (l) mad_exec_list(q, l, q->open_cb);   /* times itself */
+        if (l) {   /* madeira pso-evict-idle: no pipeline is let go while a list is replayed (mad_ev_scan) */
+            AcquireSRWLockShared(&g_ev_replay);
+            mad_exec_list(q, l, q->open_cb);   /* times itself */
+            ReleaseSRWLockShared(&g_ev_replay);
+        }
         if (rs) rs_t = mad_tick();
         q->open_lists++;
         q->executed++;
@@ -15557,6 +15595,11 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
     struct mad_pso *p = (struct mad_pso *)T;
     LONG n = InterlockedDecrement(&p->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
+        mad_ev_forget(p);   /* madeira pso-evict-idle: off the list before it goes */
+        InterlockedDecrement(&g_pm_psos);   /* madeira pso-mem-log */
+        if (p->pm_r) InterlockedDecrement(&g_pm_rps);
+        if (p->pm_c) InterlockedDecrement(&g_pm_cps);
+        if (p->nvar) InterlockedExchangeAdd(&g_pm_var, -(LONG)p->nvar);
         if (p->rps) NSObject_release(p->rps);
         { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
@@ -18114,6 +18157,288 @@ static int mad_lzlib_restore(struct mad_pso *p) {
     return 1;
 }
 
+/* madeira pso-evict-idle (madeira.cfg or the game's own file, off by default)
+ * and pso-mem-log.
+ *
+ * pso-lazy builds a pipeline at its first draw and pso-lazy-libs keeps its
+ * shader libraries out of memory until then, but once a pipeline has been drawn
+ * its Metal pipeline state, its stride variants and its libraries stay until the
+ * game releases the pipeline, which most engines never do: a game that streams
+ * new areas and cutscenes keeps every pipeline it ever drew. This is the
+ * Direct3D 12 counterpart of the MoltenVK patches 0001/0002 that got Detroit:
+ * Become Human through its shader compile: with pso-evict-idle = N, a lazy
+ * pipeline not drawn or dispatched for N seconds lets its Metal pipeline objects
+ * go, and with pso-lazy-libs = 1 also its shader libraries when their
+ * shader-cache files are still there; its next draw builds it again through
+ * mad_pso_realize exactly as its first draw did (with pso-async, in the
+ * background while its draws are skipped).
+ *
+ * Safety. A draw reads p->rps more than once without a lock, so pipelines are
+ * let go only while no command list is replayed: every replay holds g_ev_replay
+ * shared, and a scan (from Present) only TRIES it exclusive and waits for a
+ * later frame when a replay is running. Nothing ever blocks on it exclusive, so
+ * it cannot deadlock. The scan takes its own reference to each candidate first
+ * and checks the shader-cache files with no lock held. The Metal objects it lets
+ * go wait MAD_EV_RETIRE_MS on a retire list before they are released: command
+ * buffers retain what they encode, and a pipeline idle for N seconds is in no
+ * command buffer submitted in that time, so this is a second margin.
+ * Only plain lazy pipelines (no geometry or tessellation emulation) qualify.
+ * pso-evict-headroom-mb = M: scan only while iOS reports less than M MB left.
+ * pso-mem-log = 1: a [pso-mem] census line every 10 s. */
+#define MAD_EV_SCAN_MS 2000
+#define MAD_EV_RETIRE_MS 5000
+#define MAD_EV_BUDGET 256
+static int g_ev_headroom;
+static SRWLOCK g_ev_list_lock = SRWLOCK_INIT;
+static struct mad_pso *g_ev_head;
+static LONG g_ev_listed;
+struct mad_ev_ret { obj_handle_t h; DWORD t; };
+static struct mad_ev_ret *g_ev_ret; static SIZE_T g_ev_ret_n, g_ev_ret_cap;
+static SRWLOCK g_ev_ret_lock = SRWLOCK_INIT;
+static void mad_ev_config(void) {
+    long long s, h; int pml;
+    if (g_ev >= 0) return;
+    s = mad_cfg_int_pe("pso-evict-idle", 0);   /* Default 0 (off). N seconds: a Direct3D 12 pipeline not drawn for N s lets its Metal pipeline go and is built again at its next draw; with pso-lazy-libs = 1 its shader libraries too. 5-3600. [pso-evict] lines */
+    h = mad_cfg_int_pe("pso-evict-headroom-mb", 0);   /* With pso-evict-idle: let idle pipelines go only while iOS reports less than this many MB left before the memory limit. 0 (default): whenever they are idle */
+    pml = mad_cfg_int_pe("pso-mem-log", 0) ? 1 : 0;   /* 1: every 10 s a [pso-mem] line counts the Direct3D 12 pipelines and shader libraries held, with the memory footprint. Default 0 */
+    if (s < 0) s = 0;
+    if (s > 0 && s < 5) s = 5;
+    if (s > 3600) s = 3600;
+    g_ev_headroom = h > 0 ? (int)h : 0;
+    g_pml = pml;
+    MemoryBarrier();
+    g_ev = (int)s;
+    if (s)
+        d3d12_log("[pso-evict] pso-evict-idle = %lld: pipelines idle for %lld s let their Metal pipelines go%s%s; "
+                  "built again at their next use\n", s, s,
+                  g_lzlib > 0 || mad_lzlib_on() ? " and their shader libraries (pso-lazy-libs)" : " (shader libraries kept: pso-lazy-libs is off)",
+                  g_ev_headroom ? "" : ", whatever the memory headroom");
+    if (s && g_ev_headroom) d3d12_log("[pso-evict] only while less than %d MB are left (pso-evict-headroom-mb)\n", g_ev_headroom);
+    if (s && !mad_pso_lazy_on()) d3d12_log("[pso-evict] pso-lazy = 0: pipelines are built at creation, so none can be let go\n");
+    if (pml) d3d12_log("[pso-mem] pso-mem-log = 1: a census of pipelines and shader libraries every 10 s\n");
+}
+/* phys_footprint and what iOS leaves before the limit, in MB (winemetal op 7). */
+static int mad_ev_mem(UINT64 *foot_mb, UINT64 *avail_mb) {
+    struct madeira_ctl_args a;
+    memset(&a, 0, sizeof a); a.op = 7;
+    MadeiraCtl(&a);
+    if (!a.ret) return 0;
+    *foot_mb = a.ptr >> 20; *avail_mb = a.len >> 20;
+    return 1;
+}
+static void mad_ev_unlink(struct mad_pso *p) {   /* g_ev_list_lock held exclusive */
+    if (!p->ev_in) return;
+    if (p->ev_prev) p->ev_prev->ev_next = p->ev_next; else g_ev_head = p->ev_next;
+    if (p->ev_next) p->ev_next->ev_prev = p->ev_prev;
+    p->ev_prev = p->ev_next = NULL; p->ev_in = 0; g_ev_listed--;
+}
+/* A lazy pipeline just got its Metal pipeline (mad_pso_realize / mad_cpso_realize). */
+static void mad_ev_note_built(struct mad_pso *p) {
+    p->ev_last = g_ev_now;
+    if (p->ev_count) InterlockedIncrement(&g_ev_rebuilt);
+    if (g_ev <= 0) return;
+    AcquireSRWLockExclusive(&g_ev_list_lock);
+    if (!p->ev_in) {
+        p->ev_prev = NULL; p->ev_next = g_ev_head;
+        if (g_ev_head) g_ev_head->ev_prev = p;
+        g_ev_head = p; p->ev_in = 1; g_ev_listed++;
+    }
+    ReleaseSRWLockExclusive(&g_ev_list_lock);
+}
+/* pso_Release, last reference: a scan that holds the list lock finishes with p first. */
+static void mad_ev_forget(struct mad_pso *p) {
+    if (g_ev <= 0) return;   /* nothing is listed unless the switch was on when it was built */
+    AcquireSRWLockExclusive(&g_ev_list_lock);
+    mad_ev_unlink(p);
+    ReleaseSRWLockExclusive(&g_ev_list_lock);
+}
+static void mad_ev_retire(obj_handle_t h, DWORD now) {
+    if (!h) return;
+    AcquireSRWLockExclusive(&g_ev_ret_lock);
+    if (g_ev_ret_n == g_ev_ret_cap) {
+        SIZE_T nc = g_ev_ret_cap ? g_ev_ret_cap * 2 : 1024;
+        struct mad_ev_ret *nw = realloc(g_ev_ret, nc * sizeof *nw);
+        if (nw) { g_ev_ret = nw; g_ev_ret_cap = nc; }
+    }
+    if (g_ev_ret_n < g_ev_ret_cap) { g_ev_ret[g_ev_ret_n].h = h; g_ev_ret[g_ev_ret_n].t = now; g_ev_ret_n++; h = 0; }
+    ReleaseSRWLockExclusive(&g_ev_ret_lock);
+    if (h) NSObject_release(h);   /* no room on the list: it was idle anyway */
+}
+/* Releases what waited MAD_EV_RETIRE_MS; logs the footprint around a large batch. */
+static void mad_ev_reap(DWORD now) {
+    static unsigned said;
+    SIZE_T i, k = 0; LONG n = 0;
+    UINT64 f0 = 0, a0 = 0, f1 = 0, a1 = 0;
+    int big, m0 = 0;
+    obj_handle_t pool;
+    AcquireSRWLockExclusive(&g_ev_ret_lock);
+    for (i = 0; i < g_ev_ret_n && now - g_ev_ret[i].t >= MAD_EV_RETIRE_MS; i++) n++;
+    big = n >= 64 && (said < 16 || !(said % 25));
+    if (big) m0 = mad_ev_mem(&f0, &a0);
+    pool = n ? NSAutoreleasePool_alloc_init() : 0;
+    for (i = 0; i < g_ev_ret_n; i++) {
+        if (now - g_ev_ret[i].t >= MAD_EV_RETIRE_MS) NSObject_release(g_ev_ret[i].h);
+        else g_ev_ret[k++] = g_ev_ret[i];
+    }
+    g_ev_ret_n = k;
+    if (pool) NSObject_release(pool);
+    ReleaseSRWLockExclusive(&g_ev_ret_lock);
+    if (n >= 64) said++;
+    if (big && m0 && mad_ev_mem(&f1, &a1))
+        d3d12_log("[pso-evict] released %ld Metal objects: footprint %llu -> %llu MB (%+lld MB), %llu MB left\n", (long)n,
+                  (unsigned long long)f0, (unsigned long long)f1, (long long)f1 - (long long)f0, (unsigned long long)a1);
+}
+static int mad_ev_cmp_h(const void *a, const void *b) {
+    obj_handle_t x = *(const obj_handle_t *)a, y = *(const obj_handle_t *)b;
+    return x < y ? -1 : x > y;
+}
+/* The shared-library table keeps one reference to every library it holds, so a
+ * library an evicted pipeline let go is only freed once its entry goes too.
+ * Entries are taken out in one pass and the table is rebuilt (linear probing has
+ * no deletion of its own). A pipeline still using one keeps its own reference;
+ * a later read-back of the same stage then makes a library of its own. */
+static LONG mad_ev_unshare(obj_handle_t *libs, SIZE_T n, DWORD now) {
+    SIZE_T i, cap; LONG removed = 0;
+    struct mad_libshare *old, *nw;
+    if (!n) return 0;
+    qsort(libs, n, sizeof *libs, mad_ev_cmp_h);
+    AcquireSRWLockExclusive(&g_libshare_lock);
+    old = g_libshare; cap = g_libshare_cap;
+    for (i = 0; old && i < cap; i++)
+        if (old[i].lib && bsearch(&old[i].lib, libs, n, sizeof *libs, mad_ev_cmp_h)) {
+            mad_ev_retire(old[i].fn, now); mad_ev_retire(old[i].lib, now);
+            old[i].lib = old[i].fn = 0; old[i].k0 = old[i].k1 = 0;
+            removed++;
+        }
+    if (removed && (nw = calloc(cap, sizeof *nw))) {   /* without memory the holes only turn later lookups into misses */
+        g_libshare = nw;
+        for (i = 0; i < cap; i++) if (old[i].lib) *mad_libshare_slot(old[i].k0, old[i].k1) = old[i];
+        free(old);
+    }
+    g_libshare_n -= (SIZE_T)removed;
+    ReleaseSRWLockExclusive(&g_libshare_lock);
+    return removed;
+}
+/* One pipeline, with g_ev_replay held exclusive and the list lock held: 1 let
+ * go, 0 busy (another thread holds it; next scan), -1 not one this can let go. */
+static int mad_ev_evict(struct mad_pso *p, DWORD now, int libs_ok, obj_handle_t *libs, SIZE_T *nl) {
+    unsigned k;
+    if (!TryAcquireSRWLockExclusive(&p->rlock)) return 0;
+    if (p->is_compute ? (!p->lazy_cs || !p->cps)
+                      : (!p->lazy || !p->rps || p->tess || p->tess_strip || p->gs_emu || p->has_tess)) {
+        ReleaseSRWLockExclusive(&p->rlock);
+        return -1;
+    }
+    if (!p->is_compute && p->has_vd && !TryEnterCriticalSection(&p->var_lock)) { ReleaseSRWLockExclusive(&p->rlock); return 0; }
+    if (p->is_compute) {
+        mad_ev_retire(p->cps, now); p->cps = 0;
+        if (p->pm_c) { p->pm_c = 0; InterlockedDecrement(&g_pm_cps); }
+    } else {
+        mad_ev_retire(p->rps, now); p->rps = 0;
+        if (p->pm_r) { p->pm_r = 0; InterlockedDecrement(&g_pm_rps); }
+        for (k = 0; k < p->nvar; k++) { mad_ev_retire(p->var[k].rps, now); p->var[k].rps = 0; }
+        if (p->nvar) InterlockedExchangeAdd(&g_pm_var, -(LONG)p->nvar);
+        p->nvar = 0;
+        if (p->has_vd) LeaveCriticalSection(&p->var_lock);
+    }
+    InterlockedExchange(&p->async_q, 0);   /* pso-async: its next draw queues it again */
+    if (libs_ok && !p->lz && p->vs_fn && (!p->lz_has_ps || p->ps_fn)) {   /* pso-lazy-libs: back from the cache at the next use */
+        libs[(*nl)++] = p->vs_lib;
+        if (p->ps_lib) libs[(*nl)++] = p->ps_lib;
+        mad_ev_retire(p->vs_fn, now); mad_ev_retire(p->vs_lib, now);
+        mad_ev_retire(p->ps_fn, now); mad_ev_retire(p->ps_lib, now);
+        p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
+        if (!p->is_compute) p->rp.vertex_function = p->rp.fragment_function = 0;
+        p->lz = 1;
+        InterlockedIncrement(&g_ev_evicted_libs);
+    }
+    p->ev_count++;
+    InterlockedIncrement(p->is_compute ? &g_ev_evicted_c : &g_ev_evicted_r);
+    ReleaseSRWLockExclusive(&p->rlock);
+    return 1;
+}
+static void mad_ev_scan(DWORD now) {
+    static unsigned said;
+    struct mad_pso *cand[MAD_EV_BUDGET], *p;
+    UINT8 libs_ok[MAD_EV_BUDGET];
+    obj_handle_t libs[2 * MAD_EV_BUDGET];
+    SIZE_T nc = 0, nl = 0, i;
+    LONG cutoff = g_ev_now - g_ev, got = 0, got_libs = 0, unshared = 0, r;
+    UINT64 foot = 0, avail = 0;
+    int have_mem;
+    if (cutoff <= 0) return;
+    have_mem = mad_ev_mem(&foot, &avail);
+    if (g_ev_headroom > 0 && have_mem && avail >= (UINT64)g_ev_headroom) return;
+    /* 1: candidates, each with a reference of ours; a pipeline whose last
+     * reference is going (refs 0, pso_Release waiting for this lock) is left alone */
+    AcquireSRWLockShared(&g_ev_list_lock);
+    for (p = g_ev_head; p && nc < MAD_EV_BUDGET; p = p->ev_next) {
+        if (p->ev_last > cutoff) continue;
+        do r = p->refs; while (r > 0 && InterlockedCompareExchange(&p->refs, r + 1, r) != r);
+        if (r > 0) cand[nc++] = p;
+    }
+    ReleaseSRWLockShared(&g_ev_list_lock);
+    if (!nc) return;
+    InterlockedIncrement(&g_ev_scans);
+    /* 2: can the libraries be read back? File system, no lock held */
+    for (i = 0; i < nc; i++) {
+        p = cand[i];
+        libs_ok[i] = g_lzlib > 0 && !p->lz && (p->lz_vs_key[0] | p->lz_vs_key[1]) && mad_sc_exists(p->lz_vs_key) &&
+                     (!p->lz_has_ps || mad_sc_exists(p->lz_ps_key));
+    }
+    /* 3: only while no list is replayed */
+    if (TryAcquireSRWLockExclusive(&g_ev_replay)) {
+        AcquireSRWLockExclusive(&g_ev_list_lock);
+        for (i = 0; i < nc; i++) {
+            p = cand[i];
+            if (!p->ev_in || p->ev_last > cutoff) continue;   /* drawn since step 1 */
+            {
+                SIZE_T nl0 = nl;
+                r = mad_ev_evict(p, now, libs_ok[i], libs, &nl);
+                if (nl != nl0) got_libs++;
+            }
+            if (r) mad_ev_unlink(p);
+            if (r > 0) got++;
+        }
+        ReleaseSRWLockExclusive(&g_ev_list_lock);
+        ReleaseSRWLockExclusive(&g_ev_replay);
+        if (nl) { unshared = mad_ev_unshare(libs, nl, now); InterlockedExchangeAdd(&g_ev_unshared, unshared); }
+    } else InterlockedIncrement(&g_ev_busy);
+    for (i = 0; i < nc; i++) pso_Release((ID3D12PipelineState *)cand[i]);   /* ours; may be the last */
+    if (got && (said++ < 8 || !(said % 50)))
+        d3d12_log("[pso-evict] t+%lds: let go of %ld pipelines idle %d s or more (%ld with libraries, %ld shared-table entries); "
+                  "%ld others still built; so far %ld render + %ld compute let go, %ld built again; footprint %llu MB, %llu MB left\n",
+                  (long)g_ev_now - 1, (long)got, g_ev, (long)got_libs, (long)unshared,
+                  (long)g_ev_listed, (long)g_ev_evicted_r, (long)g_ev_evicted_c, (long)g_ev_rebuilt,
+                  (unsigned long long)foot, (unsigned long long)avail);
+}
+static void mad_pm_log(void) {
+    UINT64 foot = 0, avail = 0;
+    int have = mad_ev_mem(&foot, &avail);
+    LONG64 lib_mb = g_lib_count ? (LONG64)((g_lib_bytes / g_lib_count) * (LONG64)g_libshare_n) >> 20 : 0;
+    d3d12_log("[pso-mem] t+%lds: %ld pipelines, built: %ld render + %ld stride variants + %ld compute; shared libraries %lu "
+              "(~%lld MB metallib); created so far %ld libraries (%lld MB); let go %ld, built again %ld; footprint %s%llu MB, %llu MB left\n",
+              (long)g_ev_now - 1, (long)g_pm_psos, (long)g_pm_rps, (long)g_pm_var, (long)g_pm_cps, (unsigned long)g_libshare_n,
+              (long long)lib_mb, (long)g_lib_count, (long long)(g_lib_bytes >> 20), (long)(g_ev_evicted_r + g_ev_evicted_c),
+              (long)g_ev_rebuilt, have ? "" : "? ", (unsigned long long)foot, (unsigned long long)avail);
+}
+/* Once a frame, from mad_present_run. */
+static void mad_ev_tick(void) {
+    static SRWLOCK tick = SRWLOCK_INIT;
+    static DWORD t0, last_scan, last_log;
+    DWORD now;
+    mad_ev_config();
+    if (g_ev <= 0 && g_pml <= 0) return;
+    if (!TryAcquireSRWLockExclusive(&tick)) return;   /* another swapchain's present is here */
+    now = GetTickCount();
+    if (!t0) { t0 = now; last_scan = now; last_log = now; }
+    g_ev_now = (LONG)((now - t0) / 1000) + 1;
+    if (g_ev > 0 && now - last_scan >= MAD_EV_SCAN_MS) { last_scan = now; mad_ev_scan(now); }
+    if (g_ev_ret_n) mad_ev_reap(now);
+    if (g_pml > 0 && now - last_log >= 10000) { last_log = now; mad_pm_log(); }
+    ReleaseSRWLockExclusive(&tick);
+}
+
 /* madeira-bcd msc-unbounded-retry (madeira.cfg or the game's own file, off by
  * default). Horizon Zero Dawn's build 475 run (2026-10-09 16:20) lost ~4,900
  * DXIL vertex and pixel shaders to the converter's code 4
@@ -19167,8 +19492,10 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     rs = (struct mad_rootsig *)desc->pRootSignature;
     mad_resolve_target(d);
 
+    mad_ev_config();   /* madeira pso-evict-idle / pso-mem-log */
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
+    InterlockedIncrement(&g_pm_psos);   /* madeira pso-mem-log */
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState";
     p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
     if (mad_skin_on()) {   /* madeira-bcd skin-check: the vertex shader's bytecode, by hash */
@@ -19641,6 +19968,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     /* madeira-bcd pso-lazy-libs: built at its first draw, so its libraries can go
      * until then (pso-warm, above, holds its own references to the functions) */
     if (lz_on && p->lazy && !p->rps && mad_lzlib_can_drop(p, &lzv, &lzp)) mad_lzlib_drop(p, &lzv, &lzp);
+    if (p->rps && !p->pm_r) { p->pm_r = 1; InterlockedIncrement(&g_pm_rps); }   /* madeira pso-mem-log: built at creation */
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -19705,8 +20033,10 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     memset(&lzc, 0, sizeof lzc);
     lz_on = mad_lzlib_on() && mad_pso_lazy_on();   /* built at its first dispatch */
     mad_resolve_target(d);
+    mad_ev_config();   /* madeira pso-evict-idle / pso-mem-log */
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
+    InterlockedIncrement(&g_pm_psos);   /* madeira pso-mem-log */
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "ComputePipelineState";
     p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
     p->is_compute = 1;
@@ -19819,6 +20149,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         said++;
         d3d12_log("[madeira-d3d12] compute pipeline: threadgroup %ux%ux%u\n", p->tg[0], p->tg[1], p->tg[2]);
     }
+    p->pm_c = 1; InterlockedIncrement(&g_pm_cps);   /* madeira pso-mem-log: built at creation */
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -22526,6 +22857,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
+    mad_ev_tick();                  /* madeira pso-evict-idle / pso-mem-log: once a frame */
     mad_swd_step(s->queue, 'F');    /* madeira-bcd: [swap-diag] steps, named by a drain that waits on this Present */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
