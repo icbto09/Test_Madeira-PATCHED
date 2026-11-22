@@ -3930,7 +3930,10 @@ static void *ios_mach_exception_thread( void *arg )
                 fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u)
             {
                 static int kr_on = -1;
-                extern volatile int ios_fex_rip_resolved;
+                /* "FEX is loaded" = its export was found and recorded. Only the pointer is
+                 * read, never called (ml614: EC exports aren't callable from here), and
+                 * NOT ios_fex_rip_resolved, which ml614 deliberately never sets. */
+                extern unsigned long long (*ios_fex_rip_from_hostpc_cb)( unsigned long long, unsigned long long );
                 if (kr_on < 0)
                 {
                     const char *e = getenv( "MADEIRA_KUSER_REMAP" );
@@ -3939,7 +3942,7 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf( 2, "[kuser-remap] MADEIRA_KUSER_REMAP=1: KUSER_SHARED_DATA reads from JIT code go to FEX "
                                     "(learn + recompile), at most 3 times per site, then emulated here\n" );
                 }
-                if (kr_on && ios_fex_rip_resolved)
+                if (kr_on && ios_fex_rip_from_hostpc_cb)
                 {
                     extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
