@@ -3921,11 +3921,13 @@ static void *ios_mach_exception_thread( void *arg )
             /* madeira kuser-remap: env.MADEIRA_KUSER_REMAP = 1 hands a KUSER_SHARED_DATA read
              * made by FEX-compiled code (pool PC) to FEX instead of emulating it here: FEX
              * learns the guest instruction, recompiles it with the address translated inline,
-             * and resumes the guest at it (FEX ResetToConsistentState, IosKuserRemapFault). The
-             * delivery is the ordinary guest-exception path below (dispatch_guest_fault), as for
-             * any other JIT fault FEX handles. Each host PC is handed over at most 3 times; after
-             * that -- FEX gave up on the instruction, or something keeps faulting -- this handler
-             * emulates it as before, so the worst case is the old behaviour. */
+             * and drops its compiled code (FEX ResetToConsistentState, IosKuserRemapFault), then
+             * resumes the SAME host PC unchanged; that retry faults here again and is emulated
+             * as before, so the guest state is never rebuilt mid-block. The next time the guest
+             * reaches the instruction it runs the recompiled code. The delivery is the ordinary
+             * guest-exception path below (dispatch_guest_fault). Each host PC is handed over
+             * ONCE; every later fault at it is emulated here, so the worst case is the old
+             * behaviour plus one round trip per site. */
             if (!handled && req->exception == EXC_BAD_ACCESS && thread_teb &&
                 fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u)
             {
@@ -3940,7 +3942,7 @@ static void *ios_mach_exception_thread( void *arg )
                     kr_on = (e && e[0] == '1') ? 1 : 0;
                     if (kr_on)
                         dprintf( 2, "[kuser-remap] MADEIRA_KUSER_REMAP=1: KUSER_SHARED_DATA reads from JIT code go to FEX "
-                                    "(learn + recompile), at most 3 times per site, then emulated here\n" );
+                                    "(learn + recompile), once per site, then emulated here\n" );
                 }
                 if (kr_on && ios_fex_rip_from_hostpc_cb)
                 {
@@ -3972,13 +3974,14 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                         if (kr_n < KR_SLOTS)
                         {
-                            if (kr_cnt[kr_i] < 3) { kr_cnt[kr_i]++; kr_defer = 1; }
-                            else if (kr_cnt[kr_i] == 3)
+                            if (!kr_cnt[kr_i]) { kr_cnt[kr_i] = 1; kr_defer = 1; }
+                            else if (kr_cnt[kr_i] == 1)
                             {
-                                kr_cnt[kr_i] = 4;
+                                /* the retry FEX asked for, or old code still running: emulate */
+                                kr_cnt[kr_i] = 2;
                                 kr_capped++;
                                 if (kr_capped <= 16 || !(kr_capped & (kr_capped - 1)))
-                                    dprintf( 2, "[kuser-remap] pc=%#llx addr=%#llx handed to FEX 3 times: emulated here from now on "
+                                    dprintf( 2, "[kuser-remap] pc=%#llx addr=%#llx handed to FEX once, emulated here from now on "
                                                 "(%u sites so far)\n", (unsigned long long)kr_pc,
                                              (unsigned long long)fault_addr, kr_capped );
                             }
@@ -10502,8 +10505,13 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * MADEIRA_MACH_ALIGN_FAULT=0 restores the old classification (every
          * data abort here is c0000005) for a same-build A/B; it is read once
          * when the exception server starts, never from this thread. */
+        /* madeira kuser-remap: a misaligned read of the KUSER_SHARED_DATA window gets
+         * here only when the Mach handler handed it to FEX on purpose; it must arrive
+         * as c0000005 (FEX's IosKuserRemapFault learns from access violations), not
+         * as a misaligned access FEX would "fix" by patching the load. */
         is_align = ios_mach_align_fault_enabled &&
-                   (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21;
+                   (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21 &&
+                   !(fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u);
         if (is_align)
         {
             uint32_t a_insn = 0;

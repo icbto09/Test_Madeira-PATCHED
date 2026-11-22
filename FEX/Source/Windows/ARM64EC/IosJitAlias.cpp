@@ -476,15 +476,16 @@ extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* S
  * protection code reads it ~100,000 times a second (21.8 M in one 4-minute run), which kept
  * the game on a black loading screen.
  *
- * With env.MADEIRA_KUSER_REMAP = 1, ntdll hands the first faults at each JIT site to FEX
- * (ResetToConsistentState) instead of emulating them. FEX records the guest instruction
- * here, drops its compiled code and resumes at it; the recompile gives that instruction's
- * memory LOADS the same inline window translation ml1057 uses for sub-floor images
- * (no NZCV clobber). Escalation per guest RIP:
+ * With env.MADEIRA_KUSER_REMAP = 1, ntdll hands the first fault at each JIT site to FEX
+ * (ResetToConsistentState) instead of emulating it. FEX records the guest instruction
+ * here and drops its compiled code; the faulting load itself is retried unchanged and
+ * emulated by ntdll. The recompile gives that instruction's memory LOADS the same inline
+ * window translation ml1057 uses for sub-floor images (no NZCV clobber). Escalation per
+ * guest RIP:
  *   strike 1: translate this instruction;
  *   strike 2: translate every load in its 4 KB guest page (covers an inexact RIP);
  *   strike 3+: give up -- the fault is left to ntdll's emulation (its per-site cap).
- * A repeat within 20 ms is another thread still running the old code: re-invalidate only.
+ * A repeat within 20 ms is the same or another thread still in the old code: re-invalidate only.
  * The tables only grow; learning runs under ThreadCreationMutex, lookups are lock-free.
  * Stores are never translated: KUSER_SHARED_DATA is read-only to Windows programs. */
 static constexpr uint64_t kIosKuserLow = 0x7ffe0000ull;

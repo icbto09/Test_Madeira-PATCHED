@@ -1644,10 +1644,13 @@ public:
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 #ifdef FEX_IOS_HOST
 /* madeira kuser-remap (see IosJitAlias.cpp): a JIT load from the KUSER_SHARED_DATA window that
- * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction, drop its
- * compiled code and resume the guest AT that instruction, so the recompile translates the
- * address inline. When the instruction has already been through its strikes, resume the JIT
- * code unchanged: the load faults again and ntdll's per-site cap services it the old way.
+ * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction and drop its
+ * compiled code, then resume the SAME host PC with the context untouched: the load faults
+ * again and ntdll emulates it (it hands each host PC over once), and the next time the guest
+ * reaches the instruction it runs the recompiled code with the address translated inline.
+ * The guest state is never rebuilt here: a first version resumed at the reconstructed RIP,
+ * which can name an earlier instruction mid-block, re-ran it and corrupted PRAGMATA's hash of
+ * this page (crash on a wild pointer, log 2026-11-22 12:09).
  * Returns true when the fault is consumed (always, once it is a KUSER load from JIT code). */
 static bool IosKuserRemapFault(const ThreadCPUArea CPUArea, FEXCore::Core::InternalThreadState* Thread, uint64_t FaultAddress,
                                ARM64_NT_CONTEXT* NativeContext) {
@@ -1686,14 +1689,8 @@ static bool IosKuserRemapFault(const ThreadCPUArea CPUArea, FEXCore::Core::Inter
     LogMan::Msg::EFmt("[kuser-remap] #{} guest rip {:#x} read {:#x} (host pc {:#x}): {} (strike {}); {} instructions, {} pages so far",
                       N, Rip, FaultAddress, NativeContext->Pc, What[Action & 3], Strikes, Rips, Pages);
   }
-  if (!Action) {
-    return true;   // NtContinueNative re-runs the faulting load; ntdll takes it after its cap
-  }
-  const uint32_t Fpcr = NativeContext->Fpcr, Fpsr = NativeContext->Fpsr;
-  Exception::ReconstructThreadState(Thread, *NativeContext);
-  *NativeContext = Exception::StoreStateToPackedECContext(Thread, Fpcr, Fpsr);
-  CPUArea.Area->InSimulation = 0;   // as the suspend path: the context is the guest's again
-  return true;
+  (void)CPUArea;
+  return true;   // NtContinueNative re-runs the faulting load in the old code; ntdll emulates it
 }
 #endif
 
