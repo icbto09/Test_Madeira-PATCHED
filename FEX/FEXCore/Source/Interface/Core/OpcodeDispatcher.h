@@ -331,6 +331,12 @@ public:
     return HandledLock;
   }
 
+  // madeira kuser-remap: Core.cpp sets this per guest instruction (IosKuserWantsInsn); the
+  // window itself (IosKu, private below) is filled in BeginFunction.
+  void SetIosKuserInsn(bool Want) {
+    IosKu.On = Want && IosKu.Known;
+  }
+
   void SetForceTSO(ForceTSOMode Mode) {
     ForceTSO = Mode;
   }
@@ -2604,9 +2610,6 @@ private:
     bool On {false};
     uint64_t Low {0}, Size {0}, Delta {0};
   } IosKu;
-  void SetIosKuserInsn(bool Want) {
-    IosKu.On = Want && IosKu.Known;
-  }
   Ref IosWindow(Ref EA, uint64_t Low, uint64_t Size, uint64_t Delta) {
     Ref T = Sub(OpSize::i64Bit, EA, Constant(Low));                // >= 2^63 when EA < Low
     Ref U = Sub(OpSize::i64Bit, T, Constant(Size));                // top bit set when T < Size (or T huge)
