@@ -942,6 +942,49 @@ static void ios_srw_free_shared_init(void)
 }
 
 static BOOL ios_srw_holder_on;
+
+/* env.MADEIRA_SRW_DEADLOCK_BREAK = 1 (off by default). PRAGMATA's job threads
+ * each hold their own SRW lock exclusive and then read a neighbour's shared;
+ * two threads doing that at the same moment wait on each other for good (log
+ * 2026-11-22 00:25: 01c0 holds A and waits to read B, 01cc holds B and waits to
+ * read A; no writer queue involved, so MADEIRA_SRW_SHARED_WHEN_FREE can't help).
+ * With the switch on, a shared waiter checks every 20 ms whether the lock's
+ * exclusive holder is itself parked waiting for a lock that THIS thread holds
+ * exclusive. If so the holder cannot run until this thread releases that lock,
+ * so nothing can change the data under the lock while this thread reads it:
+ * the read is granted without touching the lock word (a "borrowed" read), and
+ * the matching ReleaseSRWLockShared just returns it. One borrowed read at a
+ * time in the whole process; two-thread cycles only. Exclusive holders are
+ * tracked the same way as for MADEIRA_SRW_HOLDER. */
+static BOOL ios_srw_break_on;
+static BOOL ios_srw_track;   /* holder_on || break_on: keep the owner table and histories */
+struct ios_srw_waitent { volatile ULONG tid; const void * volatile lock; ULONG start; };
+static struct ios_srw_waitent ios_srw_waiting[256];   /* indexed by thread id / 4 */
+static volatile LONG ios_srw_break_tid;               /* thread holding the borrowed read, 0 = none */
+static const void * volatile ios_srw_break_lock;
+static LONG ios_srw_breaks;
+
+static BOOL ios_env_is_1( const WCHAR *var )
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &name, var );
+    value.Buffer = buffer;
+    value.MaximumLength = sizeof(buffer);
+    return !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+           value.Length == sizeof(WCHAR) && buffer[0] == '1';
+}
+
+static inline ULONG ios_srw_me(void)
+{
+    return HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+}
+
+static inline struct ios_srw_waitent *ios_srw_waitslot( ULONG tid )
+{
+    return &ios_srw_waiting[(tid >> 2) & 255];
+}
 struct ios_srw_owner_ent { const void *lock; ULONG tid; ULONG seq; LONG hidx; ULONGLONG hist[16]; };
 static struct ios_srw_owner_ent ios_srw_owner[4096];
 static LONG ios_srw_owner_seq;
@@ -959,13 +1002,15 @@ enum ios_srw_hist_code
     SRWH_CV_SLEEP_X, SRWH_CV_SLEEP_S,                    /* SleepConditionVariableSRW: about to release (flags) */
     SRWH_CV_WOKE_X, SRWH_CV_WOKE_S,                      /* ... and re-acquired after the wait */
     SRWH_WAIT_X, SRWH_WAIT_S,                            /* an acquire found the lock taken and waits */
+    SRWH_BORROW_S, SRWH_BORROW_REL,                      /* MADEIRA_SRW_DEADLOCK_BREAK: read granted / given back */
 };
-static const char * const ios_srw_hist_name[12] =
+static const char * const ios_srw_hist_name[14] =
 {
     "acqX", "relX", "acqS", "relS", "  (that acquire was a TryAcquire)", "  (that acquire was a TryAcquire)",
     "SleepConditionVariableSRW (EXCLUSIVE mode): releasing", "SleepConditionVariableSRW (SHARED mode): releasing",
     "SleepConditionVariableSRW (EXCLUSIVE mode): re-acquired", "SleepConditionVariableSRW (SHARED mode): re-acquired",
     "waits to acquire EXCLUSIVE", "waits to acquire SHARED",
+    "DEADLOCK BREAK: read granted while its holder is parked on this thread's lock", "DEADLOCK BREAK: borrowed read released",
 };
 
 static void ios_srw_holder_init(void)
@@ -979,6 +1024,7 @@ static void ios_srw_holder_init(void)
     if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
         value.Length != sizeof(WCHAR) || buffer[0] != '1') return;
     ios_srw_holder_on = TRUE;
+    ios_srw_track = TRUE;
     ERR( "[srw-hold] MADEIRA_SRW_HOLDER=1: exclusive holders tracked; SRW waits report after 10 s\n" );
 }
 
@@ -993,7 +1039,7 @@ static void ios_srw_hist( const void *lock, unsigned int code )
     ULONG seq, tid;
     LONG k;
 
-    if (!ios_srw_holder_on) return;
+    if (!ios_srw_track) return;
     e = ios_srw_owner_slot( lock );
     if (e->lock != lock)
     {
@@ -1016,6 +1062,12 @@ void sync_init_madeira_lean(void)
 
     ios_srw_holder_init();
     ios_srw_free_shared_init();
+    if (ios_env_is_1( L"MADEIRA_SRW_DEADLOCK_BREAK" ))
+    {
+        ios_srw_break_on = TRUE;
+        ios_srw_track = TRUE;
+        ERR( "[srw-break] MADEIRA_SRW_DEADLOCK_BREAK=1: a shared waiter in a two-thread SRW cycle gets a borrowed read after 20 ms\n" );
+    }
     RtlInitUnicodeString( &name, L"MADEIRA_SYNC_LEAN" );
     value.Buffer = buffer;
     value.MaximumLength = sizeof(buffer);
@@ -1029,10 +1081,15 @@ static void ios_srw_note( const void *lock, unsigned int mode )
 {
     ULONG i;
 
-    if (ios_srw_holder_on)   /* MADEIRA_SRW_HOLDER: history; acqX stores the owner, relX clears it */
+    if (ios_srw_track)   /* MADEIRA_SRW_HOLDER / _DEADLOCK_BREAK: history; acqX stores the owner, relX clears it */
     {
         struct ios_srw_owner_ent *e = ios_srw_owner_slot( lock );
         ios_srw_hist( lock, mode );
+        if (!(mode & 1))   /* an acquire: this thread no longer waits */
+        {
+            struct ios_srw_waitent *w = ios_srw_waitslot( ios_srw_me() );
+            if (w->lock) w->lock = NULL;
+        }
         if (!mode && e->lock == lock)
         {
             e->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
@@ -1122,7 +1179,7 @@ static void ios_srw_report( const void *lock, int exclusive )
             if (!(h & 0x80000000u)) continue;
             code = (unsigned int)(h & 0xff);
             ERR( "[srw-hold]     #%lu tid=%04lx %s\n", (ULONG)(h >> 32), (ULONG)((h >> 8) & 0xffff),
-                 code < 12 ? ios_srw_hist_name[code] : "?" );
+                 code < 14 ? ios_srw_hist_name[code] : "?" );
         }
     }
     for (n = 0; n < 512 && printed < 8; n++)
@@ -1137,19 +1194,69 @@ static void ios_srw_report( const void *lock, int exclusive )
 
 /* The SRW acquire paths' wait: as before unless MADEIRA_SRW_HOLDER is on, then
  * in 10 s slices with one [srw-hold] report per lock. */
-static void ios_srw_wait( const void *lock, const void *addr, const void *cmp, SIZE_T size, int exclusive )
+/* Exclusive holder of a lock per the owner table, 0 if not held exclusive or not known. */
+static ULONG ios_srw_owner_of( const void *lock )
+{
+    struct ios_srw_owner_ent *e = ios_srw_owner_slot( lock );
+    if (e->lock != lock || !(*(const volatile LONG *)lock & 1)) return 0;
+    return e->tid;
+}
+
+/* MADEIRA_SRW_DEADLOCK_BREAK: TRUE = this thread may read `lock` without taking it. */
+static BOOL ios_srw_try_break( const void *lock, ULONG me )
+{
+    struct ios_srw_waitent *tw;
+    const void *their_wait;
+    ULONG holder = ios_srw_owner_of( lock ), n;
+
+    if (!holder || holder == me) return FALSE;
+    tw = ios_srw_waitslot( holder );
+    their_wait = tw->lock;
+    if (tw->tid != holder || !their_wait || their_wait == lock) return FALSE;
+    if (ios_srw_owner_of( their_wait ) != me) return FALSE;   /* not a two-thread cycle through us */
+    if (InterlockedCompareExchange( &ios_srw_break_tid, (LONG)me, 0 ) != 0) return FALSE;
+    ios_srw_break_lock = lock;
+    n = (ULONG)InterlockedIncrement( &ios_srw_breaks );
+    if (n <= 8 || n == 100 || n == 1000 || n == 10000)
+        ERR( "[srw-break] #%lu: tid=%04lx reads lock %p held by tid=%04lx, which waits for lock %p held by tid=%04lx\n",
+             n, me, lock, holder, their_wait, me );
+    return TRUE;
+}
+
+/* The SRW acquire paths' wait: as before unless MADEIRA_SRW_HOLDER or
+ * MADEIRA_SRW_DEADLOCK_BREAK is on. Returns TRUE only for a borrowed read. */
+static BOOL ios_srw_wait( const void *lock, const void *addr, const void *cmp, SIZE_T size, int exclusive )
 {
     LARGE_INTEGER timeout;
+    struct ios_srw_waitent *w;
+    ULONG me, waited;
 
-    if (!ios_srw_holder_on)
+    if (!ios_srw_track)
     {
         RtlWaitOnAddress( addr, cmp, size, NULL );
-        return;
+        return FALSE;
     }
-    ios_srw_hist( lock, exclusive ? SRWH_WAIT_X : SRWH_WAIT_S );
-    timeout.QuadPart = -10 * (LONGLONG)10000000;   /* 10 s, relative */
-    if (RtlWaitOnAddress( addr, cmp, size, &timeout ) == STATUS_TIMEOUT)
-        ios_srw_report( lock, exclusive );
+    me = ios_srw_me();
+    w = ios_srw_waitslot( me );
+    if (w->tid != me || w->lock != lock)
+    {
+        w->start = NtGetTickCount();
+        w->tid = me;
+        w->lock = lock;
+        ios_srw_hist( lock, exclusive ? SRWH_WAIT_X : SRWH_WAIT_S );
+    }
+    timeout.QuadPart = ios_srw_break_on ? -20 * (LONGLONG)10000      /* 20 ms */
+                                        : -10 * (LONGLONG)10000000;  /* 10 s */
+    if (RtlWaitOnAddress( addr, cmp, size, &timeout ) != STATUS_TIMEOUT) return FALSE;
+    waited = NtGetTickCount() - w->start;
+    if (ios_srw_break_on && !exclusive && ios_srw_try_break( lock, me ))
+    {
+        w->lock = NULL;
+        ios_srw_hist( lock, SRWH_BORROW_S );
+        return TRUE;
+    }
+    if (ios_srw_holder_on && waited >= 10000) ios_srw_report( lock, exclusive );
+    return FALSE;
 }
 
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
@@ -1243,7 +1350,7 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
             }
             return;
         }
-        ios_srw_wait( lock, u.s, &new.s, sizeof(struct srw_lock), 0 );
+        if (ios_srw_wait( lock, u.s, &new.s, sizeof(struct srw_lock), 0 )) return;   /* borrowed read */
     }
 }
 
@@ -1254,6 +1361,14 @@ void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
+
+    if (ios_srw_break_tid && (ULONG)ios_srw_break_tid == ios_srw_me())
+    {
+        static LONG warned;
+        if (InterlockedIncrement( &warned ) <= 4)
+            ERR( "[srw-break] tid=%04lx releases lock %p before its borrowed read of %p (the other thread may now run)\n",
+                 ios_srw_me(), lock, ios_srw_break_lock );
+    }
 
     do
     {
@@ -1280,6 +1395,14 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
+
+    if (ios_srw_break_tid && ios_srw_break_lock == lock && (ULONG)ios_srw_break_tid == ios_srw_me())
+    {
+        ios_srw_hist( lock, SRWH_BORROW_REL );
+        ios_srw_break_lock = NULL;
+        InterlockedExchange( &ios_srw_break_tid, 0 );
+        return;   /* the lock word was never changed for this read */
+    }
 
     do
     {
