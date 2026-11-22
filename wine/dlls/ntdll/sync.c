@@ -903,11 +903,47 @@ static const char * const ios_srw_mode_name[4] = { "acqX", "relX", "acqS", "relS
  * unchanged. Read once by the loader, before application threads run. */
 static BOOL ios_sync_lean;
 
+/* env.MADEIRA_SRW_HOLDER = 1 (off by default): SRW lock holder diagnostics.
+ * PRAGMATA froze after its intro movie with two game threads parked for good in
+ * RtlAcquireSRWLockShared on locks whose word read 00010001 (held exclusive,
+ * owners 1) and no record of who held them. With the switch on, every exclusive
+ * acquire stores its thread in a 4096-slot table keyed by the lock's address
+ * (two plain stores; a release clears the slot), and an SRW wait wakes every
+ * 10 s; a wait still unsatisfied then logs [srw-hold] once per lock: the waiting
+ * thread, the lock word, the exclusive holder's thread id if the table has it,
+ * and the lock's last events in the history ring. The wait then goes on as
+ * before (a timed-out RtlWaitOnAddress is a spurious wake-up; the acquire loops
+ * re-check the lock word). Locking itself is unchanged. */
+static BOOL ios_srw_holder_on;
+struct ios_srw_owner_ent { const void *lock; ULONG tid; ULONG seq; };
+static struct ios_srw_owner_ent ios_srw_owner[4096];
+static LONG ios_srw_owner_seq;
+
+static void ios_srw_holder_init(void)
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &name, L"MADEIRA_SRW_HOLDER" );
+    value.Buffer = buffer;
+    value.MaximumLength = sizeof(buffer);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
+        value.Length != sizeof(WCHAR) || buffer[0] != '1') return;
+    ios_srw_holder_on = TRUE;
+    ERR( "[srw-hold] MADEIRA_SRW_HOLDER=1: exclusive holders tracked; SRW waits report after 10 s\n" );
+}
+
+static struct ios_srw_owner_ent *ios_srw_owner_slot( const void *lock )
+{
+    return &ios_srw_owner[((ULONG_PTR)lock >> 3) & 4095];
+}
+
 void sync_init_madeira_lean(void)
 {
     UNICODE_STRING name, value;
     WCHAR buffer[2];
 
+    ios_srw_holder_init();
     RtlInitUnicodeString( &name, L"MADEIRA_SYNC_LEAN" );
     value.Buffer = buffer;
     value.MaximumLength = sizeof(buffer);
@@ -921,6 +957,17 @@ static void ios_srw_note( const void *lock, unsigned int mode )
 {
     ULONG i;
 
+    if (ios_srw_holder_on && mode < 2)   /* MADEIRA_SRW_HOLDER: acqX stores the owner, relX clears it */
+    {
+        struct ios_srw_owner_ent *e = ios_srw_owner_slot( lock );
+        if (!mode)
+        {
+            e->lock = lock;
+            e->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+            e->seq = (ULONG)InterlockedIncrement( &ios_srw_owner_seq );
+        }
+        else if (e->lock == lock) e->tid = 0;
+    }
     if (ios_sync_lean) return;
     i = (ULONG)InterlockedIncrement( &ios_srw_ring_idx );
     ios_srw_ring[i & 511].lock = lock;
@@ -951,6 +998,65 @@ static void ios_srw_dump_park( const void *addr )
         printed++;
     }
     if (!printed) ERR( "[srw]   ring has NO events for this lock (acquired before ring wrapped)\n" );
+}
+
+static void ios_srw_report( const void *lock, int exclusive )
+{
+    static const void *reported[32];
+    static LONG nreported;
+    const struct srw_lock *s = lock;
+    struct ios_srw_owner_ent *e = ios_srw_owner_slot( lock );
+    const void *owner_lock = e->lock;
+    ULONG owner_tid = e->tid, owner_seq = e->seq, word = *(const volatile LONG *)lock;
+    ULONG i = (ULONG)ios_srw_ring_idx, n, printed = 0;
+    LONG k, have = nreported;
+
+    for (k = 0; k < have && k < 32; k++) if (reported[k] == lock) return;
+    k = InterlockedIncrement( &nreported ) - 1;
+    if (k >= 32) return;
+    reported[k] = lock;
+
+    ERR( "[srw-hold] tid=%04lx waited 10 s for %s lock %p: word=%08lx (exclusive_waiters=%04x owners=%u)\n",
+         HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), exclusive ? "EXCLUSIVE" : "SHARED", lock,
+         word, (unsigned short)s->exclusive_waiters, s->owners );
+    if (s->exclusive_waiters & 1)
+    {
+        if (owner_lock == lock && owner_tid)
+            ERR( "[srw-hold]   held EXCLUSIVE by tid=%04lx (acquire #%lu of %ld so far)\n",
+                 owner_tid, owner_seq, ios_srw_owner_seq );
+        else if (owner_lock == lock)
+            ERR( "[srw-hold]   held EXCLUSIVE, but its holder's slot was cleared (a release without a matching acquire)\n" );
+        else
+            ERR( "[srw-hold]   held EXCLUSIVE; holder unknown (its slot now belongs to lock %p)\n", owner_lock );
+    }
+    else if (s->owners)
+        ERR( "[srw-hold]   held SHARED by %u thread(s) (shared holders are not tracked)\n", s->owners );
+    else
+        ERR( "[srw-hold]   the lock is FREE: a wake-up was lost\n" );
+    for (n = 0; n < 512 && printed < 8; n++)
+    {
+        const struct ios_srw_ring_ent *r = &ios_srw_ring[(i - n) & 511];
+        if (r->lock != lock) continue;
+        ERR( "[srw-hold]   ring[-%03lu] tid=%04lx %s\n", n, r->tid_mode >> 2, ios_srw_mode_name[r->tid_mode & 3] );
+        printed++;
+    }
+    if (!printed) ERR( "[srw-hold]   no events for this lock in the last 512 of the history ring\n" );
+}
+
+/* The SRW acquire paths' wait: as before unless MADEIRA_SRW_HOLDER is on, then
+ * in 10 s slices with one [srw-hold] report per lock. */
+static void ios_srw_wait( const void *lock, const void *addr, const void *cmp, SIZE_T size, int exclusive )
+{
+    LARGE_INTEGER timeout;
+
+    if (!ios_srw_holder_on)
+    {
+        RtlWaitOnAddress( addr, cmp, size, NULL );
+        return;
+    }
+    timeout.QuadPart = -10 * (LONGLONG)10000000;   /* 10 s, relative */
+    if (RtlWaitOnAddress( addr, cmp, size, &timeout ) == STATUS_TIMEOUT)
+        ios_srw_report( lock, exclusive );
 }
 
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
@@ -988,7 +1094,7 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
             ios_srw_note( lock, 0 );
             return;
         }
-        RtlWaitOnAddress( &u.s->owners, &new.s.owners, sizeof(short), NULL );
+        ios_srw_wait( lock, &u.s->owners, &new.s.owners, sizeof(short), 1 );
     }
 }
 
@@ -1031,7 +1137,7 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
             ios_srw_note( lock, 2 );
             return;
         }
-        RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
+        ios_srw_wait( lock, u.s, &new.s, sizeof(struct srw_lock), 0 );
     }
 }
 
