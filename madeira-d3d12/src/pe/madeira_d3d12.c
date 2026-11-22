@@ -21028,6 +21028,21 @@ static HRESULT STDMETHODCALLTYPE device_EnqueueMakeResident(ID3D12Device10 *This
     if (!fence) return E_INVALIDARG;
     return fence_Signal(fence, value);   /* resident already; complete the request at once */
 }
+/* PRAGMATA (RE Engine) calls Evict about a minute in, once its first frames are
+ * up; the stub's E_NOTIMPL made it raise its error box (TaskDialogIndirect,
+ * which this prefix's comctl32 can't show), and the process ended with
+ * 0xC000001D. Unified memory: nothing is ever paged out, so both residency
+ * calls succeed at once, like SetResidencyPriority / EnqueueMakeResident. */
+static HRESULT STDMETHODCALLTYPE device_MakeResident(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
+    (void)This;
+    if (n && !objs) return E_INVALIDARG;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE device_Evict(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
+    (void)This;
+    if (n && !objs) return E_INVALIDARG;
+    return S_OK;
+}
 static void STDMETHODCALLTYPE device_RemoveDevice(ID3D12Device10 *This) {
     struct mad_device *d = (struct mad_device *)This;
     d3d12_log("[madeira-d3d12] RemoveDevice requested by the application\n");
@@ -21280,6 +21295,29 @@ static HRESULT mad_child_get_device(struct mad_device *d, REFIID riid, void **ou
 }
 static HRESULT STDMETHODCALLTYPE res_GetDevice(ID3D12Resource2 *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_resource *)This)->owner, riid, out);
+}
+/* Was the E_NOTIMPL stub (PRAGMATA asks for it while it builds its first
+ * frame). Placed resources answer with their heap's properties; committed ones
+ * with their heap type. Reserved (tiled) resources have no heap: E_INVALIDARG,
+ * as on Windows. */
+static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource2 *This, D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS *flags) {
+    struct mad_resource *r = (struct mad_resource *)This;
+    if (r->placed_heap) {
+        if (props) *props = r->placed_heap->desc.Properties;
+        if (flags) *flags = r->placed_heap->desc.Flags;
+        return S_OK;
+    }
+    if (r->reserved_bytes) return E_INVALIDARG;
+    if (props) {
+        memset(props, 0, sizeof *props);
+        props->Type = r->heap ? r->heap : D3D12_HEAP_TYPE_DEFAULT;
+        props->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        props->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        props->CreationNodeMask = 1;
+        props->VisibleNodeMask = 1;
+    }
+    if (flags) *flags = D3D12_HEAP_FLAG_NONE;
+    return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE list_GetDevice(ID3D12GraphicsCommandList *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_list *)This)->device, riid, out);
@@ -21710,6 +21748,8 @@ static void build_vtables(void) {
     g_device_vtbl.CreateCommandQueue1                = device_CreateCommandQueue1;
     g_device_vtbl.SetResidencyPriority               = device_SetResidencyPriority;
     g_device_vtbl.EnqueueMakeResident                = device_EnqueueMakeResident;
+    g_device_vtbl.MakeResident                       = device_MakeResident;
+    g_device_vtbl.Evict                              = device_Evict;
     g_device_vtbl.RemoveDevice                       = device_RemoveDevice;
     g_device_vtbl.GetDeviceRemovedReason             = device_GetDeviceRemovedReason;
     g_device_vtbl.GetAdapterLuid                     = device_GetAdapterLuid;
@@ -21831,6 +21871,7 @@ static void build_vtables(void) {
     g_res_vtbl.Unmap = (void *)res_Unmap;
     g_res_vtbl.GetGPUVirtualAddress = (void *)res_GetGPUVirtualAddress;
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
+    g_res_vtbl.GetHeapProperties = res_GetHeapProperties;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
     g_list_vtbl8.OMSetFrontAndBackStencilRef = list_OMSetFrontAndBackStencilRef;   /* ml1300 */
