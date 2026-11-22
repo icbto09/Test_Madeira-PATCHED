@@ -914,6 +914,33 @@ static BOOL ios_sync_lean;
  * and the lock's last events in the history ring. The wait then goes on as
  * before (a timed-out RtlWaitOnAddress is a spurious wake-up; the acquire loops
  * re-check the lock word). Locking itself is unchanged. */
+/* env.MADEIRA_SRW_SHARED_WHEN_FREE = 1 (off by default): let AcquireSRWLockShared
+ * take a lock that nobody holds even while a thread waits to take it exclusive.
+ * Wine's shared acquire waits whenever an exclusive waiter is counted, also in
+ * the window after the last owner released and before the woken writer runs.
+ * Windows lets an acquirer take an unowned lock in that window. PRAGMATA's job
+ * threads hold their own lock exclusive and read a neighbour's lock shared;
+ * with Wine's rule a reader parked behind a writer on a FREE lock, the writer
+ * then took it and read the first thread's lock: AB/BA deadlock after the intro
+ * movie (2026-11-21 23:12 log, [srw-hold] history). The woken writer that finds
+ * the lock taken again simply waits for that reader to release it. */
+static BOOL ios_srw_free_shared;
+static LONG ios_srw_free_shared_hits;
+
+static void ios_srw_free_shared_init(void)
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &name, L"MADEIRA_SRW_SHARED_WHEN_FREE" );
+    value.Buffer = buffer;
+    value.MaximumLength = sizeof(buffer);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
+        value.Length != sizeof(WCHAR) || buffer[0] != '1') return;
+    ios_srw_free_shared = TRUE;
+    ERR( "[srw-free-shared] MADEIRA_SRW_SHARED_WHEN_FREE=1: a shared acquire may take an unowned lock while a writer waits (Windows behaviour)\n" );
+}
+
 static BOOL ios_srw_holder_on;
 struct ios_srw_owner_ent { const void *lock; ULONG tid; ULONG seq; LONG hidx; ULONGLONG hist[16]; };
 static struct ios_srw_owner_ent ios_srw_owner[4096];
@@ -988,6 +1015,7 @@ void sync_init_madeira_lean(void)
     WCHAR buffer[2];
 
     ios_srw_holder_init();
+    ios_srw_free_shared_init();
     RtlInitUnicodeString( &name, L"MADEIRA_SYNC_LEAN" );
     value.Buffer = buffer;
     value.MaximumLength = sizeof(buffer);
@@ -1191,6 +1219,13 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
                 ++new.s.owners;
                 wait = FALSE;
             }
+            else if (ios_srw_free_shared && !old.s.owners)
+            {
+                /* MADEIRA_SRW_SHARED_WHEN_FREE: writers wait, but nobody holds
+                 * the lock (an exclusive holder always has owners == 1). */
+                new.s.owners = 1;
+                wait = FALSE;
+            }
             else
             {
                 wait = TRUE;
@@ -1200,6 +1235,12 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
         if (!wait)
         {
             ios_srw_note( lock, 2 );
+            if (old.s.exclusive_waiters)   /* only reachable through MADEIRA_SRW_SHARED_WHEN_FREE */
+            {
+                LONG n = InterlockedIncrement( &ios_srw_free_shared_hits );
+                if (n == 1 || n == 100 || n == 10000 || n == 1000000)
+                    ERR( "[srw-free-shared] shared acquire of a free lock with a writer waiting: %ld so far (lock %p)\n", n, lock );
+            }
             return;
         }
         ios_srw_wait( lock, u.s, &new.s, sizeof(struct srw_lock), 0 );
@@ -1310,6 +1351,11 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
             /* Not locked exclusive, and no exclusive waiters.
              * We can try to grab it. */
             ++new.s.owners;
+            ret = TRUE;
+        }
+        else if (ios_srw_free_shared && !old.s.owners)
+        {
+            new.s.owners = 1;   /* MADEIRA_SRW_SHARED_WHEN_FREE, as in RtlAcquireSRWLockShared */
             ret = TRUE;
         }
         else
