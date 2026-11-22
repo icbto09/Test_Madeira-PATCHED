@@ -86,6 +86,7 @@ They are restored so the tree has the shape the build expects:
 - `pso-mem-log`, `pso-evict-idle`, `pso-evict-headroom-mb` (`madeira-d3d12/src/pe/madeira_d3d12.c`):
   Direct3D 12 pipeline memory census and idle pipeline eviction (692e6ef).
 - `env.MADEIRA_KUSER_REMAP` (08472dc, 983c978): KUSER_SHARED_DATA reads from FEX-compiled code
-  are handed to FEX a few times per site, which recompiles the instruction with the address
-  translated inline (`build/ntdll-unix/signal_arm64_ios.c`, `FEX/Source/Windows/ARM64EC/`,
+  are handed to FEX once per JIT site, which learns the instruction's 4 KB guest page and
+  recompiles every load in it with the address translated inline (page learning since the
+  instruction table filled on PRAGMATA) (`build/ntdll-unix/signal_arm64_ios.c`, `FEX/Source/Windows/ARM64EC/`,
   `FEX/FEXCore/Source/Interface/Core/`). Log prefix `[kuser-remap]`.

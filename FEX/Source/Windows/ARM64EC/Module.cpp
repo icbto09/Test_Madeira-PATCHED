@@ -1644,7 +1644,7 @@ public:
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 #ifdef FEX_IOS_HOST
 /* madeira kuser-remap (see IosJitAlias.cpp): a JIT load from the KUSER_SHARED_DATA window that
- * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction and drop its
+ * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction's 4 KB page and drop its
  * compiled code, then resume the SAME host PC with the context untouched: the load faults
  * again and ntdll emulates it (it hands each host PC over once), and the next time the guest
  * reaches the instruction it runs the recompiled code with the address translated inline.
@@ -1685,9 +1685,9 @@ static bool IosKuserRemapFault(const ThreadCPUArea CPUArea, FEXCore::Core::Inter
     uint32_t Rips = 0, Pages = 0;
     IosKuserCounts(&Rips, &Pages);
     static const char* const What[4] = {"gave up (left to ntdll)", "learned the instruction", "learned its 4 KB page",
-                                        "re-dropped old code (repeat)"};
-    LogMan::Msg::EFmt("[kuser-remap] #{} guest rip {:#x} read {:#x} (host pc {:#x}): {} (strike {}); {} instructions, {} pages so far",
-                      N, Rip, FaultAddress, NativeContext->Pc, What[Action & 3], Strikes, Rips, Pages);
+                                        "page already learned: dropped its code again"};
+    LogMan::Msg::EFmt("[kuser-remap] #{} guest rip {:#x} read {:#x} (host pc {:#x}): {} (strike {}); {} pages learned, {} re-faulting rips",
+                      N, Rip, FaultAddress, NativeContext->Pc, What[Action & 3], Strikes, Pages, Rips);
   }
   (void)CPUArea;
   return true;   // NtContinueNative re-runs the faulting load in the old code; ntdll emulates it

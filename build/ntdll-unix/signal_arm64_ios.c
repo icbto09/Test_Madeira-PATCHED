@@ -3953,20 +3953,33 @@ static void *ios_mach_exception_thread( void *arg )
                     uint64_t kr_pc = (uint64_t)__darwin_arm_thread_state64_get_pc( state );
                     if ((kr_rx && kr_pc >= kr_rx && kr_pc < kr_rx + kr_sz) || ios_jit_low_contains( (uintptr_t)kr_pc ))
                     {
-                        /* Only this (single) Mach exception thread touches the table. */
-                        enum { KR_SLOTS = 8192 };
+                        /* Only this (single) Mach exception thread touches the table.
+                         * 65536 slots: the first 8192-slot version filled in 15 s on PRAGMATA
+                         * (6,144 sites) and then emulated everything. When it fills now it is
+                         * cleared and starts over: a stale host PC (the code buffer reuses them)
+                         * is at worst handed over once more, and FEX shrugs that off. */
+                        enum { KR_SLOTS = 65536 };
                         static uint64_t kr_pcs[KR_SLOTS];
                         static unsigned char kr_cnt[KR_SLOTS];
-                        static unsigned kr_used, kr_deferred, kr_capped;
-                        unsigned kr_i = (unsigned)((kr_pc >> 2) * 0x9E3779B1u) & (KR_SLOTS - 1), kr_n;
+                        static unsigned kr_used, kr_deferred, kr_capped, kr_clears;
+                        unsigned kr_i, kr_n;
                         int kr_defer = 0;
 
+                        if (kr_used >= KR_SLOTS * 3 / 4)
+                        {
+                            memset( kr_pcs, 0, sizeof(kr_pcs) );
+                            memset( kr_cnt, 0, sizeof(kr_cnt) );
+                            kr_used = 0;
+                            kr_clears++;
+                            dprintf( 2, "[kuser-remap] site table full: cleared (%u time(s)), %u handed over so far\n",
+                                     kr_clears, kr_deferred );
+                        }
+                        kr_i = (unsigned)((kr_pc >> 2) * 0x9E3779B1u) & (KR_SLOTS - 1);
                         for (kr_n = 0; kr_n < KR_SLOTS; kr_n++, kr_i = (kr_i + 1) & (KR_SLOTS - 1))
                         {
                             if (kr_pcs[kr_i] == kr_pc) break;
                             if (!kr_pcs[kr_i])
                             {
-                                if (kr_used >= KR_SLOTS * 3 / 4) { kr_n = KR_SLOTS; break; }   /* full: stop handing over */
                                 kr_pcs[kr_i] = kr_pc;
                                 kr_used++;
                                 break;
