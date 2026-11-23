@@ -18724,6 +18724,160 @@ static void xref_print_bytes( const char *tag, uint64_t from, uint64_t len )
     }
 }
 
+/* madeira guest-unwind: a .pdata-checked call chain for a parked guest thread.
+ * The [guest-stack] scan lists every qword that looks like a return address, stale ones
+ * from earlier, deeper calls included (log 2026-11-23 13:38: PRAGMATA's thread 0178 had
+ * 128 of them). Here a candidate counts only if the chain above it is consistent with
+ * the x64 unwind data: the caller's return address must sit exactly at
+ * candidate_slot + 8 + (pushes + allocation of the function the candidate returns into).
+ * The lowest candidate that starts such a chain of >= 3 frames (or one that ends outside
+ * the image, i.e. at the thread start) is printed as `[guest-unwind]`, and the 96 bytes
+ * of code before each of its first 6 return addresses as `[guest-unwind-code]` (once
+ * per address per run). A function with a frame pointer (UWOP_SET_FPREG) ends the
+ * chain (its size isn't known without rbp); the chain is then shorter, not wrong. */
+static int gu_call_len( uint64_t ra )
+{
+    unsigned char c[8];
+    if (!xref_read( ra - 8, c, 8 )) return 0;
+    if (c[3] == 0xE8) return 5;
+    if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC7) == 0x05) return 6;
+    if (c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) return 2;
+    if (c[5] == 0x41 && c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) return 3;
+    if (c[5] == 0xFF && (c[6] & 0x38) == 0x10 && (c[6] & 0xC0) == 0x40) return 3;
+    if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC0) == 0x80) return 6;
+    if (c[6] == 0xFF && (c[7] & 0x38) == 0x10 && (c[7] & 0xC0) == 0x00) return 2;
+    return 0;
+}
+
+/* bytes the function holding ra has on the stack below its return address; 0 = unknown */
+static int gu_frame_size( uint64_t img, uint32_t pd_rva, uint32_t pd_size, uint64_t ra, uint64_t *total )
+{
+    uint32_t n = pd_size / 12, lo = 0, hi, rva, ent[3];
+    int depth;
+    uint64_t t = 0;
+    if (!pd_rva || !n || ra < img || ra - img > 0xffffffffull) return 0;
+    rva = (uint32_t)(ra - img) - 1;   /* ra may be the first byte after a function ending in a call */
+    hi = n;
+    while (lo < hi)
+    {
+        uint32_t mid = (lo + hi) / 2;
+        if (!xref_read( img + pd_rva + (uint64_t)mid * 12, ent, 12 )) return 0;
+        if (rva < ent[0]) hi = mid;
+        else if (rva >= ent[1]) lo = mid + 1;
+        else { lo = mid; break; }
+    }
+    if (lo >= n || !xref_read( img + pd_rva + (uint64_t)lo * 12, ent, 12 ) || rva < ent[0] || rva >= ent[1])
+        return 0;
+    for (depth = 0; depth < 8; depth++)
+    {
+        unsigned char ui[4];
+        uint16_t codes[256];
+        unsigned cnt, i;
+        if (ent[2] & 1) return 0;
+        if (!xref_read( img + ent[2], ui, 4 )) return 0;
+        cnt = ui[2];
+        if (cnt && !xref_read( img + ent[2] + 4, codes, cnt * 2 )) return 0;
+        for (i = 0; i < cnt; i++)
+        {
+            unsigned op = (codes[i] >> 8) & 0xF, info = codes[i] >> 12;
+            switch (op)
+            {
+            case 0: t += 8; break;                                       /* PUSH_NONVOL */
+            case 1:                                                      /* ALLOC_LARGE */
+                if (info == 0) { if (i + 1 >= cnt) return 0; t += (uint64_t)codes[i + 1] * 8; i += 1; }
+                else { if (i + 2 >= cnt) return 0; t += (uint64_t)codes[i + 1] | ((uint64_t)codes[i + 2] << 16); i += 2; }
+                break;
+            case 2: t += info * 8 + 8; break;                            /* ALLOC_SMALL */
+            case 3: return 0;                                            /* SET_FPREG: size needs rbp */
+            case 4: i += 1; break;                                       /* SAVE_NONVOL */
+            case 5: i += 2; break;                                       /* SAVE_NONVOL_FAR */
+            case 6: i += 1; break;                                       /* EPILOG (v2) */
+            case 8: i += 1; break;                                       /* SAVE_XMM128 */
+            case 9: i += 2; break;                                       /* SAVE_XMM128_FAR */
+            case 10: t += info ? 48 : 40; break;                         /* PUSH_MACHFRAME */
+            default: return 0;
+            }
+        }
+        if (!((ui[0] >> 3) & 4)) break;                                  /* no CHAININFO: done */
+        {
+            uint32_t parent[3];
+            if (!xref_read( img + ent[2] + 4 + ((cnt + 1u) & ~1u) * 2, parent, 12 )) return 0;
+            ent[0] = parent[0]; ent[1] = parent[1]; ent[2] = parent[2];
+        }
+    }
+    *total = t;
+    return 1;
+}
+
+static void gu_print( uint64_t gsp, uint64_t gtop, uint64_t img, uint64_t img_hi )
+{
+    static uint32_t pd_rva, pd_size;
+    static int pd_done;
+    static uint64_t printed[512];
+    static unsigned nprinted;
+    uint64_t loc;
+    int tries = 0;
+
+    if (!pd_done)
+    {
+        unsigned char h[0x200];
+        pd_done = 1;
+        if (xref_read( img, h, sizeof(h) ) && h[0] == 'M' && h[1] == 'Z')
+        {
+            uint32_t pe = *(uint32_t *)(h + 0x3c);
+            if (pe < sizeof(h) - 24 - 112 - 32 && !memcmp( h + pe, "PE\0\0", 4 ))
+            {
+                pd_rva = *(uint32_t *)(h + pe + 24 + 112 + 3 * 8);
+                pd_size = *(uint32_t *)(h + pe + 24 + 112 + 3 * 8 + 4);
+            }
+        }
+    }
+    if (!pd_rva) return;
+    for (loc = gsp; loc + 8 <= gtop && tries < 4096; loc += 8)
+    {
+        uint64_t ra, chain[48], cl = loc, sz;
+        int nch = 0, ended = 0, k;
+        if (!xref_read( loc, &ra, 8 ) || ra < img + 0x1000 || ra >= img_hi || !gu_call_len( ra )) continue;
+        tries++;
+        chain[nch++] = ra;
+        while (nch < 48)
+        {
+            uint64_t nra;
+            if (!gu_frame_size( img, pd_rva, pd_size, chain[nch - 1], &sz )) break;
+            cl = cl + 8 + sz;
+            if (cl + 8 > gtop || !xref_read( cl, &nra, 8 )) break;
+            if (nra < img || nra >= img_hi)                         /* returns out of the image: thread start / host */
+            {
+                ended = nra > 0x100000000ull && nch >= 2;
+                if (!ended) nch = -nch;
+                break;
+            }
+            if (!gu_call_len( nra )) { nch = -nch; break; }          /* inconsistent: not a real chain */
+            chain[nch++] = nra;
+        }
+        if (nch < 0) continue;
+        if (nch < 3 && !ended) continue;
+        {
+            char out[1600];
+            int len = snprintf( out, sizeof(out), "[guest-unwind] at %#llx:%s", (unsigned long long)loc,
+                                ended ? "" : " (cut)" );
+            for (k = 0; k < nch && len < (int)sizeof(out) - 24; k++)
+                len += snprintf( out + len, sizeof(out) - len, " +%#llx", (unsigned long long)(chain[k] - img) );
+            fprintf( stderr, "%s\n", out );
+            for (k = 0; k < nch && k < 6; k++)
+            {
+                unsigned j;
+                for (j = 0; j < nprinted; j++) if (printed[j] == chain[k]) break;
+                if (j < nprinted || nprinted >= 512) continue;
+                printed[nprinted++] = chain[k];
+                xref_print_bytes( "[guest-unwind-code]", chain[k] - 96, 128 );
+            }
+        }
+        return;
+    }
+    fprintf( stderr, "[guest-unwind] no consistent chain (%d candidates)\n", tries );
+}
+
 static void ios_xref_scan_once( void )
 {
     static int done;
@@ -19006,7 +19160,7 @@ void ios_dump_all_thread_stacks(void)
                     if (gs_n > 0 && tebok)
                     {
                         static uint64_t img_lo, img_hi;
-                        uint64_t sp = arm_thread_state64_get_sp( st ), sbase = 0, slimit = 0, top;
+                        uint64_t sp = arm_thread_state64_get_sp( st ), sbase = 0, slimit = 0, top, gsp0 = 0, gtop0 = 0;
                         mach_vm_size_t sg = 0;
                         int found = 0;
                         char line[2048];
@@ -19059,6 +19213,7 @@ void ios_dump_all_thread_stacks(void)
                         sp = (sp + 7) & ~7ull;
                         top = (sp >= slimit && sp < sbase) ? sbase : sp + 0x10000;
                         if (top - sp > 0x40000) top = sp + 0x40000;
+                        gsp0 = sp; gtop0 = top;
                         while (img_hi && sp < top && found < gs_n)
                         {
                             uint64_t q[512];
@@ -19094,6 +19249,7 @@ void ios_dump_all_thread_stacks(void)
                             sp += n * 8;
                         }
                         fprintf( stderr, "%s%s\n", line, img_hi ? "" : " (image not mapped)" );
+                        if (img_hi) gu_print( gsp0, gtop0, img_lo, img_hi );
                     }
                 }
             }
