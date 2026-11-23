@@ -18993,6 +18993,57 @@ static void ios_xref_scan_once( void )
     }
 }
 
+/* [kusd-clock] what the guest reads from KUSER_SHARED_DATA's clocks at each dump, next to
+ * the host clock. A loader or protection wait that compares two readings spins forever if
+ * the page stops moving while the renderer keeps drawing (ml731). Prints how far each field
+ * moved since the previous dump against the host's elapsed time, and the static fields
+ * once. Reads the real page (the same one FEX's inline window reads). */
+static void ios_kusd_clock_report(void)
+{
+    static unsigned long long prev_host_ms, prev_it, prev_st, prev_tc;
+    static int once;
+    struct { unsigned int numer, denom; } tb = {0, 0};
+    extern int mach_timebase_info(void *);
+    const unsigned char *u = (const unsigned char *)ios_exc_usd;
+    unsigned long long host_ms, it, st, tc;
+
+    if (!u) { fprintf(stderr, "[kusd-clock] no KUSER page recorded\n"); return; }
+    mach_timebase_info(&tb);
+    host_ms = tb.denom ? mach_absolute_time() * tb.numer / tb.denom / 1000000ull : 0;
+    /* KSYSTEM_TIME: LowPart, High1Time, High2Time */
+    it = ((unsigned long long)*(volatile unsigned int *)(u + 0x00c) << 32) | *(volatile unsigned int *)(u + 0x008);
+    st = ((unsigned long long)*(volatile unsigned int *)(u + 0x018) << 32) | *(volatile unsigned int *)(u + 0x014);
+    tc = ((unsigned long long)*(volatile unsigned int *)(u + 0x324) << 32) | *(volatile unsigned int *)(u + 0x320);
+    fprintf(stderr, "[kusd-clock] InterruptTime=%llu (100ns) SystemTime=%llu TickCount=%llu TickCountLow=%u\n",
+            it, st, tc, *(volatile unsigned int *)(u + 0x000));
+    if (prev_host_ms)
+    {
+        unsigned long long dh = host_ms - prev_host_ms;
+        long long dit = (long long)(it - prev_it) / 10000, dst = (long long)(st - prev_st) / 10000;
+        long long dtc = (long long)(tc - prev_tc);
+        const char *verdict = (!dit && !dst && !dtc) ? "*** FROZEN: no clock field moved ***" :
+                              (dit < (long long)dh / 2 || dtc < (long long)dh / 2) ? "*** LAGGING the host clock ***" :
+                              "moving with the host clock";
+        fprintf(stderr, "[kusd-clock] since last dump: host %llu ms, InterruptTime %lld ms, SystemTime %lld ms, "
+                "TickCount %lld ms -- %s\n", dh, dit, dst, dtc, verdict);
+    }
+    prev_host_ms = host_ms; prev_it = it; prev_st = st; prev_tc = tc;
+    if (!once)
+    {
+        once = 1;
+        fprintf(stderr, "[kusd-clock] static: NtBuild=%u NtMajor=%u NtMinor=%u ProductType=%u "
+                "KdDebuggerEnabled=%u SafeBoot=%u SharedDataFlags=%#x ActiveProcs=%u PhysPages=%u "
+                "QpcFrequency=%llu QpcBypass=%#x QpcBias=%llu TickCountMultiplier=%#x\n",
+                *(volatile unsigned int *)(u + 0x260), *(volatile unsigned int *)(u + 0x26c),
+                *(volatile unsigned int *)(u + 0x270), *(volatile unsigned int *)(u + 0x264),
+                *(volatile unsigned char *)(u + 0x2d4), *(volatile unsigned char *)(u + 0x2ec),
+                *(volatile unsigned int *)(u + 0x2f0), *(volatile unsigned int *)(u + 0x3c0),
+                *(volatile unsigned int *)(u + 0x2e8),
+                *(volatile unsigned long long *)(u + 0x300), *(volatile unsigned char *)(u + 0x3c6),
+                *(volatile unsigned long long *)(u + 0x3b8), *(volatile unsigned int *)(u + 0x004));
+    }
+}
+
 void ios_dump_all_thread_stacks(void)
 {
     thread_act_array_t threads;
@@ -19001,6 +19052,7 @@ void ios_dump_all_thread_stacks(void)
 
     if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
     fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);
+    ios_kusd_clock_report();
     ios_xref_scan_once();   /* madeira xref-scan / guest dump (env-driven, once) */
     for (i = 0; i < count; i++)
     {
