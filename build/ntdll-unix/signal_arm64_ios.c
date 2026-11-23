@@ -19030,9 +19030,34 @@ void ios_dump_all_thread_stacks(void)
                         }
                         mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 8), 8, (mach_vm_address_t)&sbase, &sg );
                         mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 16), 8, (mach_vm_address_t)&slimit, &sg );
+                        /* A thread parked in a syscall runs on Wine's unix-side kernel stack, not
+                         * the guest stack (first version scanned that and found nothing, log
+                         * 2026-11-23 11:36). The guest sp saved in its syscall frame is somewhere
+                         * on that kernel stack: take the lowest qword there that points into the
+                         * guest stack [StackLimit, StackBase) as the guest sp. */
+                        if (!(sp >= slimit && sp < sbase) && sbase > slimit && sbase - slimit < 0x10000000)
+                        {
+                            uint64_t kq[512], kmin = 0, ko;
+                            for (ko = 0; ko < 0x10000; ko += sizeof(kq))
+                            {
+                                mach_vm_size_t kg = 0;
+                                unsigned kk;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)((sp & ~7ull) + ko), sizeof(kq),
+                                                            (mach_vm_address_t)kq, &kg ) != KERN_SUCCESS || kg != sizeof(kq))
+                                    break;
+                                for (kk = 0; kk < 512; kk++)
+                                    if (kq[kk] >= slimit && kq[kk] < sbase && (!kmin || kq[kk] < kmin)) kmin = kq[kk];
+                            }
+                            len = snprintf( line, sizeof(line), "[guest-stack] native sp=%#llx guest sp=%#llx (stack %#llx-%#llx):",
+                                            (unsigned long long)sp, (unsigned long long)kmin,
+                                            (unsigned long long)slimit, (unsigned long long)sbase );
+                            sp = kmin ? kmin : slimit;
+                        }
+                        else
+                            len = snprintf( line, sizeof(line), "[guest-stack] sp=%#llx (stack %#llx-%#llx):", (unsigned long long)sp,
+                                            (unsigned long long)slimit, (unsigned long long)sbase );
                         top = (sp >= slimit && sp < sbase) ? sbase : sp + 0x10000;
                         if (top - sp > 0x40000) top = sp + 0x40000;
-                        len = snprintf( line, sizeof(line), "[guest-stack] tid stack sp=%#llx:", (unsigned long long)sp );
                         while (img_hi && sp < top && found < gs_n)
                         {
                             uint64_t q[512];
