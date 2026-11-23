@@ -18698,20 +18698,35 @@ void ios_dump_all_thread_stacks(void)
                     uint64_t rself = 0, rring = 0;
                     mach_vm_size_t rg = 0, rg2 = 0;
 
-                    if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) rteb = (uintptr_t)st.__x[18];
-                    else if (pt)
+                    uintptr_t cand[3] = { 0, 0, 0 };
+                    int ci, ok = 0;
+                    static int rmiss;
+
+                    if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) cand[0] = (uintptr_t)st.__x[18];
+                    if (pt)
                     {
                         extern uint64_t ios_ts_teb_export( void *pt );
-                        rteb = (uintptr_t)ios_ts_teb_export( (void *)pt );
+                        cand[1] = (uintptr_t)ios_ts_teb_export( (void *)pt );
+                        cand[2] = (uintptr_t)pt;
                     }
-                    if (rteb && !(rteb & 0xfff)
-                        && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x30), 8,
-                                                   (mach_vm_address_t)&rself, &rg ) == KERN_SUCCESS && rg == 8
-                        && rself == rteb
-                        && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x1710), 8,
-                                                   (mach_vm_address_t)&rring, &rg2 ) == KERN_SUCCESS && rg2 == 8
-                        && rring)
+                    for (ci = 0; ci < 3 && !ok; ci++)
+                    {
+                        rteb = cand[ci]; rself = 0; rring = 0;
+                        if (!rteb || (rteb & 0xfff)) continue;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x30), 8,
+                                                    (mach_vm_address_t)&rself, &rg ) != KERN_SUCCESS || rg != 8
+                            || rself != rteb)
+                            continue;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x1710), 8,
+                                                    (mach_vm_address_t)&rring, &rg2 ) == KERN_SUCCESS && rg2 == 8 && rring)
+                            ok = 1;
+                    }
+                    if (ok)
                         ios_block_ring_dump( rteb, (unsigned)ring_n, "thread-stacks" );
+                    else if (rmiss++ < 300)   /* why a thread got no ring: which TEB guesses there were */
+                        fprintf( stderr, "[block-ring] no ring: x18=%#llx tsd-teb=%#llx pthread=%#llx self=%#llx ring=%#llx\n",
+                                 (unsigned long long)cand[0], (unsigned long long)cand[1], (unsigned long long)cand[2],
+                                 (unsigned long long)rself, (unsigned long long)rring );
                 }
             }
 
