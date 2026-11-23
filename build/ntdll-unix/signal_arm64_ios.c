@@ -18586,158 +18586,240 @@ void ios_wait_chain_snapshot( const char *why )
     }
 }
 
-/* madeira xref-scan: find the code that touches a guest variable.
- * env.MADEIRA_XREF_SCAN = <hex addr>[:<hex len>][,<hex addr>[:<hex len>]...] (up to 8 ranges)
- * scans the executable sections of the main image (env.MADEIRA_XREF_IMAGE, default
- * 0x140000000) once, at the first [thread-stacks] dump where the image is mapped, for
- * rip-relative operands whose target lies in a range, and prints each with its kind
- * (mov byte/dword imm, store reg, load, lea, cmp/op imm) and the 48 bytes before / 24 after.
- * PRAGMATA (2026-11-22): a boot thread polls byte 0x14ba7336c that nothing ever sets;
- * no thread is busy, so a write watch would see nothing. This lists who COULD set it.
- * env.MADEIRA_DUMP_GUEST = <hex addr>:<hex len>[,...] hex-dumps guest memory at the same
- * moment (code around a hit, a struct), up to 64 KB in all. Reads only, via
+/* madeira xref-scan: find the code that touches a guest variable or calls a function.
+ * env.MADEIRA_XREF_SCAN = <hex addr>[:<hex len>][,...] (up to 16 ranges) scans the main image
+ * (env.MADEIRA_XREF_IMAGE, default 0x140000000) once, at the first [thread-stacks] dump where
+ * it is mapped: executable sections for rip-relative operands, call/jmp/jcc rel32 and
+ * call/jmp [rip] into a range, every section for 8-byte pointers into a range (vtables).
+ * Each hit: `[xref] <where> -> <target> <kind> (insn ~<addr>) func <start>-<end>: [<from>] bytes`,
+ * the function bounds from the image's .pdata (unwind chains followed).
+ * env.MADEIRA_XREF_CHAIN = N then walks N levels up: the functions holding the hits become
+ * the next targets (their start addresses), so one run gives the call chain above a
+ * variable or function, each caller's code as `[xref-code]` (the whole function when it is at
+ * most 4 KB, else 384 bytes before the call and 64 after).
+ * env.MADEIRA_DUMP_GUEST = <hex addr>:<hex len>[,...] hex-dumps guest memory (`[dump]`, <= 64 KB).
+ * PRAGMATA (2026-11-23): its black screen is a loading screen whose stop routine
+ * 0x140c640b0 is never called; this finds the loader above it. Reads only, through
  * mach_vm_read_overwrite, so an unmapped page can't fault the dumper. */
+enum { XREF_MAXR = 16, XREF_MAXH = 512, XREF_CHUNK = 4u << 20, XREF_OVER = 64 };
+struct xref_hit { uint64_t at, target, insn; const char *kind; };
+
+static int xref_read( uint64_t a, void *dst, uint64_t n )
+{
+    mach_vm_size_t g = 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a, n, (mach_vm_address_t)dst, &g )
+           == KERN_SUCCESS && g == n;
+}
+
+/* function bounds of addr from .pdata; 0 if none */
+static int xref_func_of( uint64_t img, uint32_t pd_rva, uint32_t pd_size, uint64_t addr,
+                         uint64_t *fs, uint64_t *fe )
+{
+    uint32_t n = pd_size / 12, lo = 0, hi, rva, ent[3];
+    int depth;
+    if (!pd_rva || !n || addr < img || addr - img > 0xffffffffull) return 0;
+    rva = (uint32_t)(addr - img);
+    hi = n;
+    while (lo < hi)
+    {
+        uint32_t mid = (lo + hi) / 2;
+        if (!xref_read( img + pd_rva + (uint64_t)mid * 12, ent, 12 )) return 0;
+        if (rva < ent[0]) hi = mid;
+        else if (rva >= ent[1]) lo = mid + 1;
+        else { lo = mid; break; }
+    }
+    if (lo >= n || !xref_read( img + pd_rva + (uint64_t)lo * 12, ent, 12 ) || rva < ent[0] || rva >= ent[1])
+        return 0;
+    for (depth = 0; depth < 8; depth++)   /* follow UNW_FLAG_CHAININFO to the primary entry */
+    {
+        unsigned char ui[4];
+        uint32_t parent[3], cnt;
+        if (ent[2] & 1) break;   /* unwind data is itself a RUNTIME_FUNCTION index (rare) */
+        if (!xref_read( img + ent[2], ui, 4 ) || !((ui[0] >> 3) & 4)) break;
+        cnt = (ui[2] + 1u) & ~1u;
+        if (!xref_read( img + ent[2] + 4 + cnt * 2, parent, 12 )) break;
+        ent[0] = parent[0]; ent[1] = parent[1]; ent[2] = parent[2];
+    }
+    *fs = img + ent[0];
+    *fe = img + ent[1];
+    return 1;
+}
+
+static int xref_scan( uint64_t img, const unsigned char *hdr, uint32_t pe, unsigned optsz, int nsec,
+                      const uint64_t *rlo, const uint64_t *rhi, int nr, unsigned char *buf,
+                      struct xref_hit *out )
+{
+    int sec, hits = 0;
+    for (sec = 0; sec < nsec; sec++)
+    {
+        const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
+        uint32_t vsz, va, ch;
+        uint64_t off;
+        if ((size_t)(sh + 40 - hdr) > 4096) break;
+        vsz = *(const uint32_t *)(sh + 8); va = *(const uint32_t *)(sh + 12); ch = *(const uint32_t *)(sh + 36);
+        if (!vsz) continue;
+        for (off = 0; off < vsz; off += XREF_CHUNK)
+        {
+            uint64_t base = img + va + off, n = vsz - off, i;
+            if (n > XREF_CHUNK + XREF_OVER) n = XREF_CHUNK + XREF_OVER;
+            if (!xref_read( base, buf, n )) continue;
+            if (ch & 0x20000000u)
+                for (i = 2; i + 5 <= n && i < XREF_CHUNK + 2; i++)
+                {
+                    int32_t d = (int32_t)(buf[i] | buf[i+1] << 8 | buf[i+2] << 16 | (uint32_t)buf[i+3] << 24);
+                    unsigned char op = buf[i-2], rm = buf[i-1];
+                    const char *kind = NULL;
+                    uint64_t t, insn = base + i - 2;
+                    int k, r;
+                    if (rm == 0xE8 || rm == 0xE9) { k = 0; kind = rm == 0xE8 ? "call" : "jmp"; insn = base + i - 1; }
+                    else if (op == 0x0F && (rm & 0xF0) == 0x80) { k = 0; kind = "jcc"; }
+                    else if ((rm & 0xC7) != 0x05) continue;     /* modrm: [rip+disp32] */
+                    else if (op == 0xFF && ((rm & 0x38) == 0x10 || (rm & 0x38) == 0x20)) { k = 0; kind = "call/jmp [rip]"; }
+                    else if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
+                    else if (op == 0xC7) { k = 4; kind = "mov dword imm"; }
+                    else if (op == 0x88 || op == 0x89) { k = 0; kind = "store reg"; }
+                    else if (op == 0x8A || op == 0x8B) { k = 0; kind = "load"; }
+                    else if (op == 0x8D) { k = 0; kind = "lea"; }
+                    else if (op == 0x80 || op == 0x83) { k = 1; kind = (rm & 0x38) == 0x38 ? "cmp imm8" : "op imm8"; }
+                    else if (op == 0x81) { k = 4; kind = (rm & 0x38) == 0x38 ? "cmp imm32" : "op imm32"; }
+                    else if (op == 0x86 || op == 0x87) { k = 0; kind = "xchg"; }
+                    else if (op == 0xB0 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "cmpxchg"; insn = base + i - 3; }
+                    else if (op == 0xB6 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "movzx byte"; insn = base + i - 3; }
+                    else continue;
+                    t = base + i + 4 + k + (int64_t)d;
+                    for (r = 0; r < nr; r++)
+                        if (t >= rlo[r] && t < rhi[r]) break;
+                    if (r == nr) continue;
+                    if (hits < XREF_MAXH) { out[hits].at = base + i; out[hits].target = t; out[hits].insn = insn; out[hits].kind = kind; }
+                    hits++;
+                }
+            for (i = 0; i + 8 <= n && i < XREF_CHUNK; i += 8)   /* absolute pointers, any section */
+            {
+                uint64_t v;
+                int r;
+                memcpy( &v, buf + i, 8 );
+                if (v < img || v - img > 0x40000000ull) continue;
+                for (r = 0; r < nr; r++)
+                    if (v >= rlo[r] && v < rhi[r]) break;
+                if (r == nr) continue;
+                if (hits < XREF_MAXH) { out[hits].at = base + i; out[hits].target = v; out[hits].insn = base + i; out[hits].kind = "ptr64"; }
+                hits++;
+            }
+        }
+    }
+    return hits;
+}
+
+static void xref_print_bytes( const char *tag, uint64_t from, uint64_t len )
+{
+    unsigned char row[32];
+    uint64_t o;
+    for (o = 0; o < len; o += 32)
+    {
+        char hx[32 * 3 + 1];
+        int b;
+        if (!xref_read( from + o, row, 32 )) { fprintf( stderr, "%s %p: unreadable\n", tag, (void *)(from + o) ); continue; }
+        for (b = 0; b < 32; b++) snprintf( hx + b * 3, 4, "%02x ", row[b] );
+        fprintf( stderr, "%s %p: %s\n", tag, (void *)(from + o), hx );
+    }
+}
+
 static void ios_xref_scan_once( void )
 {
     static int done;
-    enum { MAXR = 8, CHUNK = 4u << 20, OVER = 64 };
-    uintptr_t rlo[MAXR], rhi[MAXR], img;
-    int nr = 0, sec, nsec, hits = 0;
+    uint64_t rlo[XREF_MAXR], rhi[XREF_MAXR], img;
+    int nr = 0, nsec, level, chain = 0, printed = 0;
     const char *e, *q;
     unsigned char hdr[4096];
-    mach_vm_size_t g = 0;
     unsigned char *buf;
+    struct xref_hit *hit;
+    uint32_t pe, pd_rva = 0, pd_size = 0;
+    unsigned optsz;
 
     if (done) return;
     e = getenv( "MADEIRA_XREF_SCAN" );
     q = getenv( "MADEIRA_DUMP_GUEST" );
     if ((!e || !*e) && (!q || !*q)) { done = 1; return; }
     img = 0x140000000ull;
-    { const char *im = getenv( "MADEIRA_XREF_IMAGE" ); if (im && *im) img = (uintptr_t)strtoull( im, NULL, 16 ); }
-    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)img, sizeof(hdr),
-                                (mach_vm_address_t)hdr, &g ) != KERN_SUCCESS || g != sizeof(hdr)
-        || hdr[0] != 'M' || hdr[1] != 'Z')
+    { const char *im = getenv( "MADEIRA_XREF_IMAGE" ); if (im && *im) img = (uint64_t)strtoull( im, NULL, 16 ); }
+    { const char *c = getenv( "MADEIRA_XREF_CHAIN" ); if (c && *c) chain = atoi( c ); if (chain < 0) chain = 0; if (chain > 8) chain = 8; }
+    if (!xref_read( img, hdr, sizeof(hdr) ) || hdr[0] != 'M' || hdr[1] != 'Z')
         return;   /* not mapped yet: try again at the next dump */
     done = 1;
 
-    while (e && *e && nr < MAXR)
+    while (e && *e && nr < XREF_MAXR)
     {
         char *end;
-        uintptr_t a = (uintptr_t)strtoull( e, &end, 16 ), len = 1;
+        uint64_t a = (uint64_t)strtoull( e, &end, 16 ), len = 1;
         if (end == e) break;
-        if (*end == ':') len = (uintptr_t)strtoull( end + 1, &end, 16 );
+        if (*end == ':') len = (uint64_t)strtoull( end + 1, &end, 16 );
         if (a && len) { rlo[nr] = a; rhi[nr] = a + len; nr++; }
         while (*end && *end != ',') end++;
         e = *end ? end + 1 : end;
     }
 
-    if (nr && (buf = malloc( CHUNK + OVER )))
+    pe = *(uint32_t *)(hdr + 0x3c);
+    if (nr && pe < sizeof(hdr) - 24 && !memcmp( hdr + pe, "PE\0\0", 4 )
+        && (buf = malloc( XREF_CHUNK + XREF_OVER )) && (hit = malloc( sizeof(*hit) * XREF_MAXH )))
     {
-        uint32_t pe = *(uint32_t *)(hdr + 0x3c);
-        if (pe < sizeof(hdr) - 24 && !memcmp( hdr + pe, "PE\0\0", 4 ))
+        optsz = *(uint16_t *)(hdr + pe + 20);
+        nsec = *(uint16_t *)(hdr + pe + 6);
+        if (optsz >= 112 + 4 * 8)   /* PE32+ data directory 3 = exception (.pdata) */
         {
-            unsigned optsz = *(uint16_t *)(hdr + pe + 20);
-            nsec = *(uint16_t *)(hdr + pe + 6);
-            fprintf( stderr, "[xref] scanning %d section(s) of the image at %p for %d range(s)\n", nsec, (void *)img, nr );
-            for (sec = 0; sec < nsec; sec++)
-            {
-                const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
-                uint32_t vsz, va, ch;
-                uint64_t off;
-                if ((size_t)(sh + 40 - hdr) > sizeof(hdr)) break;
-                vsz = *(uint32_t *)(sh + 8); va = *(uint32_t *)(sh + 12); ch = *(uint32_t *)(sh + 36);
-                if (!(ch & 0x20000000u) || !vsz) continue;
-                fprintf( stderr, "[xref] section %.8s %p +%#x\n", (const char *)sh, (void *)(img + va), vsz );
-                for (off = 0; off < vsz; off += CHUNK)
-                {
-                    uint64_t base = img + va + off, n = vsz - off, i;
-                    if (n > CHUNK + OVER) n = CHUNK + OVER;
-                    g = 0;
-                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)base, n,
-                                                (mach_vm_address_t)buf, &g ) != KERN_SUCCESS || g != n)
-                        continue;
-                    for (i = 2; i + 5 <= n && i < CHUNK + 2; i++)
-                    {
-                        int32_t d = (int32_t)(buf[i] | buf[i+1] << 8 | buf[i+2] << 16 | (uint32_t)buf[i+3] << 24);
-                        unsigned char op = buf[i-2], rm = buf[i-1];
-                        const char *kind = NULL;
-                        uint64_t t;
-                        int k, r;
-                        if (rm == 0xE8 || rm == 0xE9) { k = 0; kind = rm == 0xE8 ? "call" : "jmp"; }
-                        else if (op == 0x0F && (rm & 0xF0) == 0x80) { k = 0; kind = "jcc"; }
-                        else if ((rm & 0xC7) != 0x05) continue;     /* modrm: [rip+disp32] */
-                        else if (op == 0xFF && ((rm & 0x38) == 0x10 || (rm & 0x38) == 0x20)) { k = 0; kind = "call/jmp [rip]"; }
-                        else if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
-                        else if (op == 0xC7) { k = 4; kind = "mov dword imm"; }
-                        else if (op == 0x88 || op == 0x89) { k = 0; kind = "store reg"; }
-                        else if (op == 0x8A || op == 0x8B) { k = 0; kind = "load"; }
-                        else if (op == 0x8D) { k = 0; kind = "lea"; }
-                        else if (op == 0x80 || op == 0x83) { k = 1; kind = (rm & 0x38) == 0x38 ? "cmp imm8" : "op imm8"; }
-                        else if (op == 0x81) { k = 4; kind = (rm & 0x38) == 0x38 ? "cmp imm32" : "op imm32"; }
-                        else if (op == 0x86 || op == 0x87) { k = 0; kind = "xchg"; }
-                        else if (op == 0xB0 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "cmpxchg"; }
-                        else if (op == 0xB6 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "movzx byte"; }
-                        else continue;
-                        t = base + i + 4 + k + (int64_t)d;
-                        for (r = 0; r < nr; r++)
-                            if (t >= rlo[r] && t < rhi[r]) break;
-                        if (r == nr) continue;
-                        if (hits++ < 400)
-                        {
-                            char hx[72 * 3 + 1];
-                            int b, from = (int)i - 48, to = (int)i + 24;
-                            hx[0] = 0;
-                            if (from < 0) from = 0;
-                            if ((uint64_t)to > n) to = (int)n;
-                            for (b = from; b < to; b++) snprintf( hx + (b - from) * 3, 4, "%02x ", buf[b] );
-                            fprintf( stderr, "[xref] %p -> %p %s (insn ~%p): [%p] %s\n", (void *)(base + i),
-                                     (void *)t, kind, (void *)(base + i - 2), (void *)(base + from), hx );
-                        }
-                    }
-                }
-            }
-            /* absolute 8-byte pointers to a range anywhere in the image (vtables, function tables) */
-            for (sec = 0; sec < nsec; sec++)
-            {
-                const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
-                uint32_t vsz, va;
-                uint64_t off;
-                if ((size_t)(sh + 40 - hdr) > sizeof(hdr)) break;
-                vsz = *(uint32_t *)(sh + 8); va = *(uint32_t *)(sh + 12);
-                if (!vsz) continue;
-                for (off = 0; off < vsz; off += CHUNK)
-                {
-                    uint64_t base = img + va + off, n = vsz - off, i;
-                    if (n > CHUNK) n = CHUNK;
-                    g = 0;
-                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)base, n,
-                                                (mach_vm_address_t)buf, &g ) != KERN_SUCCESS || g != n)
-                        continue;
-                    for (i = 0; i + 8 <= n; i += 8)
-                    {
-                        uint64_t v;
-                        int r;
-                        memcpy( &v, buf + i, 8 );
-                        if (v < 0x140000000ull || v >= 0x160000000ull) continue;
-                        for (r = 0; r < nr; r++)
-                            if (v >= rlo[r] && v < rhi[r]) break;
-                        if (r == nr) continue;
-                        if (hits++ < 400)
-                        {
-                            char hx[64 * 3 + 1];
-                            int b, from = i >= 32 ? (int)i - 32 : 0, to = (int)i + 32 <= (int)n ? (int)i + 32 : (int)n;
-                            hx[0] = 0;
-                            for (b = from; b < to; b++) snprintf( hx + (b - from) * 3, 4, "%02x ", buf[b] );
-                            fprintf( stderr, "[xref] %p -> %p ptr64 in %.8s: [%p] %s\n", (void *)(base + i), (void *)v,
-                                     (const char *)sh, (void *)(base + from), hx );
-                        }
-                    }
-                }
-            }
-            fprintf( stderr, "[xref] done: %d reference(s)%s\n", hits, hits > 400 ? " (first 400 printed)" : "" );
+            pd_rva = *(uint32_t *)(hdr + pe + 24 + 112 + 3 * 8);
+            pd_size = *(uint32_t *)(hdr + pe + 24 + 112 + 3 * 8 + 4);
         }
+        fprintf( stderr, "[xref] image %p: %d section(s), .pdata rva %#x (%u functions); %d range(s), chain %d\n",
+                 (void *)img, nsec, pd_rva, pd_size / 12, nr, chain );
+        for (level = 0; level <= chain && nr; level++)
+        {
+            int nh = xref_scan( img, hdr, pe, optsz, nsec, rlo, rhi, nr, buf, hit ), h, nn = 0;
+            uint64_t nlo[XREF_MAXR];
+            fprintf( stderr, "[xref] level %d: %d reference(s) to %d range(s)%s\n", level, nh, nr,
+                     nh > XREF_MAXH ? " (first 512 kept)" : "" );
+            if (nh > XREF_MAXH) nh = XREF_MAXH;
+            for (h = 0; h < nh; h++)
+            {
+                uint64_t fs = 0, fe = 0;
+                int have = xref_func_of( img, pd_rva, pd_size, hit[h].insn, &fs, &fe ), j;
+                if (printed++ < 600)
+                {
+                    char hx[72 * 3 + 1];
+                    unsigned char ctx[72];
+                    int b;
+                    hx[0] = 0;
+                    if (xref_read( hit[h].at - 48, ctx, 72 ))
+                        for (b = 0; b < 72; b++) snprintf( hx + b * 3, 4, "%02x ", ctx[b] );
+                    fprintf( stderr, "[xref] L%d %p -> %p %s (insn ~%p) func %p-%p: [%p] %s\n", level,
+                             (void *)hit[h].at, (void *)hit[h].target, hit[h].kind, (void *)hit[h].insn,
+                             (void *)fs, (void *)fe, (void *)(hit[h].at - 48), hx );
+                    if (chain && strcmp( hit[h].kind, "ptr64" ))
+                    {
+                        if (have && fe > fs && fe - fs <= 4096)   /* the whole function */
+                            xref_print_bytes( "[xref-code]", fs & ~31ull, ((fe - (fs & ~31ull)) + 31) & ~31ull );
+                        else
+                            xref_print_bytes( "[xref-code]", (hit[h].insn - 384) & ~31ull, 384 + 64 + 32 );
+                    }
+                }
+                if (!have || level == chain) continue;
+                for (j = 0; j < nn; j++) if (nlo[j] == fs) break;
+                if (j == nn && nn < XREF_MAXR) nlo[nn++] = fs;
+            }
+            for (h = 0; h < nn; h++) { rlo[h] = nlo[h]; rhi[h] = nlo[h] + 1; }
+            nr = nn;
+            if (level < chain && nn)
+            {
+                fprintf( stderr, "[xref] next level targets:" );
+                for (h = 0; h < nn; h++) fprintf( stderr, " %p", (void *)nlo[h] );
+                fprintf( stderr, "\n" );
+            }
+        }
+        fprintf( stderr, "[xref] done\n" );
+        free( hit );
         free( buf );
     }
+    else if (nr)
+        fprintf( stderr, "[xref] no PE header at %p\n", (void *)img );
 
     if (q && *q)
     {
@@ -18745,24 +18827,12 @@ static void ios_xref_scan_once( void )
         while (*q && total < 65536)
         {
             char *end;
-            uintptr_t a = (uintptr_t)strtoull( q, &end, 16 ), len = 0x100, o;
+            uint64_t a = (uint64_t)strtoull( q, &end, 16 ), len = 0x100;
             if (end == q) break;
-            if (*end == ':') len = (uintptr_t)strtoull( end + 1, &end, 16 );
-            for (o = 0; o < len && total < 65536; o += 32, total += 32)
-            {
-                unsigned char row[32];
-                char hx[32 * 3 + 1];
-                int b;
-                g = 0;
-                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(a + o), 32,
-                                            (mach_vm_address_t)row, &g ) != KERN_SUCCESS || g != 32)
-                {
-                    fprintf( stderr, "[dump] %p: unreadable\n", (void *)(a + o) );
-                    continue;
-                }
-                for (b = 0; b < 32; b++) snprintf( hx + b * 3, 4, "%02x ", row[b] );
-                fprintf( stderr, "[dump] %p: %s\n", (void *)(a + o), hx );
-            }
+            if (*end == ':') len = (uint64_t)strtoull( end + 1, &end, 16 );
+            if (len > 65536 - total) len = 65536 - total;
+            xref_print_bytes( "[dump]", a, (len + 31) & ~31ull );
+            total += (unsigned)((len + 31) & ~31ull);
             while (*end && *end != ',') end++;
             q = *end ? end + 1 : end;
         }
