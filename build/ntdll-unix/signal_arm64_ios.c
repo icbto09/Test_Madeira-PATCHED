@@ -18938,22 +18938,33 @@ void ios_dump_all_thread_stacks(void)
              * 2026-11-22 20:04), confirmed by TEB->Self (TEB+0x30) before the ring at
              * TEB+0x1710 is read. Reads only. */
             {
-                static int ring_n = -1;
+                static int ring_n = -1, gs_n = -1;
                 if (ring_n < 0)
                 {
                     const char *e = getenv( "MADEIRA_BLOCK_RING_STACKS" );
                     ring_n = (e && *e) ? atoi( e ) : 0;
                     if (ring_n < 0) ring_n = 0;
                     if (ring_n > 1536) ring_n = 1536;
+                    /* madeira guest-stack: env.MADEIRA_GUEST_STACK = N prints up to N return
+                     * addresses found on each guest thread's stack (sp .. TEB StackBase) that
+                     * point into the main image (0x140000000, SizeOfImage from its header)
+                     * right after a call instruction: a heuristic call stack of where the
+                     * thread is blocked. PRAGMATA's main thread (log 2026-11-22 21:16) only
+                     * shows its window procedure in the ring, called again and again from a
+                     * native wait; this shows which game call is underneath. */
+                    e = getenv( "MADEIRA_GUEST_STACK" );
+                    gs_n = (e && *e) ? atoi( e ) : 0;
+                    if (gs_n < 0) gs_n = 0;
+                    if (gs_n > 128) gs_n = 128;
                 }
-                if (ring_n > 0)
+                if (ring_n > 0 || gs_n > 0)
                 {
                     uintptr_t rteb = 0;
                     uint64_t rself = 0, rring = 0;
                     mach_vm_size_t rg = 0, rg2 = 0;
 
                     uintptr_t cand[3] = { 0, 0, 0 };
-                    int ci, ok = 0;
+                    int ci, ok = 0, tebok = 0;
                     static int rmiss;
 
                     if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) cand[0] = (uintptr_t)st.__x[18];
@@ -18965,22 +18976,98 @@ void ios_dump_all_thread_stacks(void)
                     }
                     for (ci = 0; ci < 3 && !ok; ci++)
                     {
-                        rteb = cand[ci]; rself = 0; rring = 0;
-                        if (!rteb || (rteb & 0xfff)) continue;
-                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x30), 8,
-                                                    (mach_vm_address_t)&rself, &rg ) != KERN_SUCCESS || rg != 8
-                            || rself != rteb)
+                        uintptr_t c = cand[ci];
+                        uint64_t sf = 0, rr = 0;
+                        if (!c || (c & 0xfff)) continue;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(c + 0x30), 8,
+                                                    (mach_vm_address_t)&sf, &rg ) != KERN_SUCCESS || rg != 8
+                            || sf != c)
                             continue;
-                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x1710), 8,
-                                                    (mach_vm_address_t)&rring, &rg2 ) == KERN_SUCCESS && rg2 == 8 && rring)
-                            ok = 1;
+                        if (!tebok) { tebok = 1; rteb = c; rself = sf; }
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(c + 0x1710), 8,
+                                                    (mach_vm_address_t)&rr, &rg2 ) == KERN_SUCCESS && rg2 == 8 && rr)
+                        { ok = 1; rteb = c; rring = rr; }
                     }
-                    if (ok)
+                    if (tebok)
+                    {
+                        uint64_t tid = 0;
+                        mach_vm_size_t tg = 0;
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x48), 8,
+                                                (mach_vm_address_t)&tid, &tg );
+                        fprintf( stderr, "[thread-stacks]   guest tid=%04llx teb=%#llx\n",
+                                 (unsigned long long)tid, (unsigned long long)rteb );
+                    }
+                    if (ring_n > 0 && ok)
                         ios_block_ring_dump( rteb, (unsigned)ring_n, "thread-stacks" );
-                    else if (rmiss++ < 300)   /* why a thread got no ring: which TEB guesses there were */
+                    else if (ring_n > 0 && rmiss++ < 300)   /* why a thread got no ring: which TEB guesses there were */
                         fprintf( stderr, "[block-ring] no ring: x18=%#llx tsd-teb=%#llx pthread=%#llx self=%#llx ring=%#llx\n",
                                  (unsigned long long)cand[0], (unsigned long long)cand[1], (unsigned long long)cand[2],
                                  (unsigned long long)rself, (unsigned long long)rring );
+                    if (gs_n > 0 && tebok)
+                    {
+                        static uint64_t img_lo, img_hi;
+                        uint64_t sp = arm_thread_state64_get_sp( st ), sbase = 0, slimit = 0, top;
+                        mach_vm_size_t sg = 0;
+                        int found = 0;
+                        char line[2048];
+                        int len = 0;
+
+                        if (!img_hi)
+                        {
+                            unsigned char h[0x200];
+                            mach_vm_size_t hg = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), 0x140000000ull, sizeof(h),
+                                                        (mach_vm_address_t)h, &hg ) == KERN_SUCCESS && hg == sizeof(h)
+                                && h[0] == 'M' && h[1] == 'Z')
+                            {
+                                uint32_t pe = *(uint32_t *)(h + 0x3c);
+                                if (pe < sizeof(h) - 0x58 && !memcmp( h + pe, "PE\0\0", 4 ))
+                                {
+                                    img_lo = 0x140000000ull;
+                                    img_hi = img_lo + *(uint32_t *)(h + pe + 24 + 56);   /* SizeOfImage */
+                                }
+                            }
+                        }
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 8), 8, (mach_vm_address_t)&sbase, &sg );
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 16), 8, (mach_vm_address_t)&slimit, &sg );
+                        top = (sp >= slimit && sp < sbase) ? sbase : sp + 0x10000;
+                        if (top - sp > 0x40000) top = sp + 0x40000;
+                        len = snprintf( line, sizeof(line), "[guest-stack] tid stack sp=%#llx:", (unsigned long long)sp );
+                        while (img_hi && sp < top && found < gs_n)
+                        {
+                            uint64_t q[512];
+                            mach_vm_size_t qg = 0;
+                            uint64_t n = (top - sp) / 8, k;
+                            if (n > 512) n = 512;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(sp & ~7ull), n * 8,
+                                                        (mach_vm_address_t)q, &qg ) != KERN_SUCCESS || qg != n * 8)
+                                break;
+                            for (k = 0; k < n && found < gs_n; k++)
+                            {
+                                unsigned char c[8];
+                                mach_vm_size_t cg = 0;
+                                uint64_t ra = q[k];
+                                int call = 0;
+                                if (ra < img_lo + 0x1000 || ra >= img_hi) continue;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ra - 8), 8,
+                                                            (mach_vm_address_t)c, &cg ) != KERN_SUCCESS || cg != 8)
+                                    continue;
+                                if (c[3] == 0xE8) call = 5;                                          /* call rel32 */
+                                else if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC7) == 0x05) call = 6; /* call [rip+d32] */
+                                else if (c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) call = 2;             /* call reg */
+                                else if (c[5] == 0xFF && (c[6] & 0x38) == 0x10 && (c[6] & 0xC0) == 0x40) call = 3; /* call [reg+d8] */
+                                else if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC0) == 0x80) call = 6; /* call [reg+d32] */
+                                else if (c[6] == 0xFF && (c[7] & 0x38) == 0x10 && (c[7] & 0xC0) == 0x00) call = 2; /* call [reg] */
+                                if (!call) continue;
+                                found++;
+                                if (len < (int)sizeof(line) - 40)
+                                    len += snprintf( line + len, sizeof(line) - len, " +%#llx(%d)",
+                                                     (unsigned long long)(ra - img_lo), call );
+                            }
+                            sp += n * 8;
+                        }
+                        fprintf( stderr, "%s%s\n", line, img_hi ? "" : " (image not mapped)" );
+                    }
                 }
             }
 
