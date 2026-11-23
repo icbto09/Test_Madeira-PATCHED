@@ -18663,8 +18663,11 @@ static void ios_xref_scan_once( void )
                         const char *kind = NULL;
                         uint64_t t;
                         int k, r;
-                        if ((rm & 0xC7) != 0x05) continue;          /* modrm: [rip+disp32] */
-                        if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
+                        if (rm == 0xE8 || rm == 0xE9) { k = 0; kind = rm == 0xE8 ? "call" : "jmp"; }
+                        else if (op == 0x0F && (rm & 0xF0) == 0x80) { k = 0; kind = "jcc"; }
+                        else if ((rm & 0xC7) != 0x05) continue;     /* modrm: [rip+disp32] */
+                        else if (op == 0xFF && ((rm & 0x38) == 0x10 || (rm & 0x38) == 0x20)) { k = 0; kind = "call/jmp [rip]"; }
+                        else if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
                         else if (op == 0xC7) { k = 4; kind = "mov dword imm"; }
                         else if (op == 0x88 || op == 0x89) { k = 0; kind = "store reg"; }
                         else if (op == 0x8A || op == 0x8B) { k = 0; kind = "load"; }
@@ -18689,6 +18692,44 @@ static void ios_xref_scan_once( void )
                             for (b = from; b < to; b++) snprintf( hx + (b - from) * 3, 4, "%02x ", buf[b] );
                             fprintf( stderr, "[xref] %p -> %p %s (insn ~%p): [%p] %s\n", (void *)(base + i),
                                      (void *)t, kind, (void *)(base + i - 2), (void *)(base + from), hx );
+                        }
+                    }
+                }
+            }
+            /* absolute 8-byte pointers to a range anywhere in the image (vtables, function tables) */
+            for (sec = 0; sec < nsec; sec++)
+            {
+                const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
+                uint32_t vsz, va;
+                uint64_t off;
+                if ((size_t)(sh + 40 - hdr) > sizeof(hdr)) break;
+                vsz = *(uint32_t *)(sh + 8); va = *(uint32_t *)(sh + 12);
+                if (!vsz) continue;
+                for (off = 0; off < vsz; off += CHUNK)
+                {
+                    uint64_t base = img + va + off, n = vsz - off, i;
+                    if (n > CHUNK) n = CHUNK;
+                    g = 0;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)base, n,
+                                                (mach_vm_address_t)buf, &g ) != KERN_SUCCESS || g != n)
+                        continue;
+                    for (i = 0; i + 8 <= n; i += 8)
+                    {
+                        uint64_t v;
+                        int r;
+                        memcpy( &v, buf + i, 8 );
+                        if (v < 0x140000000ull || v >= 0x160000000ull) continue;
+                        for (r = 0; r < nr; r++)
+                            if (v >= rlo[r] && v < rhi[r]) break;
+                        if (r == nr) continue;
+                        if (hits++ < 400)
+                        {
+                            char hx[64 * 3 + 1];
+                            int b, from = i >= 32 ? (int)i - 32 : 0, to = (int)i + 32 <= (int)n ? (int)i + 32 : (int)n;
+                            hx[0] = 0;
+                            for (b = from; b < to; b++) snprintf( hx + (b - from) * 3, 4, "%02x ", buf[b] );
+                            fprintf( stderr, "[xref] %p -> %p ptr64 in %.8s: [%p] %s\n", (void *)(base + i), (void *)v,
+                                     (const char *)sh, (void *)(base + from), hx );
                         }
                     }
                 }
