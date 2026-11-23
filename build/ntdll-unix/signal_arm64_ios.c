@@ -19056,6 +19056,7 @@ void ios_dump_all_thread_stacks(void)
                         else
                             len = snprintf( line, sizeof(line), "[guest-stack] sp=%#llx (stack %#llx-%#llx):", (unsigned long long)sp,
                                             (unsigned long long)slimit, (unsigned long long)sbase );
+                        sp = (sp + 7) & ~7ull;
                         top = (sp >= slimit && sp < sbase) ? sbase : sp + 0x10000;
                         if (top - sp > 0x40000) top = sp + 0x40000;
                         while (img_hi && sp < top && found < gs_n)
@@ -19064,7 +19065,8 @@ void ios_dump_all_thread_stacks(void)
                             mach_vm_size_t qg = 0;
                             uint64_t n = (top - sp) / 8, k;
                             if (n > 512) n = 512;
-                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(sp & ~7ull), n * 8,
+                            if (!n) break;   /* < 8 bytes left: n = 0 never advanced sp (hung the dump, log 2026-11-23 12:32) */
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)sp, n * 8,
                                                         (mach_vm_address_t)q, &qg ) != KERN_SUCCESS || qg != n * 8)
                                 break;
                             for (k = 0; k < n && found < gs_n; k++)
