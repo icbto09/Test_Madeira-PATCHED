@@ -18586,6 +18586,148 @@ void ios_wait_chain_snapshot( const char *why )
     }
 }
 
+/* madeira xref-scan: find the code that touches a guest variable.
+ * env.MADEIRA_XREF_SCAN = <hex addr>[:<hex len>][,<hex addr>[:<hex len>]...] (up to 8 ranges)
+ * scans the executable sections of the main image (env.MADEIRA_XREF_IMAGE, default
+ * 0x140000000) once, at the first [thread-stacks] dump where the image is mapped, for
+ * rip-relative operands whose target lies in a range, and prints each with its kind
+ * (mov byte/dword imm, store reg, load, lea, cmp/op imm) and the 48 bytes before / 24 after.
+ * PRAGMATA (2026-11-22): a boot thread polls byte 0x14ba7336c that nothing ever sets;
+ * no thread is busy, so a write watch would see nothing. This lists who COULD set it.
+ * env.MADEIRA_DUMP_GUEST = <hex addr>:<hex len>[,...] hex-dumps guest memory at the same
+ * moment (code around a hit, a struct), up to 64 KB in all. Reads only, via
+ * mach_vm_read_overwrite, so an unmapped page can't fault the dumper. */
+static void ios_xref_scan_once( void )
+{
+    static int done;
+    enum { MAXR = 8, CHUNK = 4u << 20, OVER = 64 };
+    uintptr_t rlo[MAXR], rhi[MAXR], img;
+    int nr = 0, sec, nsec, hits = 0;
+    const char *e, *q;
+    unsigned char hdr[4096];
+    mach_vm_size_t g = 0;
+    unsigned char *buf;
+
+    if (done) return;
+    e = getenv( "MADEIRA_XREF_SCAN" );
+    q = getenv( "MADEIRA_DUMP_GUEST" );
+    if ((!e || !*e) && (!q || !*q)) { done = 1; return; }
+    img = 0x140000000ull;
+    { const char *im = getenv( "MADEIRA_XREF_IMAGE" ); if (im && *im) img = (uintptr_t)strtoull( im, NULL, 16 ); }
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)img, sizeof(hdr),
+                                (mach_vm_address_t)hdr, &g ) != KERN_SUCCESS || g != sizeof(hdr)
+        || hdr[0] != 'M' || hdr[1] != 'Z')
+        return;   /* not mapped yet: try again at the next dump */
+    done = 1;
+
+    while (e && *e && nr < MAXR)
+    {
+        char *end;
+        uintptr_t a = (uintptr_t)strtoull( e, &end, 16 ), len = 1;
+        if (end == e) break;
+        if (*end == ':') len = (uintptr_t)strtoull( end + 1, &end, 16 );
+        if (a && len) { rlo[nr] = a; rhi[nr] = a + len; nr++; }
+        while (*end && *end != ',') end++;
+        e = *end ? end + 1 : end;
+    }
+
+    if (nr && (buf = malloc( CHUNK + OVER )))
+    {
+        uint32_t pe = *(uint32_t *)(hdr + 0x3c);
+        if (pe < sizeof(hdr) - 24 && !memcmp( hdr + pe, "PE\0\0", 4 ))
+        {
+            unsigned optsz = *(uint16_t *)(hdr + pe + 20);
+            nsec = *(uint16_t *)(hdr + pe + 6);
+            fprintf( stderr, "[xref] scanning %d section(s) of the image at %p for %d range(s)\n", nsec, (void *)img, nr );
+            for (sec = 0; sec < nsec; sec++)
+            {
+                const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
+                uint32_t vsz, va, ch;
+                uint64_t off;
+                if ((size_t)(sh + 40 - hdr) > sizeof(hdr)) break;
+                vsz = *(uint32_t *)(sh + 8); va = *(uint32_t *)(sh + 12); ch = *(uint32_t *)(sh + 36);
+                if (!(ch & 0x20000000u) || !vsz) continue;
+                fprintf( stderr, "[xref] section %.8s %p +%#x\n", (const char *)sh, (void *)(img + va), vsz );
+                for (off = 0; off < vsz; off += CHUNK)
+                {
+                    uint64_t base = img + va + off, n = vsz - off, i;
+                    if (n > CHUNK + OVER) n = CHUNK + OVER;
+                    g = 0;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)base, n,
+                                                (mach_vm_address_t)buf, &g ) != KERN_SUCCESS || g != n)
+                        continue;
+                    for (i = 2; i + 5 <= n && i < CHUNK + 2; i++)
+                    {
+                        int32_t d = (int32_t)(buf[i] | buf[i+1] << 8 | buf[i+2] << 16 | (uint32_t)buf[i+3] << 24);
+                        unsigned char op = buf[i-2], rm = buf[i-1];
+                        const char *kind = NULL;
+                        uint64_t t;
+                        int k, r;
+                        if ((rm & 0xC7) != 0x05) continue;          /* modrm: [rip+disp32] */
+                        if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
+                        else if (op == 0xC7) { k = 4; kind = "mov dword imm"; }
+                        else if (op == 0x88 || op == 0x89) { k = 0; kind = "store reg"; }
+                        else if (op == 0x8A || op == 0x8B) { k = 0; kind = "load"; }
+                        else if (op == 0x8D) { k = 0; kind = "lea"; }
+                        else if (op == 0x80 || op == 0x83) { k = 1; kind = (rm & 0x38) == 0x38 ? "cmp imm8" : "op imm8"; }
+                        else if (op == 0x81) { k = 4; kind = (rm & 0x38) == 0x38 ? "cmp imm32" : "op imm32"; }
+                        else if (op == 0x86 || op == 0x87) { k = 0; kind = "xchg"; }
+                        else if (op == 0xB0 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "cmpxchg"; }
+                        else if (op == 0xB6 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "movzx byte"; }
+                        else continue;
+                        t = base + i + 4 + k + (int64_t)d;
+                        for (r = 0; r < nr; r++)
+                            if (t >= rlo[r] && t < rhi[r]) break;
+                        if (r == nr) continue;
+                        if (hits++ < 400)
+                        {
+                            char hx[72 * 3 + 1];
+                            int b, from = (int)i - 48, to = (int)i + 24;
+                            hx[0] = 0;
+                            if (from < 0) from = 0;
+                            if ((uint64_t)to > n) to = (int)n;
+                            for (b = from; b < to; b++) snprintf( hx + (b - from) * 3, 4, "%02x ", buf[b] );
+                            fprintf( stderr, "[xref] %p -> %p %s (insn ~%p): [%p] %s\n", (void *)(base + i),
+                                     (void *)t, kind, (void *)(base + i - 2), (void *)(base + from), hx );
+                        }
+                    }
+                }
+            }
+            fprintf( stderr, "[xref] done: %d reference(s)%s\n", hits, hits > 400 ? " (first 400 printed)" : "" );
+        }
+        free( buf );
+    }
+
+    if (q && *q)
+    {
+        unsigned total = 0;
+        while (*q && total < 65536)
+        {
+            char *end;
+            uintptr_t a = (uintptr_t)strtoull( q, &end, 16 ), len = 0x100, o;
+            if (end == q) break;
+            if (*end == ':') len = (uintptr_t)strtoull( end + 1, &end, 16 );
+            for (o = 0; o < len && total < 65536; o += 32, total += 32)
+            {
+                unsigned char row[32];
+                char hx[32 * 3 + 1];
+                int b;
+                g = 0;
+                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(a + o), 32,
+                                            (mach_vm_address_t)row, &g ) != KERN_SUCCESS || g != 32)
+                {
+                    fprintf( stderr, "[dump] %p: unreadable\n", (void *)(a + o) );
+                    continue;
+                }
+                for (b = 0; b < 32; b++) snprintf( hx + b * 3, 4, "%02x ", row[b] );
+                fprintf( stderr, "[dump] %p: %s\n", (void *)(a + o), hx );
+            }
+            while (*end && *end != ',') end++;
+            q = *end ? end + 1 : end;
+        }
+    }
+}
+
 void ios_dump_all_thread_stacks(void)
 {
     thread_act_array_t threads;
@@ -18594,6 +18736,7 @@ void ios_dump_all_thread_stacks(void)
 
     if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
     fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);
+    ios_xref_scan_once();   /* madeira xref-scan / guest dump (env-driven, once) */
     for (i = 0; i < count; i++)
     {
         arm_thread_state64_t st;
