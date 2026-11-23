@@ -18673,6 +18673,42 @@ void ios_dump_all_thread_stacks(void)
                     (unsigned long long)st.__x[8], (unsigned long long)st.__x[18],
                     (unsigned long long)arm_thread_state64_get_sp(st), tebstate);
 
+            /* madeira hang-ring: env.MADEIRA_BLOCK_RING_STACKS = N (with MADEIRA_BLOCK_RING = 1)
+             * prints the last N guest code blocks of every guest thread under its stack line,
+             * x86 bytes included, so a game that sits on a black screen with every thread
+             * waiting shows WHAT each thread ran right before its wait (PRAGMATA, log
+             * 2026-11-22 19:13: empty scene after its initial settings, nothing in the log
+             * says what it waits for). A thread parked in a server call has x18 = 0; its
+             * TEB is then the pthread (the [teb-tsd] lines show they match), confirmed by
+             * TEB->Self (TEB+0x30) before the ring at TEB+0x1710 is read. Reads only. */
+            {
+                static int ring_n = -1;
+                if (ring_n < 0)
+                {
+                    const char *e = getenv( "MADEIRA_BLOCK_RING_STACKS" );
+                    ring_n = (e && *e) ? atoi( e ) : 0;
+                    if (ring_n < 0) ring_n = 0;
+                    if (ring_n > 1536) ring_n = 1536;
+                }
+                if (ring_n > 0)
+                {
+                    uintptr_t rteb = 0;
+                    uint64_t rself = 0, rring = 0;
+                    mach_vm_size_t rg = 0, rg2 = 0;
+
+                    if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) rteb = (uintptr_t)st.__x[18];
+                    else if (pt) rteb = (uintptr_t)pt;
+                    if (rteb && !(rteb & 0xfff)
+                        && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x30), 8,
+                                                   (mach_vm_address_t)&rself, &rg ) == KERN_SUCCESS && rg == 8
+                        && rself == rteb
+                        && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x1710), 8,
+                                                   (mach_vm_address_t)&rring, &rg2 ) == KERN_SUCCESS && rg2 == 8
+                        && rring)
+                        ios_block_ring_dump( rteb, (unsigned)ring_n, "thread-stacks" );
+                }
+            }
+
             /* ================= ml677 SPIN SNAPSHOT =========================
              *
              * ml676 sampled "Background Job.Worker 1" 43 times out of 44 at
