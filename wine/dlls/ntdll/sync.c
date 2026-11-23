@@ -1203,7 +1203,9 @@ static ULONG ios_srw_owner_of( const void *lock )
 }
 
 /* MADEIRA_SRW_DEADLOCK_BREAK: TRUE = this thread may read `lock` without taking it. */
-static BOOL ios_srw_try_break( const void *lock, ULONG me )
+static LONG ios_srw_breaks_at_park;
+
+static BOOL ios_srw_try_break( const void *lock, ULONG me, BOOL at_park )
 {
     struct ios_srw_waitent *tw;
     const void *their_wait;
@@ -1217,9 +1219,12 @@ static BOOL ios_srw_try_break( const void *lock, ULONG me )
     if (InterlockedCompareExchange( &ios_srw_break_tid, (LONG)me, 0 ) != 0) return FALSE;
     ios_srw_break_lock = lock;
     n = (ULONG)InterlockedIncrement( &ios_srw_breaks );
-    if (n <= 8 || n == 100 || n == 1000 || n == 10000)
-        ERR( "[srw-break] #%lu: tid=%04lx reads lock %p held by tid=%04lx, which waits for lock %p held by tid=%04lx\n",
-             n, me, lock, holder, their_wait, me );
+    if (at_park) InterlockedIncrement( &ios_srw_breaks_at_park );
+    if (n <= 8 || n == 100 || n == 1000 || n == 10000 || n == 100000)
+        ERR( "[srw-break] #%lu: tid=%04lx reads lock %p held by tid=%04lx, which waits for lock %p held by tid=%04lx"
+             " (%s; %ld of %lu found when parking)\n",
+             n, me, lock, holder, their_wait, me, at_park ? "when parking" : "after 20 ms",
+             ios_srw_breaks_at_park, n );
     return TRUE;
 }
 
@@ -1245,11 +1250,27 @@ static BOOL ios_srw_wait( const void *lock, const void *addr, const void *cmp, S
         w->lock = lock;
         ios_srw_hist( lock, exclusive ? SRWH_WAIT_X : SRWH_WAIT_S );
     }
+    /* Check for the cycle BEFORE sleeping. The thread that parks second always
+     * sees the first one's wait slot (each publishes its slot, then the barrier,
+     * then looks), so a two-thread cycle is broken at once instead of after a
+     * 20 ms timeout. PRAGMATA forms the cycle ~15 times a second after the intro
+     * movie; at 20 ms each that throttled its whole job system (log 2026-11-22
+     * 16:42). The timed re-check below stays as the fallback. */
+    if (ios_srw_break_on && !exclusive)
+    {
+        MemoryBarrier();
+        if (ios_srw_try_break( lock, me, TRUE ))
+        {
+            w->lock = NULL;
+            ios_srw_hist( lock, SRWH_BORROW_S );
+            return TRUE;
+        }
+    }
     timeout.QuadPart = ios_srw_break_on ? -20 * (LONGLONG)10000      /* 20 ms */
                                         : -10 * (LONGLONG)10000000;  /* 10 s */
     if (RtlWaitOnAddress( addr, cmp, size, &timeout ) != STATUS_TIMEOUT) return FALSE;
     waited = NtGetTickCount() - w->start;
-    if (ios_srw_break_on && !exclusive && ios_srw_try_break( lock, me ))
+    if (ios_srw_break_on && !exclusive && ios_srw_try_break( lock, me, FALSE ))
     {
         w->lock = NULL;
         ios_srw_hist( lock, SRWH_BORROW_S );
