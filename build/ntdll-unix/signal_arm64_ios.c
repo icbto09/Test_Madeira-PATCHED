@@ -18679,8 +18679,10 @@ void ios_dump_all_thread_stacks(void)
              * waiting shows WHAT each thread ran right before its wait (PRAGMATA, log
              * 2026-11-22 19:13: empty scene after its initial settings, nothing in the log
              * says what it waits for). A thread parked in a server call has x18 = 0; its
-             * TEB is then the pthread (the [teb-tsd] lines show they match), confirmed by
-             * TEB->Self (TEB+0x30) before the ring at TEB+0x1710 is read. Reads only. */
+             * TEB then comes from its pthread TSD slot (the thread sampler's calibration;
+             * the first version used the pthread itself and missed every such thread, log
+             * 2026-11-22 20:04), confirmed by TEB->Self (TEB+0x30) before the ring at
+             * TEB+0x1710 is read. Reads only. */
             {
                 static int ring_n = -1;
                 if (ring_n < 0)
@@ -18697,7 +18699,11 @@ void ios_dump_all_thread_stacks(void)
                     mach_vm_size_t rg = 0, rg2 = 0;
 
                     if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) rteb = (uintptr_t)st.__x[18];
-                    else if (pt) rteb = (uintptr_t)pt;
+                    else if (pt)
+                    {
+                        extern uint64_t ios_ts_teb_export( void *pt );
+                        rteb = (uintptr_t)ios_ts_teb_export( (void *)pt );
+                    }
                     if (rteb && !(rteb & 0xfff)
                         && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x30), 8,
                                                    (mach_vm_address_t)&rself, &rg ) == KERN_SUCCESS && rg == 8
