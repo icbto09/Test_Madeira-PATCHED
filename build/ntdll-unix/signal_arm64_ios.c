@@ -19041,6 +19041,14 @@ static void ios_kusd_clock_report(void)
                 *(volatile unsigned int *)(u + 0x2e8),
                 *(volatile unsigned long long *)(u + 0x300), *(volatile unsigned char *)(u + 0x3c6),
                 *(volatile unsigned long long *)(u + 0x3b8), *(volatile unsigned int *)(u + 0x004));
+        {   /* ProcessorFeatures[0..63] at 0x274 (PF_ index = position), XState.EnabledFeatures at 0x3d8 */
+            char pf[65];
+            int k;
+            for (k = 0; k < 64; k++) pf[k] = *(volatile unsigned char *)(u + 0x274 + k) ? '1' : '0';
+            pf[64] = 0;
+            fprintf(stderr, "[kusd-clock] ProcessorFeatures[0..63]=%s XState.EnabledFeatures=%#llx NativeArch=%u\n",
+                    pf, *(volatile unsigned long long *)(u + 0x3d8), *(volatile unsigned short *)(u + 0x26a));
+        }
     }
 }
 
