@@ -1,37 +1,22 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index c09a37d..dc01f27 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-@@ -945,6 +945,38 @@
-       str(TMP2, TMP1, 0);
-       (void)Bind(&l_NoRing);
+@@ -935,7 +935,16 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+       const char* E = getenv("MADEIRA_BLOCK_RING");
+       RingOn = (E && *E && *E != '0') ? 1 : 0;
      }
-+#ifdef ARCHITECTURE_arm64ec
-+      // Log the Stellar Blade slot-selection routine before it uses a slot.
-+      // Gated by MADEIRA_SB_SLOT_TRACE; no guest memory access or flag changes.
-+      if ((IosRingEntryRIP & 0xffffffffffffULL) == 0x142e3ecd9ULL) {
-+        static const bool Trace = [] {
-+          const char* E = getenv("MADEIRA_SB_SLOT_TRACE");
-+          return E && E[0] == '1' && !E[1];
-+        }();
-+        if (Trace) {
-+          ARMEmitter::ForwardLabel Skip;
-+          // Slot index lives in guest X1 at routine entry.
-+          const auto SlotIndex = StaticRegisters[X86State::REG_RCX];
-+          LoadConstant(ARMEmitter::Size::i64Bit, TMP3, 0x0000800000000000ULL);
-+          add(ARMEmitter::Size::i64Bit, TMP3, TMP3, SlotIndex, ARMEmitter::ShiftType::LSL, 0);
-+          str(TMP3, TMP4, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
-+          add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
-+          and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntries - 1);
-+          // Read the slot table entry the routine will use, if addressable.
-+          lsr(ARMEmitter::Size::i64Bit, TMP3, SlotIndex, 46);
-+          (void)cbnz(ARMEmitter::Size::i64Bit, TMP3, &Skip);
-+          ldr(TMP3, SlotIndex, 0);
-+          str(TMP3, TMP4, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
-+          add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
-+          and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntries - 1);
-+          (void)Bind(&Skip);
-+        }
-+      }
-+#endif
-       str(TMP2, TMP1, 0);
-       (void)Bind(&l_NoRing);
-     }
+-    if (RingOn) {
++    // MADEIRA_SB_SLOT_TRACE=1: keep only the slot setter and slot-selection blocks in the ring so it
++    // holds a long history of slot writes instead of a few thousand unrelated blocks.
++    static const bool SlotOnly = [] {
++      const char* E = getenv("MADEIRA_SB_SLOT_TRACE");
++      return E && E[0] == '1' && !E[1];
++    }();
++    const uint64_t RingRIP = IosRingEntryRIP & 0xffffffffffffULL;
++    const bool RingWanted = !SlotOnly || RingRIP == 0x140f8cda0ULL || RingRIP == 0x142e3ebd0ULL ||
++                            RingRIP == 0x142e3ecd9ULL || RingRIP == 0x142e6be00ULL;
++    if (RingOn && RingWanted) {
+       ARMEmitter::ForwardLabel l_NoRing;
+       ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosBlockRing));
+       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NoRing);
