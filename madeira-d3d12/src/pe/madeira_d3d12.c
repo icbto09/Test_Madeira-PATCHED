@@ -11719,13 +11719,25 @@ static D3D_FEATURE_LEVEL mad_fl_ceiling(void) {
  * Whether the converter takes every 6.7 shader is not known; one it refuses
  * fails its pipeline as any other conversion failure does. 0x67 is
  * D3D_SHADER_MODEL_6_7 (named by value: older headers stop at 6_6). */
+/* d3d12-sm-max = 60..67 (6.0..6.7) caps it lower instead, e.g. 62 for shader model 6.2,
+ * for an engine that picks a simpler shader path when the device reports less.
+ * It wins over d3d12-sm-6-7. Out-of-range values are ignored. */
 static D3D_SHADER_MODEL mad_sm_ceiling(void) {
     static int v = -1;
+    static D3D_SHADER_MODEL cap;
     if (v < 0) {
+        long long mx = mad_cfg_int_pe("d3d12-sm-max", 0);
         v = mad_cfg_int_pe("d3d12-sm-6-7", 0) ? 1 : 0;   /* 1: SHADER_MODEL reports up to 6.7 (6.6 otherwise); the converter may still refuse a 6.7 shader */
-        if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
+        cap = v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
+        if (mx >= 60 && mx <= 67) {
+            cap = (D3D_SHADER_MODEL)(0x60 + (mx - 60));
+            d3d12_log("[d3d12-caps] sm-max=%lld (d3d12-sm-max): SHADER_MODEL reports up to %d.%d\n", mx, (int)(cap >> 4), (int)(cap & 0xf));
+        } else {
+            if (mx) d3d12_log("[d3d12-caps] d3d12-sm-max=%lld ignored (use 60..67)\n", mx);
+            if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
+        }
     }
-    return v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
+    return cap;
 }
 
 /* env.MADEIRA_D3D12_CAPS_BY_FAMILY = 1 (opt-in, off by default). The
