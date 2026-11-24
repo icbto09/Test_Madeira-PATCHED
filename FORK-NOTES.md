@@ -90,3 +90,13 @@ They are restored so the tree has the shape the build expects:
   recompiles every load in it with the address translated inline (page learning since the
   instruction table filled on PRAGMATA) (`build/ntdll-unix/signal_arm64_ios.c`, `FEX/Source/Windows/ARM64EC/`,
   `FEX/FEXCore/Source/Interface/Core/`). Log prefix `[kuser-remap]`.
+- `env.MADEIRA_SB_NULL_UB_SKIP` (`wine/dlls/ntdll/signal_arm64ec.c`, `ios_sb_null_ub_skip`):
+  Stellar Blade's crash at `SB-Win64-Shipping.exe+0x2e3ec81` (access violation reading 0x18) is
+  Unreal's D3D11 renderer reading an empty pixel-stage uniform-buffer slot (in the Nov 24 log the
+  shader wanted slots 0, 2, 3 and the game had bound 0, 1, 2). With `= 1` the fault is resumed at
+  the loop's next-slot test before the game's handlers see it, so that draw goes on without the
+  missing buffer's textures (visual glitches are possible). The x86 bytes on both sides of the
+  fault are checked first. Each new shader is logged once (`[sb-ub-skip] new shader`), then a
+  count every 1000 skips; the Unix SEGV handler stops repeating its per-fault lines for reads
+  at 0x18 after 8 (`build/ntdll-unix/signal_arm64_ios.c`). A workaround, not the cause: why the
+  slot is empty is still open.

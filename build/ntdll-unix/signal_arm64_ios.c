@@ -13917,6 +13917,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 #ifdef WINE_IOS
+    /* MADEIRA_SB_NULL_UB_SKIP=1: the PE side (signal_arm64ec.c, ios_sb_null_ub_skip) resumes
+     * Stellar Blade's null uniform-buffer read at 0x18 instead of crashing, so it can recur
+     * every frame. Keep the first 8 of these lines and the region scan, then stay quiet for
+     * reads at 0x18; the PE side logs each new shader and a count every 1000 skips. */
+    static int sb_skip_env = -1, sb_quiet_n;
+    if (sb_skip_env < 0)
+    {
+        const char *e = getenv( "MADEIRA_SB_NULL_UB_SKIP" );
+        sb_skip_env = e && !strcmp( e, "1" );
+    }
+    if (!(sb_skip_env && (uintptr_t)siginfo->si_addr == 0x18 &&
+          __atomic_add_fetch( &sb_quiet_n, 1, __ATOMIC_RELAXED ) > 8))
+    {
     ERR("setup_exception for SEGV at pc=%p addr=%p (virtual_handle_fault failed)\n",
         (void*)PC_sig(context), siginfo->si_addr);
     /* Steam S3 (task #29): name the native faulting code + the target
@@ -13933,6 +13946,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      di.dli_fbase );
         ios_dump_fault_region( siginfo->si_addr );
     }
+    }   /* sb_quiet */
     /* A 32-bit program's call or jump to an address below 64 KB. FEX refuses to
      * compile such a block (CompileBlock: REFUSING low/invalid RIP) and returns 0,
      * and its dispatcher branches there, so the fault arrives here with pc = 0 and
