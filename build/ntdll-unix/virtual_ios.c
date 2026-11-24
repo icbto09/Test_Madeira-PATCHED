@@ -31327,8 +31327,16 @@ void virtual_init_user_shared_data(void)
             xs->Features[XSTATE_AVX].Offset = 0x200 + 0x40;            /* XSAVE_FORMAT + XSAVE_AREA_HEADER */
             xs->Features[XSTATE_AVX].Size = 16 * 16;                   /* upper halves of YMM0-15 */
             for (i = 0; i <= XSTATE_AVX; i++) xs->AllFeatures[i] = xs->Features[i].Size;
+            /* kusd-pf-avx: Wine's ARM64 init_shared_data_cpuinfo only adds the i386 x86 flags
+             * (SSE..SSE4.2), so the page said XState = x87+SSE+AVX and FEX's CPUID said
+             * AVX/AVX2 while PF_XSAVE_ENABLED / PF_AVX / PF_AVX2 read 0, which no x64 PC
+             * shows (IsProcessorFeaturePresent, and code that reads the page directly).
+             * Same switch as the XState block. */
+            data->ProcessorFeatures[PF_XSAVE_ENABLED] = TRUE;
+            data->ProcessorFeatures[PF_AVX_INSTRUCTIONS_AVAILABLE] = TRUE;
+            data->ProcessorFeatures[PF_AVX2_INSTRUCTIONS_AVAILABLE] = TRUE;
             dprintf( 2, "[kusd-avx] ml1310 MADEIRA_FEX_AVX=1: KUSER_SHARED_DATA XState says x87+SSE+AVX "
-                        "(features %#llx, size %#x; MADEIRA_KUSD_AVX=0 leaves it empty)\n",
+                        "(features %#llx, size %#x; PF_XSAVE/AVX/AVX2 set; MADEIRA_KUSD_AVX=0 leaves it empty)\n",
                      (unsigned long long)xs->EnabledFeatures, (unsigned)xs->Size );
         }
     }

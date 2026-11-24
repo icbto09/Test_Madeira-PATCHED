@@ -19002,14 +19002,14 @@ static void ios_kusd_clock_report(void)
 {
     static unsigned long long prev_host_ms, prev_it, prev_st, prev_tc;
     static int once;
-    struct { unsigned int numer, denom; } tb = {0, 0};
-    extern int mach_timebase_info(void *);
+    struct timespec ts;
     const unsigned char *u = (const unsigned char *)ios_exc_usd;
     unsigned long long host_ms, it, st, tc;
 
     if (!u) { fprintf(stderr, "[kusd-clock] no KUSER page recorded\n"); return; }
-    mach_timebase_info(&tb);
-    host_ms = tb.denom ? mach_absolute_time() * tb.numer / tb.denom / 1000000ull : 0;
+    /* CLOCK_MONOTONIC (the mach_absolute_time conversion gave nonsense deltas on device) */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    host_ms = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
     /* KSYSTEM_TIME: LowPart, High1Time, High2Time */
     it = ((unsigned long long)*(volatile unsigned int *)(u + 0x00c) << 32) | *(volatile unsigned int *)(u + 0x008);
     st = ((unsigned long long)*(volatile unsigned int *)(u + 0x018) << 32) | *(volatile unsigned int *)(u + 0x014);
@@ -19022,7 +19022,7 @@ static void ios_kusd_clock_report(void)
         long long dit = (long long)(it - prev_it) / 10000, dst = (long long)(st - prev_st) / 10000;
         long long dtc = (long long)(tc - prev_tc);
         const char *verdict = (!dit && !dst && !dtc) ? "*** FROZEN: no clock field moved ***" :
-                              (dit < (long long)dh / 2 || dtc < (long long)dh / 2) ? "*** LAGGING the host clock ***" :
+                              (dh > 1000 && (dit < (long long)dh / 2 || dtc < (long long)dh / 2)) ? "*** LAGGING the host clock ***" :
                               "moving with the host clock";
         fprintf(stderr, "[kusd-clock] since last dump: host %llu ms, InterruptTime %lld ms, SystemTime %lld ms, "
                 "TickCount %lld ms -- %s\n", dh, dit, dst, dtc, verdict);
