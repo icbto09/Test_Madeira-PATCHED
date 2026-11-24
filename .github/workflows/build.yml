@@ -1,9 +1,6 @@
 name: Build IPA
 
 on:
-  push:
-    branches: [main, 'codex/pr-build-*']
-  pull_request:
   workflow_dispatch:
 
 permissions:
