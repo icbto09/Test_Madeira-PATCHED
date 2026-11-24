@@ -12523,6 +12523,75 @@ static void ios_guest_fault_context( uint64_t rip, uint64_t rsp, uint64_t gregs_
     }
 }
 
+/* Stellar Blade null-table snapshot v1. Opt-in, diagnostic reads only.
+ * Offsets and signature come from the captured executable, not symbols.
+ * This is a post-fault snapshot, not an atomic snapshot or a writer trace. */
+static void ios_sb_fault_state( ucontext_t *context, uint64_t rip, const void *fault_addr )
+{
+    static unsigned count;
+    static const unsigned char signature[16] = {
+        0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00,
+        0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 };
+    unsigned char code[16];
+    uint64_t owner, index, image, entry, value, slots[16], object;
+    uint32_t image_size = 0, mask27c8 = 0, mask27cc = 0, mask27d0 = 0, object30 = 0;
+    uint16_t mask43ce = 0, objectbc = 0;
+    int ok27c8, ok27cc, ok27d0, ok43ce, ok30 = 0, okbc = 0, i;
+    const char *enabled = getenv( "MADEIRA_SB_FAULT_STATE" );
+
+    if (!enabled || strcmp( enabled, "1" )) return;
+    if ((uintptr_t)fault_addr != 0x18 || REGn_sig(2, context) != 0 || rip < 8) return;
+    if (!ios_guest_ctx_read( rip - 8, code, sizeof(code) ) ||
+        memcmp( code, signature, sizeof(code) )) return;
+    image = ios_guest_ctx_image( rip, &image_size );
+    if (!image || rip - image != 0x2e3ec81 || image_size < 0x2e3ec89) return;
+    if (__atomic_fetch_add( &count, 1, __ATOMIC_RELAXED ) >= 4) return;
+
+    owner = REGn_sig(27, context); /* live RBX, not saved frame state */
+    index = REGn_sig(8, context);  /* live RAX after MOVSXD */
+    object = FP_sig(context);     /* live RBP */
+    ERR("  [sb-state] v1 rip=%p image=%p owner=%p index=%llu r8=%p rdx=%p rdi=%p rbp=%p r14=%p (post-fault snapshot)\n",
+        (void *)rip, (void *)image, (void *)owner, (unsigned long long)index,
+        (void *)(uintptr_t)REGn_sig(2, context), (void *)(uintptr_t)REGn_sig(1, context),
+        (void *)(uintptr_t)REGn_sig(26, context), (void *)object,
+        (void *)(uintptr_t)REGn_sig(21, context));
+    if (owner < 0x10000 || owner > ~0ull - 0x4400)
+    {
+        ERR("  [sb-state] v1 owner outside safe diagnostic range; reads skipped\n");
+        return;
+    }
+    ok27c8 = ios_guest_ctx_read( owner + 0x27c8, &mask27c8, sizeof(mask27c8) );
+    ok27cc = ios_guest_ctx_read( owner + 0x27cc, &mask27cc, sizeof(mask27cc) );
+    ok27d0 = ios_guest_ctx_read( owner + 0x27d0, &mask27d0, sizeof(mask27d0) );
+    ok43ce = ios_guest_ctx_read( owner + 0x43ce, &mask43ce, sizeof(mask43ce) );
+    if (object >= 0x10000 && object <= ~0ull - 0xc0)
+    {
+        ok30 = ios_guest_ctx_read( object + 0x30, &object30, sizeof(object30) );
+        okbc = ios_guest_ctx_read( object + 0xbc, &objectbc, sizeof(objectbc) );
+    }
+    ERR("  [sb-state] v1 owner+27c8=%08x(read=%d) +27cc=%08x(read=%d) +27d0=%08x(read=%d) +43ce=%04x(read=%d) rbp+30=%08x(read=%d) +bc=%04x(read=%d)\n",
+        mask27c8, ok27c8, mask27cc, ok27cc, mask27d0, ok27d0, (unsigned)mask43ce, ok43ce,
+        object30, ok30, (unsigned)objectbc, okbc);
+    if (ok43ce && ok30)
+        ERR("  [sb-state] v1 current-memory candidate mask=%04x; may differ from mask used before fault\n",
+            (unsigned)(mask43ce & object30));
+    if (index < 16)
+    {
+        entry = owner + 0x4278 + index * 8;
+        if (ios_guest_ctx_read( entry, &value, sizeof(value) ))
+            ERR("  [sb-state] v1 selected[%llu] addr=%p now=%p live_r8=%p\n",
+                (unsigned long long)index, (void *)entry, (void *)value,
+                (void *)(uintptr_t)REGn_sig(2, context));
+        else ERR("  [sb-state] v1 selected entry unreadable\n");
+    }
+    else ERR("  [sb-state] v1 index outside captured 16-bit-mask domain; selected read skipped\n");
+    if (ios_guest_ctx_read( owner + 0x4278, slots, sizeof(slots) ))
+        for (i = 0; i < 16; i++)
+            ERR("  [sb-state] v1 slot[%02d]=%p%s\n", i, (void *)slots[i],
+                (uint64_t)i == index ? " SELECTED" : "");
+    else ERR("  [sb-state] v1 table snapshot unreadable\n");
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -13115,6 +13184,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             else
                                 ERR("  [guest-exact] ml885 block=%p rip=%p (bytes unreadable)\n", (void*)bb, (void*)xrip);
                             ios_guest_fault_context( xrip, REGn_sig(23, context), cs[5] );   /* ml1291 */
+                            ios_sb_fault_state( context, xrip, siginfo->si_addr );
                         }
                         else ERR("  [guest-exact] ml885 block=%p unresolved: %s\n", (void*)bb, why);
                     }
