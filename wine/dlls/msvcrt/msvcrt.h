@@ -261,6 +261,7 @@ extern void msvcrt_free_locks(void);
 
 extern void msvcrt_init_exception(void*);
 extern BOOL msvcrt_init_locale(void);
+extern BOOL msvcrt_init_core(BOOL);  /* Madeira pvz-msvcrt */
 extern void msvcrt_init_math(void*);
 extern void msvcrt_init_io(void);
 extern void msvcrt_free_io(void);

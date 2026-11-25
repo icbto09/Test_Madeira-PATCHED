@@ -9,3 +9,13 @@ apphelp faultrep wer profapi sxs fusion tdh tzres dbgeng sfc sfc_os srclient rst
 windows.applicationmodel windows.devices.enumeration windows.gaming.ui.gamebar windows.globalization windows.media windows.media.devices windows.media.mediacontrol windows.networking windows.networking.connectivity windows.networking.hostname windows.security.credentials.ui.userconsentverifier windows.storage windows.storage.applicationdata windows.system.profile.systemid windows.system.profile.systemmanufacturers windows.ui.core.textinput windows.perception.stub windows.graphics windows.web geolocation
 mspatcha odbccp32
 sapi msttsengine
+# Media Foundation decoder MFTs (CLSID_MSH264DecoderMFT, CLSID_MSAACDecMFT). Both are thin COM
+# servers that create winegstreamer's wg_h264_decoder / wg_aac_decoder (winegstreamer is in the farm, but
+# the iOS unix side still refuses H.264/AAC transforms, so creating one fails with STATUS_NOT_SUPPORTED).
+# Black Ops III CoCreates the H264 MFT at start-up and shows "Windows Media Feature Pack Missing"
+# when system32\msmpeg2vdec.dll cannot load (0.2.82 log: "apartment_add_dll couldn't load in-process
+# dll L"C:\\windows\\system32\\msmpeg2vdec.dll""; Wine bug 47084; Wine MR 2027). Off for one game:
+# add msmpeg2vdec,msauddecmft=d to the game's env.WINEDLLOVERRIDES line (one line wins; keep its other entries).
+msmpeg2vdec msauddecmft
+# hoi4-comctl-v6-x64: Common-Controls 6.0 for 64-bit processes (WineProcessBridge.m seeds winsxs\arm64_... from it)
+comctl32_v6

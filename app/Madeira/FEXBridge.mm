@@ -455,9 +455,9 @@ bool fex_initialize(void) {
     Features.SupportsFCMA = true;
     Features.SupportsFlagM = true;
     Features.SupportsFlagM2 = true;
-    Features.SupportsAVX = false;     // No SVE on A15
-    Features.SupportsSVE128 = false;
-    Features.SupportsSVE256 = false;
+    Features.ProcessFeatures.SupportsAVX = false;     // No SVE on A15
+    Features.ProcessFeatures.SupportsSVE128 = false;
+    Features.ProcessFeatures.SupportsSVE256 = false;
     // A15 has 6 performance + 2 efficiency cores
     Features.CPUMIDRs.resize(8, 0x611F0250); // A15 Firestorm MIDR (approximate)
 

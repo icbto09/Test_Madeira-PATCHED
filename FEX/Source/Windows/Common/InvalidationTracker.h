@@ -8,6 +8,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 #include <string_view>
 
 namespace FEXCore::Core {
@@ -50,7 +51,9 @@ public:
     uint64_t SectionSize;
   };
   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
-  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
+  // NoFilter (madeira [jit-inval]): FEX's own JIT asked for this removal (a block found its code
+  // changed), so the "no code here" filter must not skip it.
+  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, bool NoFilter = false);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
   // MADEIRA: if HotPage is given, it is set when the fault hit an already hot page (see EnableHotSMCPages),
   // which is unprotected again but not invalidated.
@@ -68,6 +71,18 @@ public:
   bool BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size);
 
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+
+  // MADEIRA section-views (ported from MetalSharp patches/fex/0025, AGPL-3.0, Avery Felts):
+  // views of one data section share their pages, so a write through one view changes code
+  // translated from another with no fault or protection change FEX sees. Wine reports every
+  // data-section view with its section handle and offset; views of the same section are
+  // grouped (NtCompareObjects), and code compiled from a view whose section has another view
+  // mapped checks its bytes before each instruction (IsSharedSectionPage feeds the same
+  // per-instruction validation as a hot SMC page). Code translated before the second view
+  // appeared is dropped once. NoInvalidate: the caller holds CodeInvalidationMutex shared.
+  void HandleDataSectionMap(HANDLE Section, uint64_t Address, uint64_t Size, uint64_t Offset, bool NoInvalidate);
+  void HandleDataSectionUnmap(uint64_t Address);
+  bool IsSharedSectionPage(uint64_t Address);
 
 private:
 #if !defined(ARCHITECTURE_arm64ec)
@@ -134,8 +149,9 @@ private:
     bool HeldByThisThread() const {
       return Owner.load(std::memory_order_relaxed) == Self();
     }
-  private:
+    // The calling thread's identity, as stored in Owner.
     static uint64_t Self();
+  private:
     std::shared_mutex Mutex;
     std::atomic<uint64_t> Owner {0};
   };
@@ -149,6 +165,18 @@ private:
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
 
+  struct SectionView {
+    uint64_t Base;
+    uint64_t Size;
+    HANDLE Section;
+    uint64_t Group;
+    bool Shared;
+  };
+  std::vector<SectionView> SectionViews;          // Protected by IntervalsLock
+  uint64_t NextSectionGroup {1};                  // Protected by IntervalsLock
+  std::atomic<uint32_t> SharedSectionViewCount {0}; // fast path for IsSharedSectionPage
+  void RecountSharedSectionViewsLocked();
+
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};
   uint64_t MonoEnd {0};
@@ -161,6 +189,20 @@ private:
   bool CountSMCWriteFault(uint64_t Page);
   // Forgets hot pages in [Begin, End) when their memory is freed.
   void ForgetHotSMCPages(uint64_t Begin, uint64_t End);
+
+  // MADEIRA: the thread currently inside InvalidateIntervalInternalLocked (OwnedSharedMutex::Self(), 0 when
+  // none). Only a write owner of CodeInvalidationMutex gets there, so one slot is enough. FEXCore frees and
+  // commits its own memory while it invalidates (lookup-cache pages, the call-ret stack, a released code
+  // buffer); Wine reports that back as memory notifications on the same thread, which would invalidate again
+  // under CodeBufferListLock (not recursive) and wait on themselves. Notifications raised from inside an
+  // invalidation are FEX's own memory, never guest code, so they are skipped (see InsideOwnInvalidation).
+  std::atomic<uint64_t> InvalidatingThread {0};
+  // Logs how many notifications InsideOwnInvalidation skipped since the last report (outside any lock).
+  static void ReportOwnInvalidationSkips();
+  bool InsideOwnInvalidation() const {
+    const auto Thread = InvalidatingThread.load(std::memory_order_relaxed);
+    return Thread && Thread == OwnedSharedMutex::Self();
+  }
 
   // MADEIRA: locks CodeInvalidationMutex exclusively unless this thread already write-owns it.
   // Returns whether it locked; the caller unlocks only then.

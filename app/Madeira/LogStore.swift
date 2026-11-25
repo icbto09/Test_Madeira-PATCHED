@@ -316,6 +316,7 @@ final class LogStore: ObservableObject {
         // — these are amplified by our own logging path (every dprintf is
         // dup2'd to the log fd, which then goes through Wine's file trace).
         // The signal lives in the original log lines, not these wrappers.
+        if raw.contains("] [flight] ") { return true }   // (flight-recorder) the copied block: read it in the file (literal = FlightRecorder.tag, so host tests need no LogTrail.swift)
         if raw.contains("trace:file:WriteFile") { return true }
         if raw.contains("trace:file:NtWriteFile") { return true }
         if raw.contains("SysCall  NtWriteFile") { return true }

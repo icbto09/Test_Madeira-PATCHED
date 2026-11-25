@@ -17,6 +17,7 @@ $end_info$
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 namespace FEXCore::IR {
 class OrderedNode;
@@ -54,6 +55,61 @@ void OpDispatchBuilder::X87FLDCWF64(OpcodeArgs) {
   Ref roundingMode = _Bfe(OpSize::i32Bit, 3, 10, NewFCW);
   _SetRoundingMode(roundingMode, false, roundingMode);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
+}
+
+// iOS-Madeira-GTM: precision control in reduced-precision (F64) mode.
+// The x87 FCW.PC field (bits 8-9) selects 24, 53 or 64-bit significands for FADD, FSUB, FMUL, FDIV
+// and FSQRT. F64 mode always computed in 53 bits, so a game that relies on PC = single (Direct3D 9
+// sets it at device creation unless D3DCREATE_FPU_PRESERVE) got different results: GTA San Andreas
+// computes floor(x * 0.005f) and gets 0.99999998 instead of 1 for x = 200, and its weather compares
+// a value in ST0 with the same value stored as float. When PC = single, the result is rounded to
+// float and widened back; for these operations a 53-bit result rounded to 24 bits equals the 24-bit
+// result (53 >= 2*24+2), and the current rounding mode applies to the conversion. Values outside the
+// float normal range keep their 53-bit value (x87 keeps the 15-bit exponent in PC = single).
+// Ported from GTMoraes/FEX 9005a5b (branch gtm-x87pc), where it is on by default.
+// Here it is opt-in for its first device tests: MADEIRA_X87_PC=1 in the game's own
+// config turns it on; unset or any other value leaves x87 exactly as before.
+static bool X87PrecisionControlEnabled() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("MADEIRA_X87_PC");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+void OpDispatchBuilder::X87PrecisionControlF64(uint8_t StackLoc) {
+  if (!X87PrecisionControlEnabled()) {
+    return;
+  }
+
+  if (StackLoc != 0) {
+    _F80StackXchange(StackLoc);
+  }
+
+  Ref Value = _ReadStackValue(0);
+  Ref Single = _Float_FToF(OpSize::i32Bit, OpSize::i64Bit, Value);
+  Ref Rounded = _Float_FToF(OpSize::i64Bit, OpSize::i32Bit, Single);
+
+  Ref Gpr = _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Value, 0);
+  Ref BiasedExp = _Bfe(OpSize::i64Bit, 11, 52, Gpr);
+  Ref ExpFromFloatMin = Sub(OpSize::i64Bit, BiasedExp, Constant(1023 - 126));
+  Ref FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
+  Ref PC = _Bfe(OpSize::i32Bit, 2, 8, FCW);
+
+  SaveNZCV();
+  // Float normal range: biased double exponent in [1023-126, 1023+127]
+  SubWithFlags(OpSize::i64Bit, ExpFromFloatMin, 254);
+  Ref InRange = _NZCVSelectV(OpSize::i64Bit, CondClass::ULT, Rounded, Value);
+  // PC == 00 (single)
+  _TestNZ(OpSize::i32Bit, PC, Constant(3));
+  Ref Result = _NZCVSelectV(OpSize::i64Bit, CondClass::EQ, InRange, Value);
+
+  _PopStackDestroy();
+  _PushStack(Result, Invalid(), OpSize::iInvalid);
+
+  if (StackLoc != 0) {
+    _F80StackXchange(StackLoc);
+  }
 }
 
 // F64 ops
@@ -153,6 +209,7 @@ void OpDispatchBuilder::FADDF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpDi
     } else {
       _F80AddStack(St0, Offset);
     }
+    X87PrecisionControlF64(ResInST0 == OpResult::RES_STI ? Offset : St0);
     if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
       _PopStackDestroy();
     }
@@ -180,6 +237,7 @@ void OpDispatchBuilder::FADDF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpDi
 
   // top of stack is at offset zero
   _F80AddValue(0, arg);
+  X87PrecisionControlF64(0);
   StoreX87FIP(Op);
 }
 
@@ -193,6 +251,7 @@ void OpDispatchBuilder::FMULF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpDi
     } else {
       _F80MulStack(st0, offset);
     }
+    X87PrecisionControlF64(ResInST0 == OpResult::RES_STI ? offset : st0);
     if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
       _PopStackDestroy();
     }
@@ -220,6 +279,7 @@ void OpDispatchBuilder::FMULF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpDi
 
   // top of stack is at offset zero
   _F80MulValue(0, arg);
+  X87PrecisionControlF64(0);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
     _PopStackDestroy();
@@ -245,6 +305,7 @@ void OpDispatchBuilder::FDIVF64(OpcodeArgs, IR::OpSize Width, bool Integer, bool
         _F80DivStack(st0, st0, offset);
       }
     }
+    X87PrecisionControlF64(ResInST0 == OpResult::RES_STI ? offset : st0);
 
     if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
       _PopStackDestroy();
@@ -279,6 +340,7 @@ void OpDispatchBuilder::FDIVF64(OpcodeArgs, IR::OpSize Width, bool Integer, bool
   } else {
     _F80DivValue(0, Arg);
   }
+  X87PrecisionControlF64(0);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
     _PopStackDestroy();
@@ -304,6 +366,7 @@ void OpDispatchBuilder::FSUBF64(OpcodeArgs, IR::OpSize Width, bool Integer, bool
         _F80SubStack(St0, St0, Offset);
       }
     }
+    X87PrecisionControlF64(ResInST0 == OpResult::RES_STI ? Offset : St0);
 
     if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
       _PopStackDestroy();
@@ -339,6 +402,7 @@ void OpDispatchBuilder::FSUBF64(OpcodeArgs, IR::OpSize Width, bool Integer, bool
   } else {
     _F80SubValue(0, arg);
   }
+  X87PrecisionControlF64(0);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
     _PopStackDestroy();

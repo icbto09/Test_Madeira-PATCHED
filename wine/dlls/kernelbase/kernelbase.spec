@@ -376,7 +376,7 @@
 @ stdcall FindNLSStringEx(wstr long wstr long wstr long ptr ptr ptr long)
 @ stdcall FindNextChangeNotification(long)
 @ stdcall FindNextFileA(long ptr)
-# @ stub FindNextFileNameW
+@ stdcall FindNextFileNameW(ptr ptr ptr)
 @ stdcall FindNextFileW(long ptr)
 @ stdcall FindNextStreamW(long ptr)
 @ stdcall FindNextVolumeW(long ptr long)
@@ -569,7 +569,7 @@
 @ stdcall GetGeoInfoEx(ptr long ptr long)
 @ stdcall GetHandleInformation(long ptr)
 # @ stub GetHivePath
-# @ stub GetIntegratedDisplaySize
+@ stdcall GetIntegratedDisplaySize(ptr)
 # @ stub GetIsEdpEnabled
 @ stdcall GetKernelObjectSecurity(long long ptr long ptr)
 @ stdcall GetLargePageMinimum()
@@ -587,6 +587,7 @@
 @ stdcall GetLogicalProcessorInformationEx(long ptr ptr)
 @ stdcall GetLongPathNameA(str ptr long)
 @ stdcall GetLongPathNameW(wstr ptr long)
+@ stdcall GetMachineTypeAttributes(long ptr)
 @ stdcall GetMappedFileNameA(long ptr ptr long)
 @ stdcall GetMappedFileNameW(long ptr ptr long)
 # @ stub GetMemoryErrorHandlingCapabilities
@@ -605,7 +606,7 @@
 @ stdcall GetNLSVersionEx(long wstr ptr)
 @ stub GetNamedLocaleHashNode
 @ stub GetNamedPipeAttribute
-@ stub GetNamedPipeClientComputerNameW
+@ stdcall GetNamedPipeClientComputerNameW(long wstr long)
 @ stdcall GetNamedPipeHandleStateW(long ptr ptr ptr ptr ptr long)
 @ stdcall GetNamedPipeInfo(long ptr ptr ptr ptr)
 @ stdcall GetNativeSystemInfo(ptr)
@@ -1051,7 +1052,7 @@
 # @ stub PackageFamilyNameFromFullName
 # @ stub PackageFamilyNameFromId
 # @ stub PackageFamilyNameFromProductId
-# @ stub PackageFullNameFromId
+@ stdcall PackageFullNameFromId(ptr ptr ptr)
 # @ stub PackageFullNameFromProductId
 @ stdcall PackageIdFromFullName(wstr long ptr ptr)
 # @ stub PackageIdFromProductId
@@ -1220,10 +1221,10 @@
 # @ stub PsmIsChildKey
 # @ stub PsmIsDynamicKey
 # @ stub PsmIsValidKey
-# @ stub PssCaptureSnapshot
+@ stdcall PssCaptureSnapshot(ptr long long ptr)
 # @ stub PssDuplicateSnapshot
-# @ stub PssFreeSnapshot
-# @ stub PssQuerySnapshot
+@ stdcall PssFreeSnapshot(ptr ptr)
+@ stdcall PssQuerySnapshot(ptr long ptr long)
 # @ stub PssWalkMarkerCreate
 # @ stub PssWalkMarkerFree
 # @ stub PssWalkMarkerGetPosition
@@ -1281,8 +1282,8 @@
 @ stdcall ReOpenFile(ptr long long long)
 @ stdcall ReadConsoleA(long ptr long ptr ptr)
 @ stdcall ReadConsoleInputA(long ptr long ptr)
-@ stub ReadConsoleInputExA
-@ stub ReadConsoleInputExW
+@ stdcall ReadConsoleInputExA(long ptr long ptr long)
+@ stdcall ReadConsoleInputExW(long ptr long ptr long)
 @ stdcall ReadConsoleInputW(long ptr long ptr)
 @ stdcall ReadConsoleOutputA(long ptr long long ptr)
 @ stdcall ReadConsoleOutputAttribute(long ptr long long ptr)
@@ -1546,7 +1547,7 @@
 @ stdcall SetThreadpoolThreadMaximum(ptr long) ntdll.TpSetPoolMaxThreads
 @ stdcall SetThreadpoolThreadMinimum(ptr long) ntdll.TpSetPoolMinThreads
 @ stdcall SetThreadpoolTimer(ptr ptr long long) ntdll.TpSetTimer
-# @ stub SetThreadpoolTimerEx
+@ stdcall SetThreadpoolTimerEx(ptr ptr long long) ntdll.TpSetTimerEx
 @ stdcall SetThreadpoolWait(ptr long ptr) ntdll.TpSetWait
 # @ stub SetThreadpoolWaitEx
 @ stdcall SetTimeZoneInformation(ptr)
@@ -1643,7 +1644,7 @@
 @ stdcall SwitchToThread()
 @ stdcall SystemTimeToFileTime(ptr ptr)
 @ stdcall SystemTimeToTzSpecificLocalTime(ptr ptr ptr)
-@ stub SystemTimeToTzSpecificLocalTimeEx
+@ stdcall SystemTimeToTzSpecificLocalTimeEx(ptr ptr ptr)
 @ stdcall TerminateProcess(long long)
 # @ stub TerminateProcessOnMemoryExhaustion
 @ stdcall TerminateThread(long long)
@@ -1661,7 +1662,7 @@
 @ stdcall TryEnterCriticalSection(ptr) ntdll.RtlTryEnterCriticalSection
 @ stdcall TrySubmitThreadpoolCallback(ptr ptr ptr)
 @ stdcall TzSpecificLocalTimeToSystemTime(ptr ptr ptr)
-@ stub TzSpecificLocalTimeToSystemTimeEx
+@ stdcall TzSpecificLocalTimeToSystemTimeEx(ptr ptr ptr)
 @ stdcall UnhandledExceptionFilter(ptr)
 @ stdcall UnlockFile(long long long long long)
 @ stdcall UnlockFileEx(long long long long ptr)
@@ -1829,3 +1830,508 @@
 @ stdcall lstrlenW(wstr) KERNELBASE_lstrlenW
 # @ stub time
 # @ stub wprintf
+
+# iOS-Madeira bo3-kernelbase-stubs: every name the Windows 10/11 kernelbase.dll exports that ours lacked
+# (497, Nov 20 2026). Plain stubs: a call logs "unimplemented function kernelbase.dll.<name>".
+# HIDDEN from the export table unless env.MADEIRA_KB_STUBS = 1 (main.c kb_stubs_hide).
+@ stub AcquireStateLock
+@ stub AddDependencyToProcessPackageGraph
+@ stub AddExtensionProgId
+@ stub AddPackageToFamilyXref
+@ stub AddResourceAttributeAce
+@ stub AddSIDToBoundaryDescriptor
+@ stub AddScopedPolicyIDAce
+@ stub AppContainerDeriveSidFromMoniker
+@ stub AppContainerFreeMemory
+@ stub AppContainerLookupDisplayNameMrtReference
+@ stub AppContainerLookupMoniker
+@ stub AppContainerRegisterSid
+@ stub AppContainerUnregisterSid
+@ stub AppPolicyGetClrCompat
+@ stub AppPolicyGetCreateFileAccess
+@ stub AppPolicyGetLifecycleManagement
+@ stub AppXFreeMemory
+@ stub AppXGetApplicationData
+@ stub AppXGetDevelopmentMode
+@ stub AppXGetOSMaxVersionTested
+@ stub AppXGetOSMinVersion
+@ stub AppXGetPackageCapabilities
+@ stub AppXGetPackageSid
+@ stub AppXLookupDisplayName
+@ stub AppXLookupMoniker
+@ stub AppXPostSuccessExtension
+@ stub AppXPreCreationExtension
+@ stub AppXReleaseAppXContext
+@ stub AppXUpdatePackageCapabilities
+@ stub ApplicationUserModelIdFromProductId
+@ stub AreThereVisibleLogoffScriptsInternal
+@ stub AreThereVisibleShutdownScriptsInternal
+@ stub ArmFeatureUsageSubscriberFlushNotification
+@ stub BaseCheckAppcompatCacheEx
+@ stub BaseFormatObjectAttributes
+@ stub BaseFreeAppCompatDataForProcess
+@ stub BaseGetConsoleReference
+@ stub BaseIsAppcompatInfrastructureDisabled
+@ stub BaseMarkFileForDelete
+@ stub BaseReadAppCompatDataForProcess
+@ stub BasepAdjustObjectAttributesForPrivateNamespace
+@ stub BasepCopyFileCallback
+@ stub BasepCopyFileExW
+@ stub BasepNotifyTrackingService
+@ stub CLOSE_LOCAL_HANDLE_INTERNAL
+@ stub CallEnclave
+@ stub CeipIsOptedIn
+@ stub CheckAllowDecryptedRemoteDestinationPolicy
+@ stub CheckIfStateChangeNotificationExists
+@ stub CheckIsMSIXPackage
+@ stub CheckTokenCapability
+@ stub CheckTokenMembershipEx
+@ stub ClosePackageInfo
+@ stub ClosePrivateNamespace
+@ stub CloseState
+@ stub CloseStateAtom
+@ stub CloseStateChangeNotification
+@ stub CloseStateContainer
+@ stub CloseStateLock
+@ stub CommitStateAtom
+@ stub CouldMultiUserAppsBehaviorBePossibleForPackage
+@ stub CreateAppContainerToken
+@ stub CreateEnclave
+@ stub CreatePrivateNamespaceW
+@ stub CreatePseudoConsoleAsUser
+@ stub CreateStateAtom
+@ stub CreateStateChangeNotification
+@ stub CreateStateContainer
+@ stub CreateStateLock
+@ stub CreateStateSubcontainer
+@ stub CveEventWrite
+@ stub DecodeRemotePointer
+@ stub DelayLoadFailureHookLookup
+@ stub DeleteBoundaryDescriptor
+@ stub DeleteEnclave
+@ stub DeleteStateAtomValue
+@ stub DeleteStateContainer
+@ stub DeleteStateContainerValue
+@ stub DsBindWithSpnExW
+@ stub DsCrackNamesW
+@ stub DsFreeDomainControllerInfoW
+@ stub DsFreeNameResultW
+@ stub DsFreeNgcKey
+@ stub DsFreePasswordCredentials
+@ stub DsGetDomainControllerInfoW
+@ stub DsMakePasswordCredentialsW
+@ stub DsReadNgcKeyW
+@ stub DsUnBindW
+@ stub DsWriteNgcKeyW
+@ stub DuplicateStateContainerHandle
+@ stub EncodeRemotePointer
+@ stub EnterCriticalPolicySectionInternal
+@ stub EnumSystemGeoNames
+@ stub EnumerateExtensionNames
+@ stub EnumerateStateAtomValues
+@ stub EnumerateStateContainerItems
+@ stub ExtensionProgIdExists
+@ stub FindPackagesByPackageFamily
+@ stub ForceSyncFgPolicyInternal
+@ stub FormatApplicationUserModelId
+@ stub FormatApplicationUserModelIdA
+@ stub FreeGPOListInternalA
+@ stub FreeGPOListInternalW
+@ stub GenerateGPNotificationInternal
+@ stub GetAdjustObjectAttributesForPrivateNamespaceRoutine
+@ stub GetAlternatePackageRoots
+@ stub GetAppContainerAce
+@ stub GetAppContainerNamedObjectPath
+@ stub GetAppDataFolder
+@ stub GetAppModelVersion
+@ stub GetApplicationRecoveryCallback
+@ stub GetApplicationUserModelId
+@ stub GetApplicationUserModelIdFromToken
+@ stub GetAppliedGPOListInternalA
+@ stub GetAppliedGPOListInternalW
+@ stub GetCachedSigningLevel
+@ stub GetCommPorts
+@ stub GetConsoleAliasExesA
+@ stub GetConsoleAliasExesW
+@ stub GetConsoleAliasesA
+@ stub GetConsoleAliasesW
+@ stub GetConsoleHistoryInfo
+@ stub GetConsoleSelectionInfo
+@ stub GetCurrentPackageApplicationContext
+@ stub GetCurrentPackageApplicationResourcesContext
+@ stub GetCurrentPackageContext
+@ stub GetCurrentPackageGlobalizationContext
+@ stub GetCurrentPackageInfo2
+@ stub GetCurrentPackageInfo3
+@ stub GetCurrentPackagePath2
+@ stub GetCurrentPackageResourcesContext
+@ stub GetCurrentPackageSecurityContext
+@ stub GetCurrentTargetPlatformContext
+@ stub GetDurationFormatEx
+@ stub GetEffectivePackageStatusForUser
+@ stub GetEffectivePackageStatusForUserSid
+@ stub GetEightBitStringToUnicodeSizeRoutine
+@ stub GetEightBitStringToUnicodeStringRoutine
+@ stub GetExtensionApplicationUserModelId
+@ stub GetExtensionProgIds
+@ stub GetExtensionProperty
+@ stub GetExtensionProperty2
+@ stub GetFileVersionInfoByHandle
+@ stub GetGPOListInternalA
+@ stub GetGPOListInternalW
+@ stub GetGamingDeviceModelInformation
+@ stub GetHivePath
+@ stub GetIsEdpEnabled
+@ stub GetIsWdagEnabled
+@ stub GetMemoryErrorHandlingCapabilities
+@ stub GetNextFgPolicyRefreshInfoInternal
+@ stub GetOsManufacturingMode
+@ stub GetOsSafeBootMode
+@ stub GetPackageApplicationContext
+@ stub GetPackageApplicationIds
+@ stub GetPackageApplicationProperty
+@ stub GetPackageApplicationPropertyString
+@ stub GetPackageApplicationResourcesContext
+@ stub GetPackageContext
+@ stub GetPackageFamilyNameFromProgId
+@ stub GetPackageFamilyNameFromToken
+@ stub GetPackageFullNameFromToken
+@ stub GetPackageGlobalizationContext
+@ stub GetPackageGlobalizationProperty
+@ stub GetPackageId
+@ stub GetPackageInfo
+@ stub GetPackageInfo2
+@ stub GetPackageInfo3
+@ stub GetPackageInstallTime
+@ stub GetPackageOSMaxVersionTested
+@ stub GetPackagePath
+@ stub GetPackagePathByFullName2
+@ stub GetPackagePathOnVolume
+@ stub GetPackageProperty
+@ stub GetPackagePropertyString
+@ stub GetPackageResourcesContext
+@ stub GetPackageResourcesProperty
+@ stub GetPackageSecurityContext
+@ stub GetPackageSecurityProperty
+@ stub GetPackageStatus
+@ stub GetPackageStatusForUser
+@ stub GetPackageStatusForUserSid
+@ stub GetPackageTargetPlatformProperty
+@ stub GetPackageVolumeSisPath
+@ stub GetPersistedFileLocationW
+@ stub GetPersistedRegistryLocationW
+@ stub GetPersistedRegistryValueW
+@ stub GetPreviousFgPolicyRefreshInfoInternal
+@ stub GetProcAddressForCaller
+@ stub GetProcessDefaultCpuSets
+@ stub GetProcessorSystemCycleTime
+@ stub GetProtocolAumid
+@ stub GetProtocolProperty
+@ stub GetPublisherCacheFolder
+@ stub GetPublisherRootFolder
+@ stub GetRegistryExtensionFlags
+@ stub GetRegistryValueWithFallbackW
+@ stub GetRoamingLastObservedChangeTime
+@ stub GetSecureSystemAppDataFolder
+@ stub GetSerializedAtomBytes
+@ stub GetSharedLocalFolder
+@ stub GetStagedPackageOrigin
+@ stub GetStagedPackagePathByFullName
+@ stub GetStagedPackagePathByFullName2
+@ stub GetStateContainerDepth
+@ stub GetStateFolder
+@ stub GetStateRootFolder
+@ stub GetStateRootFolderBase
+@ stub GetStateSettingsFolder
+@ stub GetStateVersion
+@ stub GetStringScripts
+@ stub GetSystemAppDataFolder
+@ stub GetSystemAppDataKey
+@ stub GetSystemLeapSecondInformation
+@ stub GetSystemMetadataPath
+@ stub GetSystemMetadataPathForPackage
+@ stub GetSystemMetadataPathForPackageFamily
+@ stub GetSystemStateRootFolder
+@ stub GetSystemTimeAdjustmentPrecise
+@ stub GetTargetPlatformContext
+@ stub GetThreadInformation
+@ stub GetThreadSelectedCpuSets
+@ stub GetUnicodeStringToEightBitSizeRoutine
+@ stub GetUnicodeStringToEightBitStringRoutine
+@ stub GetUserOverrideString
+@ stub GetUserOverrideWord
+@ stub GuardCheckLongJumpTarget
+@ stub HasPolicyForegroundProcessingCompletedInternal
+@ stub IncrementPackageStatusVersion
+@ stub InitializeEnclave
+@ stub InstallELAMCertificateInfo
+@ stub InternetTimeFromSystemTimeA
+@ stub InternetTimeFromSystemTimeW
+@ stub InternetTimeToSystemTimeA
+@ stub InternetTimeToSystemTimeW
+@ stub InvalidateAppModelVersionCache
+@ stub IsDeveloperModePolicyApplied
+@ stub IsEnclaveTypeSupported
+@ stub IsMrtResourceRedirectionEnabled
+@ stub IsOnDemandRegistrationSupportedForExtensionCategory
+@ stub IsProcessCritical
+@ stub IsSideloadingEnabled
+@ stub IsSideloadingPolicyApplied
+@ stub IsSyncForegroundPolicyRefresh
+@ stub IsTimeZoneRedirectionEnabled
+@ stub IsUserCetAvailableInEnvironment
+@ stub IsWow64GuestMachineSupported
+@ stub KernelbasePostInit
+@ stub LeaveCriticalPolicySectionInternal
+@ stub LoadEnclaveData
+@ stub LoadEnclaveImageA
+@ stub LoadEnclaveImageW
+@ stub LocalFileTimeToLocalSystemTime
+@ stub LocalSystemTimeToLocalFileTime
+@ stub MapPredefinedHandleInternal
+@ stub MapViewOfFile3FromApp
+@ stub MapViewOfFileNuma2
+@ stub MoveFileWithProgressTransactedW
+@ stub NamedPipeEventEnum
+@ stub NamedPipeEventSelect
+@ stub OfferVirtualMemory
+@ stub OpenCommPort
+@ stub OpenGlobalizationUserSettingsKey
+@ stub OpenPackageInfoByFullName
+@ stub OpenPackageInfoByFullNameForMachine
+@ stub OpenPackageInfoByFullNameForUser
+@ stub OpenPrivateNamespaceW
+@ stub OpenState
+@ stub OpenStateAtom
+@ stub OpenStateExplicit
+@ stub OpenStateExplicitForUserSid
+@ stub OpenStateExplicitForUserSidString
+@ stub OverrideRoamingDataModificationTimesInRange
+@ stub PackageFamilyNameFromFullName
+@ stub PackageFamilyNameFromFullNameA
+@ stub PackageFamilyNameFromId
+@ stub PackageFamilyNameFromIdA
+@ stub PackageFamilyNameFromProductId
+@ stub PackageFullNameFromIdA
+@ stub PackageFullNameFromProductId
+@ stub PackageIdFromFullNameA
+@ stub PackageIdFromProductId
+@ stub PackageNameAndPublisherIdFromFamilyName
+@ stub PackageNameAndPublisherIdFromFamilyNameA
+@ stub PackageRelativeApplicationIdFromProductId
+@ stub PackageSidFromFamilyName
+@ stub PackageSidFromProductId
+@ stub ParseApplicationUserModelId
+@ stub ParseApplicationUserModelIdA
+@ stub PcwAddQueryItem
+@ stub PcwClearCounterSetSecurity
+@ stub PcwCollectData
+@ stub PcwCompleteNotification
+@ stub PcwCreateNotifier
+@ stub PcwCreateQuery
+@ stub PcwDisconnectCounterSet
+@ stub PcwEnumerateInstances
+@ stub PcwIsNotifierAlive
+@ stub PcwQueryCounterSetSecurity
+@ stub PcwReadNotificationData
+@ stub PcwRegisterCounterSet
+@ stub PcwRemoveQueryItem
+@ stub PcwSendNotification
+@ stub PcwSendStatelessNotification
+@ stub PcwSetCounterSetSecurity
+@ stub PcwSetQueryItemUserData
+@ stub PerfDecrementULongCounterValue
+@ stub PerfDecrementULongLongCounterValue
+@ stub PerfIncrementULongCounterValue
+@ stub PerfIncrementULongLongCounterValue
+@ stub PerfQueryInstance
+@ stub PoolPerAppKeyStateInternal
+@ stub ProductIdFromPackageFamilyName
+@ stub PsmCreateKey
+@ stub PsmCreateKeyWithDynamicId
+@ stub PsmEqualApplication
+@ stub PsmEqualPackage
+@ stub PsmGetApplicationNameFromKey
+@ stub PsmGetDynamicIdFromKey
+@ stub PsmGetKeyFromProcess
+@ stub PsmGetKeyFromToken
+@ stub PsmGetPackageFullNameFromKey
+@ stub PsmIsChildKey
+@ stub PsmIsDynamicKey
+@ stub PsmIsValidKey
+@ stub PssDuplicateSnapshot
+@ stub PssWalkMarkerCreate
+@ stub PssWalkMarkerFree
+@ stub PssWalkMarkerGetPosition
+@ stub PssWalkMarkerSeekToBeginning
+@ stub PssWalkMarkerSetPosition
+@ stub PssWalkSnapshot
+@ stub PublishStateChangeNotification
+@ stub PublisherFromPackageFullName
+@ stub QueryAuxiliaryCounterFrequency
+@ stub QueryGlobalizationUserSettingsStatus
+@ stub QueryOptionalDelayLoadedAPI
+@ stub QueryProtectedPolicy
+@ stub QueryStateAtomValueInfo
+@ stub QueryStateContainerCreatedNew
+@ stub QueryStateContainerItemInfo
+@ stub QuirkGetData
+@ stub QuirkGetData2
+@ stub QuirkIsEnabled2
+@ stub QuirkIsEnabledForPackage
+@ stub QuirkIsEnabledForPackage2
+@ stub QuirkIsEnabledForPackage3
+@ stub QuirkIsEnabledForPackage4
+@ stub QuirkIsEnabledForProcess
+@ stub RaiseCustomSystemEventTrigger
+@ stub ReadDirectoryChangesExW
+@ stub ReadStateAtomValue
+@ stub ReadStateContainerValue
+@ stub ReclaimVirtualMemory
+@ stub RecordFeatureUsage2
+@ stub RefreshPackageInfo
+@ stub RefreshPolicyExInternal
+@ stub RefreshPolicyInternal
+@ stub RegCreateKeyExInternalA
+@ stub RegCreateKeyExInternalW
+@ stub RegDeleteKeyExInternalA
+@ stub RegDeleteKeyExInternalW
+@ stub RegDisablePredefinedCacheEx
+@ stub RegKrnGetAppKeyEventAddressInternal
+@ stub RegKrnGetAppKeyLoaded
+@ stub RegKrnGetClassesEnumTableAddressInternal
+@ stub RegKrnGetHKEY_ClassesRootAddress
+@ stub RegKrnGetTermsrvRegistryExtensionFlags
+@ stub RegKrnResetAppKeyLoaded
+@ stub RegKrnSetDllHasThreadStateGlobal
+@ stub RegKrnSetTermsrvRegistryExtensionFlags
+@ stub RegOpenKeyExInternalA
+@ stub RegOpenKeyExInternalW
+@ stub RegQueryMultipleValuesA
+@ stub RegQueryMultipleValuesW
+@ stub RegisterApplicationRestart
+@ stub RegisterBadMemoryNotification
+@ stub RegisterGPNotificationInternal
+@ stub RegisterStateChangeNotification
+@ stub RegisterStateLock
+@ stub ReleaseStateLock
+@ stub RemoveExtensionProgIds
+@ stub RemovePackageFromFamilyXref
+@ stub RemovePackageStatus
+@ stub RemovePackageStatusForUser
+@ stub ReplaceFileExInternal
+@ stub ResetState
+@ stub ResolveDelayLoadsFromDll
+@ stub RestoreThreadPreferredUILanguages
+@ stub RsopLoggingEnabledInternal
+@ stub SHCoCreateInstance
+@ stub SHLoadIndirectStringInternal
+@ stub SaveAlternatePackageRootPath
+@ stub SaveStateRootFolderPath
+@ stub SetClientDynamicTimeZoneInformation
+@ stub SetClientTimeZoneInformation
+@ stub SetComputerNameEx2W
+@ stub SetConsoleHistoryInfo
+@ stub SetConsoleNumberOfCommandsA
+@ stub SetConsoleNumberOfCommandsW
+@ stub SetDynamicTimeZoneInformation
+@ stub SetExtensionProperty
+@ stub SetFileIoOverlappedRange
+@ stub SetIsDeveloperModeEnabled
+@ stub SetIsSideloadingEnabled
+@ stub SetProcessDynamicEHContinuationTargets
+@ stub SetProcessDynamicEnforcedCetCompatibleRanges
+@ stub SetProcessValidCallTargets
+@ stub SetProcessValidCallTargetsForMappedView
+@ stub SetProtectedPolicy
+@ stub SetProtocolProperty
+@ stub SetRoamingLastObservedChangeTime
+@ stub SetStateVersion
+@ stub SetSystemTimeAdjustmentPrecise
+@ stub SetThreadPreferredUILanguages2
+@ stub SetThreadpoolWaitEx
+@ stub SharedLocalIsEnabled
+@ stub StrChrA_MB
+@ stub StrChrNIW
+@ stub SubscribeEdpEnabledStateChange
+@ stub SubscribeFeatureUsageFlush
+@ stub SubscribeStateChangeNotification
+@ stub SubscribeWdagEnabledStateChange
+@ stub TerminateEnclave
+@ stub TerminateProcessOnMemoryExhaustion
+@ stub TestClose
+@ stub TestControlReporting
+@ stub TestCreate
+@ stub TestOpen
+@ stub TestQueryData
+@ stub TestRecoverResults
+@ stub TestReport
+@ stub TestUnlockData
+@ stub UnregisterApplicationRestart
+@ stub UnregisterBadMemoryNotification
+@ stub UnregisterGPNotificationInternal
+@ stub UnregisterStateChangeNotification
+@ stub UnregisterStateLock
+@ stub UnsubscribeEdpEnabledStateChange
+@ stub UnsubscribeFeatureUsageFlush
+@ stub UnsubscribeStateChangeNotification
+@ stub UnsubscribeWdagEnabledStateChange
+@ stub UpdatePackageStatus
+@ stub UpdatePackageStatusForUser
+@ stub UpdatePackageStatusForUserSid
+@ stub VerifyApplicationUserModelId
+@ stub VerifyApplicationUserModelIdA
+@ stub VerifyPackageFamilyName
+@ stub VerifyPackageFamilyNameA
+@ stub VerifyPackageFullName
+@ stub VerifyPackageFullNameA
+@ stub VerifyPackageId
+@ stub VerifyPackageIdA
+@ stub VerifyPackagePublisher
+@ stub VerifyPackagePublisherA
+@ stub VerifyPackageRelativeApplicationId
+@ stub VerifyPackageRelativeApplicationIdA
+@ stub VerifyScripts
+@ stub VirtualUnlockEx
+@ stub WTSGetServiceSessionId
+@ stub WTSIsServerContainer
+@ stub WaitForMachinePolicyForegroundProcessingInternal
+@ stub WaitForUserPolicyForegroundProcessingInternal
+@ stub WerRegisterAdditionalProcess
+@ stub WerRegisterAppLocalDump
+@ stub WerRegisterExcludedMemoryBlock
+@ stub WerSetMaxProcessHoldMilliseconds
+@ stub WerUnregisterAdditionalProcess
+@ stub WerUnregisterAppLocalDump
+@ stub WerUnregisterExcludedMemoryBlock
+@ stub WerpNotifyLoadStringResource
+@ stub WerpNotifyUseStringResource
+@ stub Wow64SetThreadDefaultGuestMachine
+@ stub Wow64SuspendThread
+@ stub WriteStateAtomValue
+@ stub WriteStateContainerValue
+@ stub _AddMUIStringToCache
+@ stub _GetMUIStringFromCache
+@ stub _OpenMuiStringCache
+@ stub __dllonexit3
+@ stub __wgetmainargs
+@ stub _amsg_exit
+@ stub _c_exit
+@ stub _cexit
+@ stub _exit
+@ stub _initterm
+@ stub _initterm_e
+@ stub _invalid_parameter
+@ stub _onexit
+@ stub _purecall
+@ stub _time64
+@ stub atexit
+@ stub exit
+@ stub hgets
+@ stub hwprintf
+@ stub time
+@ stub wprintf
+
+# iOS-Madeira bo3-kb-ntcreatesection (Nov 21 2026): real pass-through to ntdll (main.c kb_NtCreateSection).
+# -private = not in the import library. HIDDEN unless env.MADEIRA_KB_STUBS = 1; env.MADEIRA_KB_NTCS = 0 hides it alone.
+@ stdcall -private -arch=win64 NtCreateSection(ptr long ptr ptr long long long) kb_NtCreateSection

@@ -279,10 +279,14 @@ struct DockInstallRequestRows: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("Cancel") { dock.setInstallRequest(appID, nil) }.font(.caption)
+                        .padItem("st-install-request-cancel", cornerRadius: 12, when: PadSettingsRows.on, inset: -6) { dock.setInstallRequest(appID, nil) }  // no row fill: it sits beside a Spacer
                 }
             } else {
                 Button("Record as done…") { confirmRecord = true }
+                    .padRow("st-record-done") { confirmRecord = true }
                 Button("Reset one-time installs…", role: .destructive) { confirmReset = true }
+                    .padRow("st-reset-installs") { confirmReset = true }
+
             }
         }
         .confirmationDialog("Record \(name)'s one-time installs as done?", isPresented: $confirmRecord, titleVisibility: .visible) {

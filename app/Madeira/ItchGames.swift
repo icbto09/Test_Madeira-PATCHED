@@ -496,12 +496,13 @@ struct ItchEntrySection: View {
             if let download {
                 ItchDownloadStatus(download: download)
                 switch download.state {
-                case .active, .queued: Button("Pause download") { itch.pause(id) }
-                case .paused, .failed: Button("Resume download") { itch.install(id) }
+                case .active, .queued: Button("Pause download") { itch.pause(id) }.padRow("itch-pause-download") { itch.pause(id) }
+                case .paused, .failed: Button("Resume download") { itch.install(id) }.padRow("itch-resume-download") { itch.install(id) }
                 }
             } else if itch.updateAvailable(id) {
                 Button { itch.install(id) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!itch.signedIn)
+                    .padRow("itch-update-available-downloa", when: !(!itch.signedIn)) { itch.install(id) }
             }
             if let record {
                 if !record.version.isEmpty { LabeledContent("Version", value: record.version) }
@@ -510,6 +511,7 @@ struct ItchEntrySection: View {
             LabeledContent("itch.io game ID", value: "\(id)")
             if record != nil, download == nil {
                 Button("Uninstall", role: .destructive) { confirmUninstall = true }
+                    .padRow("itch-uninstall") { confirmUninstall = true }
             }
         } header: {
             Text("itch.io")
@@ -625,8 +627,10 @@ struct ItchSettingsSection: View {
             if itch.signedIn {
                 LabeledContent("Signed in as", value: itch.accountName ?? "itch.io account")
                 Button("Sign out of itch.io", role: .destructive) { confirmSignOut = true }
+                    .padRow("itch-sign-out") { confirmSignOut = true }
             } else {
                 Button { showSignIn = true } label: { Label("Sign in to itch.io", systemImage: "person.crop.circle.badge.plus") }
+                    .padRow("itch-sign-in") { showSignIn = true }
             }
         } header: {
             Text("itch.io")

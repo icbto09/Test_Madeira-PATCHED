@@ -143,6 +143,18 @@ ExitToX64:
   adrp x16, IosFfsBypassEnable
   ldr w16, [x16, #:lo12:IosFfsBypassEnable]
   cbz w16, ios_ffs_no_bypass
+  //
+  // ffs-peek (Nov 21 2026): the three loads below read the CALL TARGET's bytes natively. Real Windows never
+  // touches an x64 target from native code before running it, so a target page the guest keeps PAGE_NOACCESS
+  // (Overwatch_loader.dll does this to Overwatch.exe .text and decrypts on the first x64 fault) faults HERE,
+  // in FEX's own code, and wine then dispatches a nonsense x64 context (Rip = this host pc). Module.cpp
+  // ResetToConsistentStateImpl catches a read fault between IosFfsPeekBegin and IosFfsPeekEnd and resumes at
+  // IosFfsNoBypass: normal emulation, whose frontend checks the page first and raises the Windows-correct
+  // guest execute fault at the target. Nothing between Begin and End changes sp, lr, x9 or any argument
+  // register (only x16/x17, which ios_ffs_no_bypass clobbers anyway), so resuming there is the same as the
+  // pattern not matching. Off switch: MADEIRA_FFS_PEEK_FIXUP=0.
+.globl IosFfsPeekBegin
+IosFfsPeekBegin:
   ldr x16, [x9]
   movz x17, #0x8b48
   movk x17, #0x48c4, lsl #16
@@ -155,6 +167,8 @@ ExitToX64:
   cmp w16, w17
   b.ne ios_ffs_no_bypass
   ldursw x16, [x9, #10]  // jmp rel32 (signed)
+.globl IosFfsPeekEnd
+IosFfsPeekEnd:             // first instruction that no longer reads the target
   add x17, x9, x16
   add x17, x17, #14      // raw target = FFS base + 14 + rel32
   // ml316b: x9 (and thus the raw target) is usually the POOL-COPY alias -- wine
@@ -253,6 +267,8 @@ ios_ffs_reject:
   str x23, [x16, #16]    // [2] = matched-but-rejected count
   str x17, [x16, #24]    // [3] = last rejected (PE-space) target
 ios_ffs_no_bypass:
+.globl IosFfsNoBypass
+IosFfsNoBypass:            // ffs-peek resume point (same address as ios_ffs_no_bypass)
   IOS_XP_COUNT 2112, x16, x17   // ml1131: EC->x64 call (callback) emulated
 #endif
   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.

@@ -450,6 +450,19 @@ Ref OpDispatchBuilder::ReconstructX87StateFromFSW_Helper(Ref FSW) {
   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(C2);
   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(C3);
   SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(IE);
+
+  // madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT)
+  // The other exception flags DE..ES (bits 1-7). Only IE is ever raised by emulated operations, but the others must
+  // survive FLDENV/FRSTOR/FXRSTOR so software can set and test them (fesetexceptflag/fetestexcept).
+  if (MadeiraX87Flags()) {
+    SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(_Bfe(OpSize::i32Bit, 1, 1, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(_Bfe(OpSize::i32Bit, 1, 2, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(_Bfe(OpSize::i32Bit, 1, 3, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(_Bfe(OpSize::i32Bit, 1, 4, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(_Bfe(OpSize::i32Bit, 1, 5, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(_Bfe(OpSize::i32Bit, 1, 6, FSW));
+    SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(_Bfe(OpSize::i32Bit, 1, 7, FSW));
+  }
   return Top;
 }
 
@@ -743,6 +756,9 @@ void OpDispatchBuilder::FTST(OpcodeArgs) {
 
 void OpDispatchBuilder::X87OpHelper(OpcodeArgs, FEXCore::IR::IROps IROp, bool ZeroC2) {
   DeriveOp(Result, IROp, _F80SCALEStack());
+  if (ReducedPrecisionMode && IROp == OP_F80SQRTSTACK) {
+    X87PrecisionControlF64(0); // iOS-Madeira-GTM: FSQRT honors FCW.PC = single
+  }
   if (ZeroC2) {
     SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(Constant(0));
   }
@@ -793,6 +809,16 @@ Ref OpDispatchBuilder::ReconstructFSW_Helper(Ref T) {
   auto IE = GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC);
   FSW = _Or(OpSize::i64Bit, FSW, IE);
 
+  if (MadeiraX87Flags()) { // madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT)
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_DE_LOC), 1);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_ZE_LOC), 2);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_OE_LOC), 3);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_UE_LOC), 4);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_PE_LOC), 5);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_SF_LOC), 6);
+    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_ES_LOC), 7);
+  }
+
   return FSW;
 }
 
@@ -812,6 +838,16 @@ void OpDispatchBuilder::X87FNSTSW(OpcodeArgs, bool DestRAX) {
 void OpDispatchBuilder::FNCLEX(OpcodeArgs) {
   // Clear the exception flag bit
   SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Constant(0));
+  if (MadeiraX87Flags()) { // madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT): clear DE..ES too
+    auto Zero = _Constant(0);
+    SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(Zero);
+  }
 }
 
 void OpDispatchBuilder::FNINIT(OpcodeArgs) {
@@ -840,6 +876,15 @@ void OpDispatchBuilder::FNINIT(OpcodeArgs) {
   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(Zero);
   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(Zero);
   SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(Zero);
+  if (MadeiraX87Flags()) { // madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT): clear DE..ES too
+    SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(Zero);
+    SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(Zero);
+  }
 
   // fninit resets the FIP.
   _StoreContextGPR(OpSize::i64Bit, _Constant(0), offsetof(FEXCore::Core::CPUState, FIP));

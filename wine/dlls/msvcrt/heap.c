@@ -33,7 +33,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
 #define UNLOCK_HEAP _unlock( _HEAP_LOCK )
 
 /* _aligned */
-#define SAVED_PTR(x) ((void *)((DWORD_PTR)((char *)x - sizeof(void *)) & \
+#define SAVED_PTR(x) ((void **)((DWORD_PTR)((char *)x - sizeof(void *)) & \
                                ~(sizeof(void *) - 1)))
 #define ALIGN_PTR(ptr, alignment, offset) ((void *) \
     ((((DWORD_PTR)((char *)ptr + alignment + sizeof(void *) + offset)) & \
@@ -53,8 +53,58 @@ static unsigned int MSVCRT_amblksiz = 16;
 /* FIXME - According to documentation it should be 480 bytes, at runtime default is 0 */
 static size_t MSVCRT_sbh_threshold = 0;
 
+/* Madeira (msvcrt-early-heap): Wine 11.22's GetUserNameW() and shell32's
+ * %USERPROFILE% expansion now go through advapi32's LookupAccountSidW(), which
+ * calls malloc().  When a DLL's DllMain runs that path before msvcrt's own
+ * DLL_PROCESS_ATTACH (an import cycle puts wininet ahead of msvcrt on iOS),
+ * 'heap' is still NULL and HeapAlloc(NULL) faults.  Create the heap on first
+ * use instead; msvcrt_init_heap() then keeps it.
+ * Off switch: MADEIRA_MSVCRT_EARLY_HEAP=0 (old behaviour, which faults). */
+static HANDLE msvcrt_create_heap(void)
+{
+#if _MSVCR_VER <= 100
+    return HeapCreate(0, 0, 0);
+#else
+    return GetProcessHeap();
+#endif
+}
+
+/* Set 'heap' once, race-safe: the early path and DLL_PROCESS_ATTACH can both get here. */
+static HANDLE msvcrt_install_heap(void)
+{
+    HANDLE h;
+
+    if (heap) return heap;
+    if (!(h = msvcrt_create_heap())) return NULL;
+    if (InterlockedCompareExchangePointer(&heap, h, NULL))
+    {
+#if _MSVCR_VER <= 100
+        HeapDestroy(h);
+#endif
+    }
+    return heap;
+}
+
+static HANDLE msvcrt_early_heap(void)
+{
+    static LONG logged;
+    DWORD err = GetLastError();
+    WCHAR sw[4];
+    BOOL off = GetEnvironmentVariableW(L"MADEIRA_MSVCRT_EARLY_HEAP", sw, ARRAY_SIZE(sw)) == 1 && sw[0] == '0';
+
+    SetLastError(err);  /* the variable is normally unset; don't leak ERROR_ENVVAR_NOT_FOUND to the caller */
+    if (off) return NULL;
+    if (!msvcrt_install_heap()) return NULL;
+    if (!InterlockedExchange(&logged, 1))
+        ERR("[msvcrt-early-heap] malloc before msvcrt DLL_PROCESS_ATTACH; heap %p created on first use "
+            "(MADEIRA_MSVCRT_EARLY_HEAP=0 disables)\n", heap);
+    return heap;
+}
+
 static void* msvcrt_heap_alloc(DWORD flags, size_t size)
 {
+    if (!heap) msvcrt_early_heap();
+
     if(size < MSVCRT_sbh_threshold)
     {
         void *memblock, *temp, **saved;
@@ -580,6 +630,12 @@ void * CDECL _aligned_offset_malloc(size_t size, size_t alignment, size_t offset
     if (alignment < sizeof(void *))
         alignment = sizeof(void *);
 
+    if (size > (size_t)-1 - alignment - sizeof(void *))
+    {
+        *_errno() = ENOMEM;
+        return NULL;
+    }
+
     /* allocate enough space for void pointer and alignment */
     temp = malloc(size + alignment + sizeof(void *));
 
@@ -612,8 +668,9 @@ void * CDECL _aligned_malloc(size_t size, size_t alignment)
 void * CDECL _aligned_offset_realloc(void *memblock, size_t size,
                                      size_t alignment, size_t offset)
 {
-    void * temp, **saved;
+    void *temp, *alloc_ptr;
     size_t old_padding, new_padding, old_size;
+
     TRACE("(%p, %Iu, %Iu, %Iu)\n", memblock, size, alignment, offset);
 
     if (!memblock)
@@ -643,18 +700,11 @@ void * CDECL _aligned_offset_realloc(void *memblock, size_t size,
     if (alignment < sizeof(void *))
         alignment = sizeof(void *);
 
-    /* make sure alignment and offset didn't change */
-    saved = SAVED_PTR(memblock);
-    if (memblock != ALIGN_PTR(*saved, alignment, offset))
-    {
-        *_errno() = EINVAL;
-        return NULL;
-    }
-
-    old_padding = (char *)memblock - (char *)*saved;
+    alloc_ptr = *SAVED_PTR(memblock);
+    old_padding = (char *)memblock - (char *)alloc_ptr;
 
     /* Get previous size of block */
-    old_size = _msize(*saved);
+    old_size = _msize(alloc_ptr);
     if (old_size == -1)
     {
         /* It seems this function was called with an invalid pointer. Bail out. */
@@ -669,55 +719,40 @@ void * CDECL _aligned_offset_realloc(void *memblock, size_t size,
     }
     old_size -= old_padding;
 
-    temp = realloc(*saved, size + alignment + sizeof(void *));
-
-    if (!temp)
+    if (size > (size_t)-1 - alignment - sizeof(void *))
+    {
+        *_errno() = ENOMEM;
         return NULL;
+    }
+
+    /* Ensure data is preserved if padding block is shrinked */
+    if (alignment + sizeof(void *) < old_padding)
+    {
+        memmove(alloc_ptr, memblock, old_size);
+        old_padding = 0;
+    }
+
+    temp = realloc(alloc_ptr, size + alignment + sizeof(void *));
+    if (!temp)
+    {
+        if (!old_padding)
+        {
+            memmove(memblock, alloc_ptr, old_size);
+            *SAVED_PTR(memblock) = alloc_ptr;
+        }
+        return NULL;
+    }
 
     /* adjust pointer for proper alignment and offset */
     memblock = ALIGN_PTR(temp, alignment, offset);
-
-    /* Save the real allocation address below returned address */
-    /* so it can be found later to free. */
-    saved = SAVED_PTR(memblock);
-
     new_padding = (char *)memblock - (char *)temp;
-
-/*
-   Memory layout of old block is as follows:
-   +-------+---------------------+-+--------------------------+-----------+
-   |  ...  | "old_padding" bytes | | ... "old_size" bytes ... |    ...    |
-   +-------+---------------------+-+--------------------------+-----------+
-           ^                     ^ ^
-           |                     | |
-        *saved               saved memblock
-
-   Memory layout of new block is as follows:
-   +-------+-----------------------------+-+----------------------+-------+
-   |  ...  |    "new_padding" bytes      | | ... "size" bytes ... |  ...  |
-   +-------+-----------------------------+-+----------------------+-------+
-           ^                             ^ ^
-           |                             | |
-          temp                       saved memblock
-
-   However, in the new block, actual data is still written as follows
-   (because it was copied by realloc):
-   +-------+---------------------+--------------------------------+-------+
-   |  ...  | "old_padding" bytes |   ... "old_size" bytes ...     |  ...  |
-   +-------+---------------------+--------------------------------+-------+
-           ^                             ^ ^
-           |                             | |
-          temp                       saved memblock
-
-   Therefore, min(old_size,size) bytes of actual data have to be moved
-   from the offset they were at in the old block (temp + old_padding),
-   to the offset they have to be in the new block (temp + new_padding == memblock).
-*/
+    /* copy data to new location */
     if (new_padding != old_padding)
         memmove((char *)memblock, (char *)temp + old_padding, (old_size < size) ? old_size : size);
 
-    *saved = temp;
-
+    /* Save the real allocation address below returned address */
+    /* so it can be found later to free. */
+    *SAVED_PTR(memblock) = temp;
     return memblock;
 }
 
@@ -729,6 +764,44 @@ void * CDECL _aligned_realloc(void *memblock, size_t size, size_t alignment)
     TRACE("(%p, %Iu, %Iu)\n", memblock, size, alignment);
     return _aligned_offset_realloc(memblock, size, alignment, 0);
 }
+
+#if _MSVCR_VER>=80
+/*********************************************************************
+ *		_aligned_offset_recalloc (MSVCR80.@)
+ */
+void * CDECL _aligned_offset_recalloc(void *memblock, size_t num, size_t size,
+                                      size_t alignment, size_t offset)
+{
+    size_t old_size = 0;
+    void *ret;
+
+    TRACE("(%p, %Iu, %Iu, %Iu, %Iu)\n", memblock, num, size, alignment, offset);
+
+    if (num && size > (size_t)-1 / num)
+    {
+        *_errno() = ENOMEM;
+        return NULL;
+    }
+    size *= num;
+
+    if (memblock)
+        old_size = _aligned_msize(memblock, alignment, offset);
+
+    ret = _aligned_offset_realloc(memblock, size, alignment, offset);
+    if (ret && size > old_size)
+        memset((char *)ret + old_size, 0, size - old_size);
+    return ret;
+}
+
+/*********************************************************************
+ *		_aligned_recalloc (MSVCR80.@)
+ */
+void * CDECL _aligned_recalloc(void *memblock, size_t num, size_t size, size_t alignment)
+{
+    TRACE("(%p, %Iu, %Iu, %Iu)\n", memblock, num, size, alignment);
+    return _aligned_offset_recalloc(memblock, num, size, alignment, 0);
+}
+#endif
 
 /*********************************************************************
  *		memmove_s (MSVCRT.@)
@@ -829,12 +902,9 @@ int CDECL wmemcpy_s(wchar_t *dest, size_t numberOfElements,
 
 BOOL msvcrt_init_heap(void)
 {
-#if _MSVCR_VER <= 100
-    heap = HeapCreate(0, 0, 0);
-#else
-    heap = GetProcessHeap();
-#endif
-    return heap != NULL;
+    /* msvcrt-early-heap: keep a heap that malloc() already created, so blocks handed
+     * out before DLL_PROCESS_ATTACH stay freeable. */
+    return msvcrt_install_heap() != NULL;
 }
 
 void msvcrt_destroy_heap(void)

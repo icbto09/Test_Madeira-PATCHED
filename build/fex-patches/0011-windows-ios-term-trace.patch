@@ -1,0 +1,15 @@
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1554,8 +1554,11 @@
+   /* Recorder emitted only for this executable, before CTX/JIT creation. */
+   const auto HistoryName = fextl::string {AppConfigName};
+   const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
++  /* madeira [term-trace]: MADEIRA_FEX_BRANCH_HISTORY = 1 records for any executable
++   * (a per-game config line; BO3's self-exit). Unset keeps the old rule. */
+   FEXCore::Core::IosGuestBranchTraceEnabled =
+-    _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
++    (HistoryOpt && HistoryOpt[0] == '1') ||
++    (_stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0'));
+   LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
+                    FEXCore::Core::IosGuestBranchTraceEnabled != 0, AppConfigName);
+ #endif

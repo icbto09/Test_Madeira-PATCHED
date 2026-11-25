@@ -80,7 +80,7 @@ check('MXMetricManager.shared.remove(subscriber)' in code and 'try? FileManager.
 check('Toggle("Send crash reports", isOn: $on)' in ios and 'CrashReportsSection()' in logs, 'the switch is on the Logs page')
 gate = ios.index('if DebugLogging.available {')
 check(gate < ios.index('Crash Madeira now (test copy only)') and gate < ios.index('Write a test error (test copy only)')
-      and ios.count('CrashReports.crashNow()') == 1 and ios.count('CrashReports.testError()') == 1,
+      and ios.count('CrashReports.crashNow()') >= 1 and ios.count('CrashReports.testError()') >= 1,   # settings-pad-rows: a controller press does the same as the tap
       'the rows that try it show only on the test bundle')
 trail_at = main_app.index('LogTrail.install()')
 check('CrashReports.start()' in main_app and main_app.index('CrashReports.start()') > trail_at, 'MadeiraApp starts it after the log trail')
@@ -89,7 +89,7 @@ check('CrashReports.start()' in main_app and main_app.index('CrashReports.start(
 for name in ['CrashReportsCore.swift', 'CrashReports.swift']:
     check(pbx.count(f'/* {name} */') >= 2 and pbx.count(f'/* {name} in Sources */') == 2, f'{name} is in the Xcode project')
 langs = {'de', 'es', 'ko', 'pt-BR', 'ru', 'zh-Hans'}
-texts = set(re.findall(r'(?:Text|Toggle)\("([^"\\]+)"', ios))
+texts = set(re.findall(r'(?<![A-Za-z])(?:Text|Toggle)\("([^"\\]+)"', ios))   # not padToggle(...)
 check(len(texts) == 2, f'two translated texts ({len(texts)} found)')
 missing = [t for t in sorted(texts) if set(strings.get(t, {}).get('localizations', {})) < langs]
 check(not missing, f'every new text has six languages (missing: {missing})')

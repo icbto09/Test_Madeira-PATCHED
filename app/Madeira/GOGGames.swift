@@ -519,16 +519,18 @@ struct GOGEntrySection: View {
             if let download {
                 GOGDownloadStatus(download: download)
                 switch download.state {
-                case .active, .queued: Button("Pause download") { gog.pause(id) }
-                case .paused, .failed: Button("Resume download") { gog.install(id) }
+                case .active, .queued: Button("Pause download") { gog.pause(id) }.padRow("gog-pause-download") { gog.pause(id) }
+                case .paused, .failed: Button("Resume download") { gog.install(id) }.padRow("gog-resume-download") { gog.install(id) }
                 }
             } else if gog.updateAvailable(id) {
                 Button { gog.install(id) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!gog.signedIn)
+                    .padRow("gog-update-available-downloa", when: !(!gog.signedIn)) { gog.install(id) }
             }
             if download == nil, record != nil {
                 Button { gog.repair(id) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
                     .disabled(!gog.signedIn)
+                    .padRow("gog-repair-installed-files", when: !(!gog.signedIn)) { gog.repair(id) }
                 Text("Checks every installed file against GOG's current build and downloads what is missing or changed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -537,9 +539,12 @@ struct GOGEntrySection: View {
                 LabeledContent("Language", value: record.language == "*" ? "Default" : record.language)
                 if !record.dlc.isEmpty { LabeledContent("DLC installed", value: "\(record.dlc.count)") }
                 if programs.count > 1, download == nil {
-                    Picker("Program", selection: Binding(get: { record.launchExe.lowercased() }, set: { pick($0, id: id) })) {
+                    let program = Binding(get: { record.launchExe.lowercased() }, set: { pick($0, id: id) })
+                    Picker("Program", selection: program) {
                         ForEach(programs) { Text($0.name).tag($0.id) }
                     }
+                    .padPicker("gog-program", program, programs.map { $0.id })
+
                     Text("Which program Play starts. Pick the game itself when its launcher closes without starting it.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -551,6 +556,7 @@ struct GOGEntrySection: View {
             LabeledContent("Product ID", value: id)
             if record != nil, download == nil {
                 Button("Uninstall", role: .destructive) { confirmUninstall = true }
+                    .padRow("gog-uninstall") { confirmUninstall = true }
             }
         } header: {
             Text("GOG")
@@ -601,8 +607,10 @@ struct GOGSettingsSection: View {
             if gog.signedIn {
                 LabeledContent("Signed in as", value: gog.accountName ?? "GOG account")
                 Button("Sign out of GOG", role: .destructive) { confirmSignOut = true }
+                    .padRow("gog-sign-out") { confirmSignOut = true }
             } else {
                 Button { open(.gogSignIn) } label: { Label("Sign in to GOG", systemImage: "person.crop.circle.badge.plus") }
+                    .padRow("gog-sign-in") { open(.gogSignIn) }
             }
         } header: {
             Text("GOG")

@@ -1,0 +1,98 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index dd23485..11132d8 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1049,6 +1049,34 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+   return AllocatedInfo;
+ }
+ 
++/* madeira [multiblock-fault-rip] rev=multiblock-fault-rip-1, env MADEIRA_FEX_MB_FAULT_RIP = 0 (off switch, default on).
++ *
++ * A block whose emission is restarted (a b.cond/cbz/tbz/adr that cannot reach its label: EnableFarARM64Jumps, or
++ * the temporary buffer's guard page: NeedsLargerJITSpace) is emitted again from the start, and the restart
++ * resets the jump targets, the entry points and (upstream fc8ef0e72) the relocations, but not DebugData. The
++ * GuestOpcode markers of the abandoned attempt stay in DebugData->GuestOpcodes, the second attempt appends its
++ * own, and the block tail's host-PC -> guest-RIP table is written from both. RestoreRIPFromHostPC (and the
++ * ml885 diagnostic, which walks the same table) stops at the first entry past the host PC, which is in the stale
++ * prefix whenever the abandoned attempt got that far: it answers with the instruction that sat at that host
++ * offset in the abandoned layout. Far jumps make every conditional branch one instruction longer, so that is a
++ * later instruction than the one that faulted, and the guest's SEH scope does not match it.
++ *
++ * Only large blocks reach a restart (a tbz/tbnz reaches +-32 KB; the taken exits of a multiblock's jcc/jp/js
++ * are placed at its end), which is why this shows with FEX_MULTIBLOCK=1. Overwatch 0.2.93: a loader byte probe
++ * (movzx eax, byte [rax] at rva 0xf03a09) faulted 76 KB into a multiblock and was reported at rva 0xf0532e,
++ * a jno; with multiblock off the same probe was reported exactly and its handler ran.
++ *
++ * Upstream FEX has the same gap (main 123706543). MADEIRA_FEX_MB_FAULT_RIP=0: the stale entries are kept. */
++static bool IosMbFaultRipEnabled() {
++  static const bool Enabled = [] {
++    const char* Env = getenv("MADEIRA_FEX_MB_FAULT_RIP");
++    const bool On = !(Env && Env[0] == '0' && Env[1] == '\0');
++    LogMan::Msg::EFmt("[multiblock-fault-rip] rev=multiblock-fault-rip-1 {}", On ? "on" : "off (MADEIRA_FEX_MB_FAULT_RIP=0)");
++    return On;
++  }();
++  return Enabled;
++}
++
+ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
+   FEXCORE_PROFILE_SCOPED("Arm64::EmitJITCode");
+@@ -1085,6 +1113,23 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+ 
+   CodeData.EntryPoints.clear();
+ 
++  // madeira [multiblock-fault-rip]: a restarted attempt starts with the RIP table and subblocks of the abandoned
++  // one still in DebugData; drop them as the relocations above are dropped. Empty on a first attempt.
++  const bool MbFaultRip = IosMbFaultRipEnabled(); // also logs the rev line once, at the first compile
++  if (DebugData && (!DebugData->GuestOpcodes.empty() || !DebugData->Subblocks.empty())) {
++    static std::atomic<uint32_t> MbFaultRipLogged {0};
++    if (MbFaultRipLogged.fetch_add(1, std::memory_order_relaxed) < 8) {
++      LogMan::Msg::EFmt("[multiblock-fault-rip] rev=multiblock-fault-rip-1 restart entry={:#x} far={} ssa_mul={}: {} {} stale "
++                        "RIP entries, {} subblocks",
++                        Entry, RequiresFarARM64Jumps ? 1 : 0, SSANodeMultiplier, MbFaultRip ? "dropped" : "KEPT (switch off)",
++                        DebugData->GuestOpcodes.size(), DebugData->Subblocks.size());
++    }
++    if (MbFaultRip) {
++      DebugData->GuestOpcodes.clear();
++      DebugData->Subblocks.clear();
++    }
++  }
++
+   // Fairly excessive buffer range to make sure we don't overflow
+   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
+   const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE * 2 + SSACount * SSANodeMultiplier, FEXCore::Utils::FEX_PAGE_SIZE);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 01f6a1f..6deceea 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -261,6 +261,16 @@ public:
+     return Enabled;
+   }
+ 
++  // MADEIRA multiblock-fault-rip: on unless MADEIRA_FEX_MB_FAULT_RIP=0. Read once per process; the JIT side
++  // (JIT.cpp, IosMbFaultRipEnabled) reads the same variable and logs the rev line.
++  static bool MbFaultRipMarkEnabled() {
++    static const bool Enabled = [] {
++      const char* Env = getenv("MADEIRA_FEX_MB_FAULT_RIP");
++      return !(Env && Env[0] == '0' && Env[1] == '\0');
++    }();
++    return Enabled;
++  }
++
+   static bool CanHaveSideEffects(const FEXCore::X86Tables::X86InstInfo* TableInfo, FEXCore::X86Tables::DecodedOp Op) {
+     if (TableInfo) {
+       if (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) {
+@@ -284,6 +294,13 @@ public:
+       if ((TableInfo->Flags & X86Tables::InstFlags::FLAGS_MEM_OFFSET) && MoffsMarkerEnabled()) {
+         return true;
+       }
++
++      // MADEIRA multiblock-fault-rip: PUSHF (9C) stores to [rsp-8] but has no operand and, unlike PUSH, POP,
++      // PUSH FS and the others with an implicit stack access, no FLAGS_DEBUG_MEM_ACCESS, so it got no marker:
++      // a stack fault on it was reported at, and resumed from, the previous marked instruction.
++      if (TableInfo == &X86Tables::BaseOps[0x9C] && MbFaultRipMarkEnabled()) {
++        return true;
++      }
+     }
+ 
+     auto CanHaveSideEffects = false;

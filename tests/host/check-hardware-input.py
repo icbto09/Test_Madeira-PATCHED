@@ -871,7 +871,7 @@ check('GCController' not in source.split('final class PadStickMouse', 1)[0].spli
       'only PadStickMouse may touch controllers; GamepadInput owns them')
 check(re.search(r'm\.scroll\.valueChangedHandler = \{ \[weak self\] _, x, y in\s*'
                 r'let wheel = GCMouseWheel\.axes\(Double\(x\), Double\(y\)\)\s*'
-                r'self\?\.scrolled\(wheel\.dx, wheel\.dy\)', glue) is not None,
+                r'self\?\.scrolled\(wheel\.dx, wheel\.dy, flush: true\)', glue) is not None,
       'the GCMouse wheel goes through GCMouseWheel.axes')
 # iPadOS refusing the lock: checked once the request has settled, shown once per game.
 check('DispatchQueue.main.asyncAfter(deadline: .now() + LockRefusedNotice.settle) { settle() }' in glue
@@ -882,7 +882,7 @@ check('HardwareInput.shared.dismissLockRefusedHint("the lock was granted")' in g
       'a lock granted later hides the notice')
 check('HardwareInput.shared.gameSessionStarted()' in (app / 'ContentView.swift').read_text(),
       'each library launch resets the once-per-game notice')
-check('if hw.lockRefusedHint && !model.startingScreen && !model.menu' in (app / 'Library.swift').read_text(),
+check('if hw.lockRefusedHint && !hw.lockDropped && !model.startingScreen && !model.menu' in (app / 'Library.swift').read_text(),
       'the game shows the notice (LibraryHUD)')
 strings = (app / 'Localizable.xcstrings').read_text()
 check('"Mouse leaving the game? In iPad Settings > Multitasking & Gestures, choose Full Screen Apps."' in strings,

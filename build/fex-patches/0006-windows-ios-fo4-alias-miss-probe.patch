@@ -1,0 +1,70 @@
+diff -ru a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
+--- a/Source/Windows/ARM64EC/IosJitAlias.cpp	2026-11-22 05:08:37.967955015 +0000
++++ b/Source/Windows/ARM64EC/IosJitAlias.cpp	2026-11-22 05:08:17.802446676 +0000
+@@ -543,6 +543,26 @@
+ }
+ /* ======================= end ml951 SUB-FLOOR WINDOWS ===================== */
+ 
++/* fo4-alias-miss-probe: how many registrations the full table refused, the
++ * JIT base of the last one, and a snapshot for the MISS log line. Log-only. */
++uint64_t IosAliasRefused = 0;
++uint64_t IosAliasLastRefusedJit = 0;
++void IosJitAliasStats(int* Count, int* Live, uint64_t* Refused, uint64_t* LastRefusedJit, uint64_t* Low, uint64_t* High) {
++  const int n = g_EntryCount;
++  int live = 0;
++  for (int i = 0; i < n; i++) {
++    if (g_Entries[i].Size) {
++      live++;
++    }
++  }
++  *Count = n;
++  *Live = live;
++  *Refused = __atomic_load_n(&IosAliasRefused, __ATOMIC_RELAXED);
++  *LastRefusedJit = __atomic_load_n(&IosAliasLastRefusedJit, __ATOMIC_RELAXED);
++  *Low = __atomic_load_n(&g_JitLow, __ATOMIC_RELAXED);
++  *High = __atomic_load_n(&g_JitHigh, __ATOMIC_RELAXED);
++}
++
+ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
+   /* ml951: a sub-floor window arrives through this same entry point, marked by
+    * a below-4GB "PeBase" (no real PE base can be there on iOS). Route it to the
+@@ -607,8 +627,10 @@
+      * unix call that corrupted the running syscall's frame (gta-2237:
+      * RockstarService died at pc == its syscall frame). Count only
+      * (tools/patch-fex-ios-alias-full-quiet.py). */
+-    static uint64_t refused = 0;
+-    __atomic_fetch_add(&refused, 1, __ATOMIC_RELAXED);
++    /* fo4-alias-miss-probe: counted in globals so the [iOS-xquery] MISS line
++     * (logged from the JIT thread, not from a unix call) can print them. */
++    __atomic_fetch_add(&IosAliasRefused, 1, __ATOMIC_RELAXED);
++    __atomic_store_n(&IosAliasLastRefusedJit, JitBase, __ATOMIC_RELAXED);
+     return;
+   }
+   g_Entries[count].PeBase = PeBase;
+diff -ru a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+--- a/Source/Windows/ARM64EC/Module.cpp	2026-11-22 05:08:37.968014889 +0000
++++ b/Source/Windows/ARM64EC/Module.cpp	2026-11-22 05:08:37.944111286 +0000
+@@ -80,6 +80,7 @@
+ extern "C" uint64_t IosJitTranslate(uint64_t Addr);
+ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
++extern "C" void IosJitAliasStats(int* Count, int* Live, uint64_t* Refused, uint64_t* LastRefusedJit, uint64_t* Low, uint64_t* High); // fo4-alias-miss-probe
+ extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
+ extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
+ /* Defined in FEXCore Dispatcher.cpp; read when the dispatcher is emitted. */
+@@ -1125,8 +1126,13 @@
+       static uint32_t QueryFailCount = 0;
+       if (QueryFailCount < 12) {
+         QueryFailCount++;
+-        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x}",
+-                          static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address));
++        int AliasCount = 0, AliasLive = 0;
++        uint64_t AliasRefused = 0, AliasLastRefused = 0, JitLow = 0, JitHigh = 0;
++        IosJitAliasStats(&AliasCount, &AliasLive, &AliasRefused, &AliasLastRefused, &JitLow, &JitHigh);
++        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x} alias-table={}/256 live={} refused={} "
++                          "last-refused-jit={:#x} jit-bounds=[{:#x},{:#x}) probe=fo4-alias-miss-probe",
++                          static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address),
++                          AliasCount, AliasLive, AliasRefused, AliasLastRefused, JitLow, JitHigh);
+       }
+     }
+ #endif

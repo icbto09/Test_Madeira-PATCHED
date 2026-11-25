@@ -792,6 +792,7 @@ struct SigningSettingsSection: View {
                     } label: {
                         Label(signing.account == nil ? "Sign in with Apple ID…" : "Sign in again…", systemImage: "person.crop.circle")
                     }
+                    .padRow("sign-apple-id") { signing.signingIn = true }
                 }
                 if let appleID = signing.account?.appleID {
                     LabeledContent("Apple ID", value: appleID)
@@ -808,9 +809,13 @@ struct SigningSettingsSection: View {
                         }
                     }
                     .disabled(signing.working || signing.signInRefused || !signing.weekly)
+                    .padRow("sign-refresh", when: !(signing.working || signing.signInRefused || !signing.weekly)) { signing.refresh() }
                     if case .failed(let message) = signing.status {
                         Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                        if signing.deviceUnreachable { Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() } }
+                        if signing.deviceUnreachable {
+                            Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() }.padRow("sign-vpn") { LocalDevVPN.open() }
+                        }
+
                     } else if signing.status == .refreshed {
                         Label("Refreshed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                     }

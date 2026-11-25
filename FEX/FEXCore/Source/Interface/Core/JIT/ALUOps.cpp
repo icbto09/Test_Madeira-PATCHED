@@ -12,7 +12,17 @@ $end_info$
 #include "Interface/Core/JIT/Relocations.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 
+#include <cstdlib> // madeira [intel-flags]: getenv
+
 namespace FEXCore::CPU {
+// madeira [intel-flags]: same switch as OpDispatchBuilder::MadeiraIntelFlags(), read once per process.
+static bool MadeiraIntelFlagsJIT() {
+  static const bool On = [] {
+    const char* E = getenv("MADEIRA_FEX_INTEL_FLAGS");
+    return E && E[0] == '1' && E[1] == '\0';
+  }();
+  return On;
+}
 
 #define DEF_BINOP_WITH_CONSTANT(FEXOp, VarOp, ConstOp)                                    \
   DEF_OP(FEXOp) {                                                                         \
@@ -636,16 +646,35 @@ DEF_OP(ShiftFlags) {
       lsrv(EmitSize, CFWord, Src1, CFWord);
     }
 
-    if (Op->InvertCF) {
-      mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
-      CFWord = TMP1;
-    }
-
     bool SetOF = Op->Shift != IR::ShiftType::ASR;
-    if (SetOF) {
-      // Only defined when Shift is 1 else undefined
-      // OF flag is set if a sign change occurred
-      eor(EmitSize, TMP3, Src1, Dst);
+    // madeira [intel-flags] (BOR1NG, MetalSharp FEX 0031; env MADEIRA_FEX_INTEL_FLAGS = 1): for a left shift by a
+    // variable count, OF = MSB(result) ^ CF as Intel hardware and Rosetta 2 give for any count (the same as the
+    // sign-change rule for a count of 1). Computed before CF is inverted. Right shifts keep the sign-change rule.
+    if (SetOF && Op->Shift == IR::ShiftType::LSL && MadeiraIntelFlagsJIT()) {
+      const unsigned TopBit = IR::OpSizeToSize(OpSize) * 8 - 1;
+      if (CFBit != 0) {
+        // CF is Dst[TopBit + 1].
+        eor(ARMEmitter::Size::i64Bit, TMP3, Dst.X(), Dst.X(), ARMEmitter::ShiftType::LSR, 1);
+      } else {
+        // CF is CFWord[0].
+        eor(EmitSize, TMP3, Dst, CFWord, ARMEmitter::ShiftType::LSL, TopBit);
+      }
+      if (Op->InvertCF) {
+        mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
+        CFWord = TMP1;
+      }
+    } else {
+      // Switch off (or not a left shift): the original order.
+      if (Op->InvertCF) {
+        mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
+        CFWord = TMP1;
+      }
+
+      if (SetOF) {
+        // Only defined when Shift is 1 else undefined
+        // OF flag is set if a sign change occurred
+        eor(EmitSize, TMP3, Src1, Dst);
+      }
     }
 
     if (CTX->HostFeatures.SupportsFlagM) {

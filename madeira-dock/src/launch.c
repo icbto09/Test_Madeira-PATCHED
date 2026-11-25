@@ -38,8 +38,35 @@ struct saved_value { HKEY key; const wchar_t *name; DWORD previous, written; boo
  * failed), the registry status, and the existing value's type and size.
  */
 static struct { int32_t what, status, type, size; } publish_fail;
+/* [dock-registry-create] Open-or-create for the two Steam discovery keys.
+ * Off switch: env MADEIRA_DOCK_REGISTRY_CREATE=0 (in the game's own config as
+ * env.MADEIRA_DOCK_REGISTRY_CREATE = 0) keeps the old behaviour (open only).
+ * Steps: open; on any failure wait 1 s and open once more (an open changes
+ * nothing); if the key is still missing (ERROR_FILE_NOT_FOUND/PATH_NOT_FOUND)
+ * create it (RegCreateKeyExW, same access) and report it.
+ */
+static bool registry_create_enabled(void)
+{
+    wchar_t v[8];
+    DWORD n = GetEnvironmentVariableW(L"MADEIRA_DOCK_REGISTRY_CREATE", v, 8);
+    return !(n == 1 && v[0] == L'0');
+}
+static LSTATUS open_or_create(HKEY root, const wchar_t *path, REGSAM extra, HKEY *out, int32_t *created)
+{
+    REGSAM sam = KEY_QUERY_VALUE | KEY_SET_VALUE | extra;
+    LSTATUS s = RegOpenKeyExW(root, path, 0, sam, out);
+    if (s == ERROR_SUCCESS || !registry_create_enabled()) return s;
+    Sleep(1000);
+    s = RegOpenKeyExW(root, path, 0, sam, out);
+    if (s != ERROR_FILE_NOT_FOUND && s != ERROR_PATH_NOT_FOUND) return s;
+    DWORD disp = 0;
+    s = RegCreateKeyExW(root, path, 0, NULL, 0, sam, NULL, out, &disp);
+    if (s == ERROR_SUCCESS && disp == REG_CREATED_NEW_KEY) *created += 1;
+    return s;
+}
 static bool publish(struct saved_value *v, DWORD value)
 {
+    memset(&publish_fail, 0, sizeof(publish_fail));
     DWORD type = 0, size = sizeof(DWORD);
     LSTATUS status = RegQueryValueExW(v->key, v->name, NULL, &type, (BYTE *)&v->previous, &size);
     v->existed = status == ERROR_SUCCESS;
@@ -323,10 +350,10 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
      * either) is missing; the result is the same as before: either one
      * failing ends the launch with 42.
      */
-    LSTATUS active_status = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", 0,
-                                          KEY_QUERY_VALUE | KEY_SET_VALUE, &active);
-    LSTATUS machine_status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", 0,
-                                           KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_32KEY, &machine);
+    int32_t created = 0;
+    LSTATUS active_status = open_or_create(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", 0, &active, &created);
+    LSTATUS machine_status = open_or_create(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", KEY_WOW64_32KEY, &machine, &created);
+    if (created) o->event("launch-registry-created", created);
     if (active_status != ERROR_SUCCESS || machine_status != ERROR_SUCCESS) {
         o->event("launch-discovery-open-active", (int32_t)active_status);
         o->event("launch-discovery-open-machine", (int32_t)machine_status);

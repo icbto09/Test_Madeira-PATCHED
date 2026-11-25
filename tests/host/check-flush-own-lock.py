@@ -73,8 +73,20 @@ fex = ROOT / 'FEX'
 mod = fex / 'Source/Windows/ARM64EC/Module.cpp'
 if mod.exists():
     if 'IosFlushUnderOwnLock' in mod.read_text(encoding='utf-8', errors='replace'):
-        rev = subprocess.run(['git', '-C', str(fex), 'apply', '--reverse', '--check', str(PATCH)], capture_output=True)
-        check(rev.returncode == 0, 'the FEX working tree has patch 0003 applied as written')
+        # Later patches (0005 and on) change lines patch 0003 touched, so `git apply --reverse` of 0003 alone no
+        # longer works on the full stack. Check instead that every line patch 0003 adds is in its file.
+        files, cur, ok_added = {}, None, True
+        for line in PATCH.read_text(encoding='utf-8', errors='replace').splitlines():
+            if line.startswith('+++ b/'):
+                cur = line[6:]; files[cur] = []
+            elif line.startswith('+') and not line.startswith('+++') and cur and line[1:].strip():
+                files[cur].append(line[1:].strip())
+        for name, added in files.items():
+            f = fex / name
+            text = f.read_text(encoding='utf-8', errors='replace') if f.exists() else ''
+            have = {l.strip() for l in text.splitlines()}
+            if any(a not in have for a in added): ok_added = False
+        check(ok_added and bool(files), 'the FEX working tree has patch 0003 applied as written')
     else:
         print('SKIP: patch 0003 not applied to this FEX checkout (build/fex-patches/apply.sh applies 0001, 0002, 0003)')
 else:

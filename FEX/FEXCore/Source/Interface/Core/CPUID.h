@@ -215,10 +215,14 @@ private:
   FEXCore::CPUID::FunctionResults Function_04h(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_06h(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_07h(uint32_t Leaf) const;
+  // madeira [cpu-identity-2]: leaf 0xB (x2APIC topology), zero (as before) with the count part off.
+  FEXCore::CPUID::FunctionResults Function_0Bh(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_0Dh(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_15h(uint32_t Leaf) const;
+  FEXCore::CPUID::FunctionResults Function_16h(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_1Ah(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_24h(uint32_t Leaf) const;
+  bool HideHypervisorLeaves() const; // MADEIRA fex-hv-leaf-hide
   FEXCore::CPUID::FunctionResults Function_4000_0000h(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_4000_0001h(uint32_t Leaf) const;
   FEXCore::CPUID::FunctionResults Function_8000_0000h(uint32_t Leaf) const;
@@ -229,6 +233,9 @@ private:
 
   FEXCore::CPUID::FunctionResults Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const;
   FEXCore::CPUID::FunctionResults Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const;
+  // madeira [cpu-identity]: the brand string leaves 0x80000002-4 return, with Intel's "@ x.xxGHz"
+  // naming the guest TSC's frequency (env MADEIRA_CPU_IDENTITY = 0: the product name alone).
+  void BrandString(uint32_t CPU, char (&Out)[49]) const;
   FEXCore::CPUID::FunctionResults Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const;
 
   FEXCore::CPUID::FunctionResults Function_8000_0005h(uint32_t Leaf) const;
@@ -273,8 +280,8 @@ private:
     &CPUIDEmu::Function_Reserved,
     // 0x0A: Architectural performance monitoring
     &CPUIDEmu::Function_Reserved,
-    // 0x0B: Extended topology enumeration
-    &CPUIDEmu::Function_Reserved,
+    // 0x0B: Extended topology enumeration (madeira [cpu-identity-2])
+    &CPUIDEmu::Function_0Bh,
     // 0x0C: Reserved?
     &CPUIDEmu::Function_Reserved,
     // 0x0D: Processor extended state enumeration
@@ -300,8 +307,8 @@ private:
 #else
     &CPUIDEmu::Function_Reserved,
 #endif
-    // 0x16: Processor frequency information
-    &CPUIDEmu::Function_Reserved,
+    // 0x16: Processor frequency information (zero unless MADEIRA_FEX_CPUID_FREQ=1)
+    &CPUIDEmu::Function_16h,
     // 0x17: SoC vendor attribute enumeration
     &CPUIDEmu::Function_Reserved,
     // 0x18: Reserved?
@@ -385,8 +392,8 @@ private:
     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
     // 0x0A: Architectural performance monitoring
     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
-    // 0x0B: Extended topology enumeration
-    {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
+    // 0x0B: Extended topology enumeration (madeira [cpu-identity-2]: EDX is the x2APIC ID of the current CPU)
+    {SupportsConstant::NONCONSTANT, NeedsLeafConstant::NEEDSLEAFCONSTANT},
     // 0x0C: Reserved?
     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
     // 0x0D: Processor extended state enumeration

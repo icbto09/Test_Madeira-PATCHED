@@ -479,16 +479,18 @@ struct EAEntrySection: View {
             if let download {
                 EADownloadStatus(download: download)
                 switch download.state {
-                case .active, .queued: Button("Pause download") { ea.pause(id) }
-                case .paused, .failed: Button("Resume download") { ea.install(id) }
+                case .active, .queued: Button("Pause download") { ea.pause(id) }.padRow("ea-pause-download") { ea.pause(id) }
+                case .paused, .failed: Button("Resume download") { ea.install(id) }.padRow("ea-resume-download") { ea.install(id) }
                 }
             } else if ea.updateAvailable(id) {
                 Button { ea.install(id) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!ea.signedIn)
+                    .padRow("ea-update-available-downloa", when: !(!ea.signedIn)) { ea.install(id) }
             }
             if download == nil, record != nil {
                 Button { ea.repair(id) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
                     .disabled(!ea.signedIn)
+                    .padRow("ea-repair-installed-files", when: !(!ea.signedIn)) { ea.repair(id) }
                 Text("Checks every installed file against EA's current build and downloads what is missing or changed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -499,6 +501,7 @@ struct EAEntrySection: View {
             LabeledContent("Offer ID", value: id)
             if record != nil, download == nil {
                 Button("Uninstall", role: .destructive) { confirmUninstall = true }
+                    .padRow("ea-uninstall") { confirmUninstall = true }
             }
         } header: {
             Text("EA app")
@@ -528,8 +531,10 @@ struct EASettingsSection: View {
             if ea.signedIn {
                 LabeledContent("Signed in as", value: ea.accountName ?? "EA account")
                 Button("Sign out of EA", role: .destructive) { confirmSignOut = true }
+                    .padRow("ea-sign-out") { confirmSignOut = true }
             } else {
                 Button { open(.eaSignIn) } label: { Label("Sign in to EA", systemImage: "person.crop.circle.badge.plus") }
+                    .padRow("ea-sign-in") { open(.eaSignIn) }
             }
         } header: {
             Text("EA app")

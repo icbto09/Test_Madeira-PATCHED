@@ -49,6 +49,8 @@ enum GetHelpCore {
 
     struct Request: Encodable {
         var install_id: String
+        /// (player-id) The short code shown in Settings; sent beside install_id, never instead of it.
+        var player_id: String? = nil
         var game: String
         var app_version: String
         var reason: String   // "crash" (after a game stopped by itself) or "player" (the game page)
@@ -219,19 +221,40 @@ enum GetHelpCore {
 
     // MARK: Apply and Undo
 
+    /// (auto-tune-writer) Who added a block of lines to a game's config. Get Help and auto-tune share this one
+    /// writer (apply / undo / Record), so neither ever takes out the other's lines.
+    enum Source: Equatable {
+        case getHelp
+        case autoTune(String)   // the rule's id
+        var tag: String {
+            switch self {
+            case .getHelp: return "get-help"
+            case .autoTune(let id): return "auto-tune:" + id
+            }
+        }
+        init(tag: String) { self = tag.hasPrefix("auto-tune:") ? .autoTune(String(tag.dropFirst("auto-tune:".count))) : .getHelp }
+        var isAutoTune: Bool { if case .autoTune = self { return true }; return false }
+    }
+
+    static let getHelpHeaderPrefix = "# Get Help added these"
+    static let autoTuneHeaderPrefix = "# Auto-tune added these"
+
     /// The comment Apply writes above its lines.
-    static func header(date: String) -> String {
-        "# Get Help added these on \(date). Undo: Game details > Advanced > Undo Get Help"
+    static func header(date: String, source: Source = .getHelp) -> String {
+        switch source {
+        case .getHelp: return "\(getHelpHeaderPrefix) on \(date). Undo: Game details > Advanced > Undo Get Help"
+        case .autoTune(let id): return "\(autoTuneHeaderPrefix) on \(date) (rule \(id)). Undo: Game details > Advanced > Undo auto-tune"
+        }
     }
 
     /// The game's config with `lines` added at the end, and the lines that were added
     /// (to take out again with `undo`). A line the config already ends up with (same key,
     /// same value) is not added again; nil when nothing would change.
-    static func apply(_ lines: [ConfigLine], to text: String, date: String) -> (text: String, added: [String])? {
+    static func apply(_ lines: [ConfigLine], to text: String, date: String, source: Source = .getHelp) -> (text: String, added: [String])? {
         let current = values(text)
         let new = lines.filter { safe($0) && current[$0.key.trimmingCharacters(in: .whitespaces)] != $0.value.trimmingCharacters(in: .whitespaces) }
         guard !new.isEmpty else { return nil }
-        var added = [header(date: date)]
+        var added = [header(date: date, source: source)]
         for line in new {
             let plain = line.plain.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
             if !plain.isEmpty { added.append("# " + plain) }
@@ -253,7 +276,8 @@ enum GetHelpCore {
             guard let i = rows.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == line }) else { continue }
             rows.remove(at: i)
             // The blank line Apply put before its comment goes with it.
-            if line.hasPrefix("# Get Help added these"), i > 0, rows[i - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+            if line.hasPrefix(getHelpHeaderPrefix) || line.hasPrefix(autoTuneHeaderPrefix), i > 0,
+               rows[i - 1].trimmingCharacters(in: .whitespaces).isEmpty {
                 rows.remove(at: i - 1)
             }
         }
@@ -278,7 +302,16 @@ enum GetHelpCore {
     struct Record: Codable, Equatable {
         var game: String
         var date: String
+        /// Every line Get Help and auto-tune added, in order (what Reset to clean state takes out).
         var added: [String]
+        /// (auto-tune-writer) The same lines in blocks, one per Apply, each with who added it. A record written
+        /// before auto-tune has none: all of its lines are one Get Help block (`blocks(of:)`).
+        var blocks: [Block]? = nil
+        struct Block: Codable, Equatable {
+            var source: String   // Source.tag
+            var date: String
+            var added: [String]
+        }
         /// (get-help-steam-starts) The "Steam starts" choice Apply made, and the one before it.
         var steamStarts: SteamStartsChange? = nil
         struct SteamStartsChange: Codable, Equatable {
@@ -286,6 +319,94 @@ enum GetHelpCore {
             var before: String?
             var set: String
         }
+    }
+
+    // MARK: Shared writer (auto-tune-writer)
+
+    /// The record's blocks; a record from before auto-tune is one Get Help block.
+    static func blocks(of record: Record) -> [Record.Block] {
+        if let blocks = record.blocks { return blocks }
+        return record.added.isEmpty ? [] : [Record.Block(source: Source.getHelp.tag, date: record.date, added: record.added)]
+    }
+
+    /// The setting keys a list of added lines sets (comments skipped).
+    static func keys(_ added: [String]) -> Set<String> { Set(values(added.joined(separator: "\n")).keys) }
+
+    /// The record with one more block (what Apply just added).
+    static func adding(_ added: [String], source: Source, date: String, to record: Record) -> Record {
+        var out = record
+        out.blocks = blocks(of: record) + [Record.Block(source: source.tag, date: date, added: added)]
+        out.added = record.added + added
+        out.date = date
+        return out
+    }
+
+    /// Takes the picked blocks' lines out of `text`, by position: all blocks are walked newest first, and each line
+    /// takes the last copy in the file that no newer line took; only the picked blocks' copies go. So a line two
+    /// blocks share (the same setting, a comment, a header written in the same minute) leaves only from the block
+    /// being undone. With one block this is exactly `undo(_:from:)`. A line the player removed is skipped. The blank
+    /// line Apply put before a header goes with it.
+    static func undo(blocks all: [Record.Block], picked: (Record.Block) -> Bool, from text: String) -> String {
+        undo(blocks: all, pickedAt: { picked(all[$0]) }, from: text)
+    }
+
+    /// The same, picking blocks by their position in `all` (so two identical blocks can be told apart).
+    static func undo(blocks all: [Record.Block], pickedAt: (Int) -> Bool, from text: String) -> String {
+        var rows = text.components(separatedBy: "\n")
+        if rows.last == "" { rows.removeLast() }
+        var claimed = Set<Int>(), gone = Set<Int>()
+        for index in all.indices.reversed() {
+            let take = pickedAt(index)
+            for line in all[index].added.reversed() {
+                guard let i = rows.indices.last(where: { !claimed.contains($0) && rows[$0].trimmingCharacters(in: .whitespaces) == line }) else { continue }
+                claimed.insert(i)
+                guard take else { continue }
+                gone.insert(i)
+                // The blank line Apply put before its header goes with it (the nearest row above that is still there).
+                if line.hasPrefix(getHelpHeaderPrefix) || line.hasPrefix(autoTuneHeaderPrefix),
+                   let j = (0..<i).last(where: { !gone.contains($0) }), rows[j].trimmingCharacters(in: .whitespaces).isEmpty {
+                    gone.insert(j)
+                }
+            }
+        }
+        rows = rows.indices.filter { !gone.contains($0) }.map { rows[$0] }
+        while let last = rows.last, last.trimmingCharacters(in: .whitespaces).isEmpty { rows.removeLast() }
+        let out = rows.joined(separator: "\n")
+        return out.isEmpty ? "" : out + "\n"
+    }
+
+    /// The record without the blocks `which` picks: the record left (nil when nothing is left in it) and the
+    /// lines to take out of the config (take them out with `undo(blocks:picked:from:)`, by position).
+    /// `added` is rebuilt from the blocks that stay.
+    static func removing(_ which: (Record.Block) -> Bool, from record: Record) -> (record: Record?, lines: [String]) {
+        let all = blocks(of: record)
+        return removing(at: Set(all.indices.filter { which(all[$0]) }), from: record)
+    }
+
+    /// The same, for the blocks at these positions of `blocks(of: record)`.
+    static func removing(at picked: Set<Int>, from record: Record) -> (record: Record?, lines: [String]) {
+        let all = blocks(of: record)
+        let gone = all.indices.filter { picked.contains($0) }.map { all[$0] }
+        let kept = all.indices.filter { !picked.contains($0) }.map { all[$0] }
+        var out = record
+        out.blocks = kept
+        out.added = kept.flatMap(\.added)
+        let empty = kept.isEmpty && out.steamStarts == nil
+        return (empty ? nil : out, gone.flatMap(\.added))
+    }
+
+    /// Lines from one source that set a key another source's block already sets. Auto-tune never overrides
+    /// Get Help: those lines are dropped. Get Help's lines win over auto-tune's: the auto-tune blocks that set
+    /// the same keys are named so the caller takes them out first.
+    static func conflicts(_ lines: [ConfigLine], source: Source, record: Record?) -> (dropKeys: Set<String>, autoTuneBlocks: [Record.Block]) {
+        guard let record else { return ([], []) }
+        let wanted = Set(lines.map { $0.key.trimmingCharacters(in: .whitespaces) })
+        let all = blocks(of: record)
+        if source.isAutoTune {
+            let helpKeys = all.filter { !Source(tag: $0.source).isAutoTune }.reduce(into: Set<String>()) { $0.formUnion(keys($1.added)) }
+            return (wanted.intersection(helpKeys), [])
+        }
+        return ([], all.filter { Source(tag: $0.source).isAutoTune && !keys($0.added).isDisjoint(with: wanted) })
     }
 
     // MARK: Late zip (late-zip)

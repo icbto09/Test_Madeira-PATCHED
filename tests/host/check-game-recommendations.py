@@ -67,14 +67,14 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
 # The Steam titles merged on 2026-10-26 from community tested lists (GameRecommendations.steamTitles); Dark Souls III
 # has its own tested list (darkSoulsIII), which replaced the community one.
 MERGED = {'msfs-2024', 'counter-strike-2', 'breakneck', 'spelunky-2', 'albion-online', 'hogwarts-legacy',
-          'metal-gear-solid-v', 'stellar-blade-demo', 'star-wars-galactic-racer', 'minecraft-dungeons-2', 'denshattack', 'hades-ii', 'la-noire', 'final-fantasy-resonance-demo', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3',
+          'metal-gear-solid-v', 'stellar-blade-demo', 'star-wars-galactic-racer', 'minecraft-dungeons-2', 'denshattack', 'portal', 'hades-ii', 'la-noire', 'final-fantasy-resonance-demo', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3',
           'no-rest-for-the-wicked', 'quaver', 'dying-light', 'beamng-drive', 'monster-hunter-stories-3-trial', 'pwaat',
           'american-truck-simulator', 'marvels-spider-man-miles-morales', 'diablo-ii-resurrected', 'clair-obscur-expedition-33', 'gtasa-de-steam', 'unrailed-2-back-on-track',
           'blazblue-entropy-effect', 'marvels-spider-man-remastered', 'marvels-spider-man-2', 'raidou-remastered', 'yakuza-like-a-dragon',
           'batman-arkham-city-goty', 'trails-in-the-sky-1st-chapter', 'subnautica-2', 'rdr1-steam', 'resident-evil-requiem', 'resident-evil-requiem-demo',
           'life-is-strange-remastered', 'life-is-strange-2', 'project-zomboid', 'spiderheck', 'rounds', 'plateup',
           'final-fantasy-tactics-ivalice-chronicles', 'jetboard-joust', 'dead-as-disco', 'tung', 'sekiro-shadows-die-twice', 'stardew-valley', 'slay-the-spire-2',
-          'glyphica-typing-survival', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace', 'satisfactory-steam', 'blue-prince', 'the-forest', 'steep', 'just-cause-2'}
+          'glyphica-typing-survival', 'football-manager-27', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace', 'satisfactory-steam', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'goals', 'dotnet-large-heap', 'cyberpunk-2077'}
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta5l-other', 'gta4-steam',
                         'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
                         'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
@@ -114,7 +114,7 @@ for ident in ('battle-net', 'battle-net-setup'):
     assert presets[ident]['switches'].endswith('launchMode: "desktop", startServices: true'), (ident, presets[ident]['switches'])
 bnet_lines = presets['battle-net']['lines']
 # Version 5 (BattleNet Test 9, 2026-11-15): web fonts off, or its pages draw no text.
-assert presets['battle-net']['version'] == 8   # v8 (Nightly 0.2.29 build 89): exactly the proven try10 config (games/battlenet/try10-alert-recheck.txt)
+assert presets['battle-net']['version'] == 9   # v9 (bnettest20): the proven try10 config + env.MADEIRA_SHARED_SECTION_EXEC = 1 (games/battlenet/try11-ow2.txt)
 assert 'env.MADEIRA_ALERT_RECHECK_MS = 500' in presets['battle-net']['lines']
 for line in ('pool-split = 1', 'pool-low = 1', 'env.MADEIRA_WOW_PLACEHOLDERS = 1', 'env.WINEDLLOVERRIDES = locationapi=d',
              'env.DXMT_SMALL_RINGS = Battle.net Launcher.exe;Battle.net.exe;Agent.exe',
@@ -123,7 +123,7 @@ for line in ('pool-split = 1', 'pool-low = 1', 'env.MADEIRA_WOW_PLACEHOLDERS = 1
              'env.MADEIRA_SPAWN_BLOCK = ClientSdkFirewallHelper'):
     assert line in bnet_lines, ('battle-net', line)
 # Overwatch 2's shared-section line is not proven: it stays in the Battle.net test builds only.
-assert not any('MADEIRA_SHARED_SECTION_EXEC' in l for l in bnet_lines)
+assert 'env.MADEIRA_SHARED_SECTION_EXEC = 1' in bnet_lines   # bnettest20 only; the Nightly list (v8) does not have it
 child = [l for l in bnet_lines if l.startswith('env.MADEIRA_CHILD_ARGS = Battle.net.exe ')]
 assert len(child) == 1 and '--renderer-process-limit=2' in child[0] and '--use-angle=d3d11' in child[0] and '--jitless' not in child[0] \
     and 'MAP *.googlevideo.com ~NOTFOUND' in child[0] and '--disable-remote-fonts' in child[0] and child[0].endswith(' --disable-gpu-rasterization'), child
@@ -187,12 +187,13 @@ FORK_DEFAULTS = ["# The defaults this list was tested with (upstream's differ)."
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
 for ident, p in presets.items():
-    if ident in ('dark-souls-remastered', 'dark-souls-iii'):
+    # battle-net v8 is the proven try10 config as it ran: its defaults sit inside the list, with no "tested defaults" comment line.
+    if ident in ('dark-souls-remastered', 'dark-souls-iii', 'battle-net'):
         p['tested'], p['fork'] = [line for line in p['lines'][2:] if not line.startswith('#')], []
         continue
     # These lists were tested without madeira-bcd's defaults.
     if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
-                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human'):
+                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'football-manager-27'):
         # steep-epic-launcher-wait: Steep's own fix IS the wait-for-children rule, not the community defaults
         own_fix = {'env.MADEIRA_WAIT_CHILDREN = 1'} if ident == 'steep' else set()
         assert not (set(FORK_DEFAULTS) - own_fix) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
@@ -495,11 +496,18 @@ assert presets['gta4-steam']['version'] == 3 and presets['gta4-steam']['switches
 # variant or app-side switches, and no MADEIRA_SPAWN_SWAP (its engine code is not in this tree).
 for ident in MERGED:
     p = presets[ident]
-    assert p['version'] == (2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio') else 1), ident
+    assert p['version'] == (3 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2') else 1), ident
     assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
                                     'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
                    for line in p['lines']), (ident, p['lines'])
 assert [ident for ident, p in presets.items() if any(line.startswith('env.MADEIRA_SPAWN_SWAP') for line in p['lines'])] == []
+# cyberpunk-oversize-2gb: Cyberpunk 2077 is the standard line plus a 2 GB real part for its 64 GB reservation (the
+# 8 GB real part of the first reports left no room for its later 4 GB one). No other list sets the size.
+assert presets['cyberpunk-2077']['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'oversize-reserve = 1', 'oversize-reserve-mb = 2048'] \
+    and presets['cyberpunk-2077']['switches'] == '', presets['cyberpunk-2077']
+assert [i for i, p in presets.items() if any(l.startswith('oversize-reserve-mb') for l in p['lines'])] == ['cyberpunk-2077']
+assert ('        case "redprelauncher.exe":\n' in lists_src
+        and 'return fileExists(folder + "\\\\bin\\\\x64\\\\Cyberpunk2077.exe") ? cyberpunk2077 : nil\n' in lists_src)
 assert presets['beamng-drive']['tested'][-4:] == [
     'env.MADEIRA_SC_PA_POOLS = 2', 'env.MADEIRA_CEF_PA_EXES = BeamNG.drive.x64.exe',
     'env.MADEIRA_CHILD_ARGS = BeamNG.drive.x64.exe --single-process --js-flags=--jitless '
@@ -631,13 +639,14 @@ for name in ('GameRecommendations.swift', 'GameRecommendationsApply.swift'):
 # The rules: first sight only for a game with nothing of its own; switches only on first sight or a reset.
 due = block(apply_src, '    private static func due(', '\n    }\n')
 assert due.index('guard let rec = found else { return nil }') < due.index('let text = GameProfile(windowsPath: windowsPath).text')
-assert 'guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(base)) else { return nil }' in due   # (recommended-after-get-help) compared without the additions
+assert 'guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(base)) else {' in due   # recommended-merge: the else branch merges the missing lines, then returns nil   # (recommended-after-get-help) compared without the additions
 assert '!(base + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty' in due and 'setMark("", windowsPath)' in due
 # The standard list for every other game and the Desktop, and later a game's own list over it as on first sight.
 fallback = block(apply_src, '    static func recommendation(windowsPath: String, steamAppID: Int?) -> GameRecommendation? {', '\n    }\n')
-assert 'if let rec = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists) { return rec }' in fallback
-assert 'return parts.count > 1 ? standard : nil' in fallback
-assert 'let fromStandard = mark.hasPrefix(standard.id + "#") && rec.id != standard.id' in due
+assert 'var base = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists)' in fallback   # (remote-recs) then the remote list over it
+assert 'if parts.count > 1 { base = enginePreset(windowsPath: windowsPath, fileExists: driveFileExists) ?? standard }' in fallback
+assert 'return RemoteRecs.replacement(base: base, steamAppID: steamAppID) ?? base' in fallback
+assert 'let fromStandard = (mark.hasPrefix(standard.id + "#") || mark.hasPrefix("engine-"))' in due
 assert 'if entry.desktop == true { return standard }' in apply_src  # the Desktop's is the standard list (shared-configs: never a shared one)
 assert 'if let found = due(entry.windowsPath, recommendation(for: entry), ownLines: entry.config, title: entry.title),' in apply_src
 assert 'guard entry.desktop != true' not in apply_src, 'prepare takes the Desktop too'
@@ -649,6 +658,17 @@ assert ('if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }' in p
         and 'if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }' in put)
 print('PASS: first sight in the library (start-up, save, Game details, start); Reset to Recommended last in Game details')
 
+# [engine-presets] Engine presets are built by a function (not a static list), so they are not in `presets` above.
+assert 'static func enginePreset(_ engine: Engine) -> GameRecommendation' in lists_src
+assert 'guard mark == nil || mark?.hasPrefix("engine-") == true else { return nil }' in apply_src, 'only a game nothing was written for'
+assert 'MadeiraConfig.flag("MADEIRA_ENGINE_PRESETS")' in apply_src and 'MadeiraConfig.flag(engine.switchName)' in apply_src
+assert 'enginePreset(windowsPath: windowsPath, fileExists: driveFileExists) ?? standard' in apply_src, 'falls back to the standard list'
+assert 'rec?.id.hasPrefix("engine-") == true' in apply_src, 'a shared list for the game still wins'
+for key in ('env.MADEIRA_EC_HOOK_TRACE',):
+    assert 'ConfigOption(key: "%s"' % key in catalog, ('engine preset key not read by Madeira', key)
+for name in ('MADEIRA_ENGINE_PRESETS', 'MADEIRA_ENGINE_PRESET_'):
+    assert name in lists_src + apply_src, name
+print("PASS: engine presets: function-built, only for a game nothing was written for, shared lists win, switches named")
 # The Swift fixture: the real files with small stand-ins for the app types they use.
 stable_hash = block(prefs, '    static func stableHash(_ s: String) -> UInt64 {', '\n    }\n')
 profile_text = block(profiles, '    var text: String {', '\n    }\n')
@@ -671,15 +691,26 @@ final class LibraryModel {
 // cfg-lossy-ini-utf16: GameProfiles reads the game's config through MadeiraConfig.readText (lossy UTF-8)
 enum MadeiraConfig {
     static func readText(_ url: URL) -> String? { (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) } }
+    static var off: Set<String> = []
+    static func flag(_ name: String, fallback: Bool = true) -> Bool { !off.contains(name) }
 }
 
 // (shared-configs) SharedConfigs.swift has its own check (check-shared-configs.py); here only what Apply asks.
+enum RecommendedMerge {   // recommended-merge: the real one (RecommendedMerge.swift) merges missing lines; its own check lives elsewhere
+    static func merge(_ rec: GameRecommendation, windowsPath: String, title: String, ownLines: String?, alreadyAtThisVersion: Bool) {}
+    static func forget(windowsPath: String) {}
+}
 enum SharedConfigs {
     static var table: [String: GameRecommendation] = [:]
     static func recommendation(title: String) -> GameRecommendation? { table[title] }
     static func isShared(_ rec: GameRecommendation?) -> Bool { rec?.id.hasPrefix("shared-") == true }
     static var asked: [String] = []
     static func applied(title: String, windowsPath: String) { asked.append(title) }
+}
+
+// (remote-recs) RemoteRecs.swift has its own check (check-remote-recs.py); here no signed list is ever kept.
+enum RemoteRecs {
+    static func replacement(base: GameRecommendation?, steamAppID: Int?) -> GameRecommendation? { nil }
 }
 
 final class LogStore {
@@ -864,6 +895,7 @@ check(id(#"D:\Games\FS\FlightSimulator2024.exe"#) == "msfs-2024", "a merged titl
 check(id(steam + #"\GTA San Andreas - The Definitive Edition\Gameface\Binaries\Win64\PlayGTASanAndreas.exe"#) == "gtasa-de-steam",
       "a Steam-only program inside Steam")
 check(id(#"C:\Games\GTASA\PlayGTASanAndreas.exe"#) == "none", "a Steam-only program outside Steam")
+check(id(#"C:\Project Zomboid\ProjectZomboid64.exe"#) == "project-zomboid", "Project Zomboid by its program outside Steam (zomboid-any-store)")
 check(id(steam + #"\Dead as Disco"#, 3404260) == "dead-as-disco" && id(steam + #"\TUNG"#) == "tung", "App ID only, folder only")
 check(id(steam + #"\Red Dead Redemption"#) == "rdr1-steam" && id(steam + #"\Red Dead Redemption 2"#) == "rdr2-steam",
       "folders match whole names")
@@ -902,7 +934,15 @@ check(id(#"C:\Program Files\Epic Games\InnerSpace\InnerSpace.exe"#,
          files: [#"C:\Program Files\Epic Games\InnerSpace\version.dll"#, #"C:\Program Files\Epic Games\InnerSpace\MelonLoader"#]) == "innerspace",
       "a game's own list wins over the MelonLoader list")
 check(R.melonLoader.fileText.contains("\noversize-reserve = 1\n"), "the MelonLoader list serves large reservations in part")
-check(R.steamTitles.count == 69 && R.all.count == 98, "69 titles in the Steam table, 98 lists (+ The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire; The Witcher 3 dropped)")
+check(R.steamTitles.count == 74 && R.all.count == 103, "74 titles in the Steam table, 103 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
+check(id(steam + #"\Cyberpunk 2077"#, 1091500) == "cyberpunk-2077" && id(steam + #"\Cyberpunk 2077"#) == "cyberpunk-2077"
+      && id(#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#) == "cyberpunk-2077"
+      && id(#"C:\GOG Games\Cyberpunk 2077\REDprelauncher.exe"#, files: [#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#]) == "cyberpunk-2077"
+      && id(#"C:\GOG Games\The Witcher 3 Wild Hunt\REDprelauncher.exe"#,
+            files: [#"C:\GOG Games\The Witcher 3 Wild Hunt\bin\x64\witcher3.exe"#]) == "none",
+      "Cyberpunk 2077 by App ID, folder, program and its launcher (GOG); another game's REDprelauncher gets nothing (cyberpunk-oversize-2gb)")
+check(R.cyberpunk2077.fileText.contains("\noversize-reserve = 1\noversize-reserve-mb = 2048\n"),
+      "Cyberpunk 2077's 64 GB reservation gets a 2 GB real part")
 check(id(#"C:\Program Files\Epic Games\Steep\steep.exe"#) == "steep" && id(steam + #"\Steep"#, 460920) == "steep"
       && R.steep.config.contains("env.MADEIRA_WAIT_CHILDREN = 1"),
       "Steep by program (Epic folder), App ID and folder; the stub's child keeps the session")
@@ -1082,6 +1122,41 @@ check(FileManager.default.createFile(atPath: folder.appendingPathComponent("gta5
 let play = #"C:\Games\GTA V Enhanced\PlayGTAV.exe"#
 check(R.recommendation(windowsPath: play, steamAppID: nil)?.id == "gta5e-other", "drive_c is looked up in any case")
 check(R.recommendation(windowsPath: #"C:\Games\GTA V\PlayGTAV.exe"#, steamAppID: nil)?.id == "standard", "a missing game file: the standard list")
+// [engine-presets] A new game with no list of its own whose folder shows an engine gets that engine's preset.
+let unityFolder = drive.appendingPathComponent("Games/UnityGame", isDirectory: true)
+try! FileManager.default.createDirectory(at: unityFolder, withIntermediateDirectories: true)
+check(FileManager.default.createFile(atPath: unityFolder.appendingPathComponent("UnityPlayer.dll").path, contents: Data()), "fixture")
+let unityExe = #"C:\Games\UnityGame\game.exe"#
+check(R.recommendation(windowsPath: unityExe, steamAppID: nil)?.id == "engine-unity", "a Unity folder with no list: the Unity preset")
+check(R.recommendation(windowsPath: #"C:\Games\UnityGame\UnityCrashHandler64.exe"#, steamAppID: nil)?.id == "standard", "Unity's crash handler: the standard list")
+check(R.recommendation(windowsPath: #"C:\Games\UnityGame\unins000.exe"#, steamAppID: nil)?.id == "standard", "an uninstaller: the standard list")
+var unity = LibraryEntry(title: "Unity Game", windowsPath: unityExe)
+check(R.prepare(&unity, new: true) && file(unityExe) == R.enginePreset(.unity).fileText
+      && file(unityExe).contains("env.MADEIRA_EC_HOOK_TRACE = 0")
+      && mark(unityExe)?.hasPrefix("engine-unity#\(R.standard.version)#") == true && unity.resolution == "1408x648" && !LibraryPrefs.avx(unityExe),
+      "first sight of a new Unity game: the Unity preset, no switches")
+check(R.recommendation(for: unity)?.id == "engine-unity", "an engine preset written stays the game's recommendation")
+let oldUnity = #"C:\Games\UnityGame\old.exe"#
+marks = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+marks[oldUnity.lowercased()] = "standard#\(R.standard.version)#" + String(LibraryPrefs.stableHash(R.standard.fileText), radix: 16)
+UserDefaults.standard.set(marks, forKey: key)
+check(R.recommendation(windowsPath: oldUnity, steamAppID: nil)?.id == "standard", "a game the standard list was written for keeps it")
+let ownUnity = #"C:\Games\UnityGame\own.exe"#
+GameProfile(windowsPath: ownUnity).text = "fence-chain = 6\n"
+var ownUnityEntry = LibraryEntry(title: "Own Unity", windowsPath: ownUnity)
+check(!R.prepare(&ownUnityEntry) && file(ownUnity) == "fence-chain = 6\n" && mark(ownUnity) == "", "a Unity game with a config of its own keeps it")
+MadeiraConfig.off = ["MADEIRA_ENGINE_PRESET_UNITY"]
+check(R.recommendation(windowsPath: #"C:\Games\UnityGame\new.exe"#, steamAppID: nil)?.id == "standard", "the Unity off switch: the standard list")
+_ = R.prepare(&unity)
+check(file(unityExe) == R.standard.fileText && mark(unityExe)?.hasPrefix("standard#") == true, "off: a config still as the preset wrote it goes back to the standard list")
+MadeiraConfig.off = ["MADEIRA_ENGINE_PRESETS"]
+check(R.recommendation(windowsPath: #"C:\Games\UnityGame\new.exe"#, steamAppID: nil)?.id == "standard", "the master off switch: the standard list")
+MadeiraConfig.off = []
+check(R.engine(windowsPath: #"C:\Games\UnityGame"#, fileExists: R.driveFileExists) == .unity, "a Steam-style install folder is looked at itself")
+check(R.engine(windowsPath: #"C:\Games\GTA V\PlayGTAV.exe"#, fileExists: { $0.hasSuffix("\\jre\\bin\\server\\jvm.dll") }) == .jvm, "a bundled Java runtime shows the JVM")
+check(R.engine(windowsPath: #"C:\Games\X\x.exe"#, fileExists: { $0.hasSuffix("\\coreclr.dll") }) == .dotnet, ".NET's runtime shows .NET")
+check(R.enginePreset(.jvm).config.contains("env.MADEIRA_EC_HOOK_TRACE = 0") && R.enginePreset(.jvm).id == "engine-jvm", "Java: the standard line")
+print("PASS: engine presets: a new game with no list shows its engine's preset; a marked game, a config of its own, a list of its own and the off switches are left alone")
 var removed = LibraryEntry(title: "GTA V Enhanced", windowsPath: play)
 check(R.prepare(&removed, new: true) && file(play) == R.gta5EnhancedOther.fileText && LibraryPrefs.nvidia(play)
       && removed.resolution == "1280x720", "first sight of a new program outside Steam")

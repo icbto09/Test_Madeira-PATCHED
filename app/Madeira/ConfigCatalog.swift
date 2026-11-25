@@ -68,9 +68,17 @@ struct AllSettingsView: View {
         })
     }
 
+    private func addEntry() {
+        let k = newKey.trimmingCharacters(in: .whitespaces)
+        guard !k.isEmpty, !k.contains("="), !k.hasPrefix("#") else { return }
+        binding(k).wrappedValue = newValue
+        newKey = ""; newValue = ""
+    }
+
     var body: some View {
         NavigationStack {
             List {
+
                 Section {
                     Text("Every other option Madeira reads from madeira.cfg. JIT pool, video memory, the swap tier, the sync engine and eco mode are in Settings › Memory & sync; the Direct3D 9/12 routes, the Vulkan driver and windowed mode in Settings › Display and Graphics. Most options are read when Madeira starts, so close it from the app switcher after a change. Default leaves the option out of the file. Swipe left on a row to reset it.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -104,17 +112,15 @@ struct AllSettingsView: View {
                         .textInputAutocapitalization(.never).autocorrectionDisabled().font(.body.monospaced())
                     TextField("value", text: $newValue)
                         .textInputAutocapitalization(.never).autocorrectionDisabled().font(.body.monospaced())
-                    Button("Add to madeira.cfg") {
-                        let k = newKey.trimmingCharacters(in: .whitespaces)
-                        guard !k.isEmpty, !k.contains("="), !k.hasPrefix("#") else { return }
-                        binding(k).wrappedValue = newValue
-                        newKey = ""; newValue = ""
-                    }
+                    Button("Add to madeira.cfg", action: addEntry)
                     .disabled(newKey.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .padRow("cfg-add", when: !newKey.trimmingCharacters(in: .whitespaces).isEmpty, press: { addEntry() })
                 } header: { Text("Add an entry") } footer: {
                     Text("For anything not listed, such as env.FEX_TSOENABLED = 1.")
                 }
             }
+            // The list follows the controller's highlight (settings-pad-rows).
+            .modifier(PadSettingsForm())
             .searchable(text: $search, prompt: "Search options")
             .navigationTitle("All settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -152,17 +158,19 @@ struct ConfigOptionRow: View {
     @ViewBuilder private var control: some View {
         switch option.kind {
         case .bool:
-            Picker(option.displayTitle, selection: Binding(get: { value ?? "" }, set: { value = $0.isEmpty ? nil : $0 })) {
+            Picker(option.displayTitle, selection: selection) {
                 Text("Default").tag("")
                 Text("On").tag("1")
                 Text("Off").tag("0")
                 if let v = value, !["1", "0"].contains(v) { Text(v).tag(v) }
             }
+            .padPicker("cfg-\(option.key)", selection, ["", "1", "0"])
         case .choice:
-            Picker(option.displayTitle, selection: Binding(get: { value ?? "" }, set: { value = $0.isEmpty ? nil : $0 })) {
+            Picker(option.displayTitle, selection: selection) {
                 ForEach(option.choices, id: \.self) { Text($0.label).tag($0.value) }
                 if let v = value, !option.choices.contains(where: { $0.value == v }) { Text("Custom: \(v)").tag(v) }
             }
+            .padPicker("cfg-\(option.key)", selection, option.choices.map { $0.value })
         case .int, .text:
             HStack {
                 Text(option.displayTitle).lineLimit(2)
@@ -179,6 +187,13 @@ struct ConfigOptionRow: View {
             .onAppear { draft = value ?? "" }
             .onChange(of: value) { _, v in if !editing { draft = v ?? "" } }
             .onChange(of: editing) { _, on in if !on, draft != (value ?? "") { value = draft } }
+            // A puts the cursor in the field, as a tap does (the keyboard comes up).
+            .padRow("cfg-\(option.key)") { editing = true }
         }
+    }
+
+    /// The picker's choice: "" is Default (the key left out).
+    private var selection: Binding<String> {
+        Binding(get: { value ?? "" }, set: { value = $0.isEmpty ? nil : $0 })
     }
 }

@@ -47,6 +47,9 @@ thread_data_t *CDECL msvcrt_get_thread_data(void)
     thread_data_t *ptr;
     DWORD err = GetLastError();  /* need to preserve last error */
 
+    /* Madeira pvz-msvcrt: called before msvcrt DLL_PROCESS_ATTACH (locale still NULL) */
+    if (!MSVCRT_locale) msvcrt_init_core( TRUE );
+
     if (!(ptr = TlsGetValue( msvcrt_tls_index )))
     {
         if (!(ptr = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*ptr) )))

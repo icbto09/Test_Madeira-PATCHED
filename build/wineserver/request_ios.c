@@ -87,38 +87,15 @@ static void master_socket_poll_event( struct fd *fd, int event );
 
 static const struct object_ops master_socket_ops =
 {
-    sizeof(struct master_socket),  /* size */
-    &no_type,                      /* type */
-    master_socket_dump,            /* dump */
-    no_add_queue,                  /* add_queue */
-    NULL,                          /* remove_queue */
-    NULL,                          /* signaled */
-    NULL,                          /* satisfied */
-    no_signal,                     /* signal */
-    no_get_fd,                     /* get_fd */
-    default_get_sync,              /* get_sync */
-    default_map_access,            /* map_access */
-    default_get_sd,                /* get_sd */
-    default_set_sd,                /* set_sd */
-    no_get_full_name,              /* get_full_name */
-    no_lookup_name,                /* lookup_name */
-    no_link_name,                  /* link_name */
-    NULL,                          /* unlink_name */
-    no_open_file,                  /* open_file */
-    no_kernel_obj_list,            /* get_kernel_obj_list */
-    no_close_handle,               /* close_handle */
-    master_socket_destroy          /* destroy */
+    .size    = sizeof(struct master_socket),
+    .type    = &no_type,
+    .dump    = master_socket_dump,
+    .destroy = master_socket_destroy,
 };
 
 static const struct fd_ops master_socket_fd_ops =
 {
-    NULL,                          /* get_poll_events */
-    master_socket_poll_event,      /* poll_event */
-    NULL,                          /* flush */
-    NULL,                          /* get_fd_type */
-    NULL,                          /* ioctl */
-    NULL,                          /* queue_async */
-    NULL                           /* reselect_async */
+    .poll_event = master_socket_poll_event,
 };
 
 
@@ -174,51 +151,54 @@ void *set_reply_data_size( data_size_t size )
 static const struct object_attributes empty_attributes;
 
 /* return object attributes from the current request */
-const struct object_attributes *get_req_object_attributes( const struct security_descriptor **sd,
-                                                           struct unicode_str *name,
-                                                           struct object **root )
+bool get_req_object_attributes( struct object_params *params )
 {
     const struct object_attributes *attr = get_req_data();
     data_size_t size = get_req_data_size();
 
-    if (root) *root = NULL;
+    params->root = NULL;
+    params->sd   = NULL;
 
     if (!size)
     {
-        *sd = NULL;
-        name->len = 0;
-        return &empty_attributes;
+        params->name.len = 0;
+        params->attr     = 0;
+        params->objattr  = &empty_attributes;
+        return true;
     }
-
     if ((size < sizeof(*attr)) || (size - sizeof(*attr) < attr->sd_len) ||
         (size - sizeof(*attr) - attr->sd_len < attr->name_len))
     {
         set_error( STATUS_ACCESS_VIOLATION );
-        return NULL;
+        return false;
     }
     if (attr->sd_len && !sd_is_valid( (const struct security_descriptor *)(attr + 1), attr->sd_len ))
     {
         set_error( STATUS_INVALID_SECURITY_DESCR );
-        return NULL;
+        return false;
     }
     if ((attr->name_len & (sizeof(WCHAR) - 1)) || attr->name_len >= 65534)
     {
         set_error( STATUS_OBJECT_NAME_INVALID );
-        return NULL;
+        return false;
     }
-    if (root && attr->rootdir && attr->name_len)
+    if (attr->rootdir && attr->name_len)
     {
-        if (!(*root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return NULL;
+        if (!(params->root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return false;
     }
-    *sd = attr->sd_len ? (const struct security_descriptor *)(attr + 1) : NULL;
-    name->len = attr->name_len;
-    name->str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
-    return attr;
+    if (attr->sd_len) params->sd = (const struct security_descriptor *)(attr + 1);
+
+    params->name.len = attr->name_len;
+    params->name.str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
+    params->attr     = attr->attributes;
+    params->objattr  = attr;
+    return true;
 }
 
 /* return a pointer to the request data following an object attributes structure */
-const void *get_req_data_after_objattr( const struct object_attributes *attr, data_size_t *len )
+const void *get_req_data_after_objattr( const struct object_params *params, data_size_t *len )
 {
+    const struct object_attributes *attr = params->objattr;
     data_size_t size = (sizeof(*attr) + (attr->sd_len & ~1) + (attr->name_len & ~1) + 3) & ~3;
 
     if (attr == &empty_attributes || size >= get_req_data_size())
@@ -727,10 +707,55 @@ int ios_doorbell_poll_thread( unsigned int tid )
     return again;
 }
 
+#include <time.h>   /* clock_gettime_nsec_np, [io-stuck] rev 3 */
+/* [io-stuck] rev 3 (LOG ONLY): what read_request last saw for each thread, and
+ * the owning thread's state for fd_ios.c ios_dump_io_stuck. io-stuck rev 2
+ * found Battle.net.exe request pipes with a whole request unread while the
+ * server thread is RUNNING; this says whether the server tried to read them
+ * and what read() answered. Indexed by Wine tid / 4. */
+#define IOS_IOSTUCK_TIDS 16384
+static struct { unsigned int calls, fails; int ret, err; unsigned long long t_ns; } ios_iostuck_rd[IOS_IOSTUCK_TIDS];
+
+static void ios_iostuck_note( struct thread *thread, int ret, int err )
+{
+    unsigned int idx = thread->id >> 2;
+    if (idx >= IOS_IOSTUCK_TIDS) return;
+    ios_iostuck_rd[idx].fails++;
+    ios_iostuck_rd[idx].ret = ret;
+    ios_iostuck_rd[idx].err = err;
+    ios_iostuck_rd[idx].t_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+}
+
+/* 1 and a line in buf when obj is a thread (called from fd_ios.c) */
+int ios_iostuck_thread_fmt( struct object *obj, struct fd *fd, char *buf, size_t len )
+{
+    struct thread *t;
+    unsigned int idx;
+    unsigned long long now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+
+    if (!obj || !obj->ops || obj->ops->type != &thread_type) return 0;
+    t = (struct thread *)obj;
+    idx = t->id >> 2;
+    if (idx < IOS_IOSTUCK_TIDS && ios_iostuck_rd[idx].t_ns)
+        snprintf( buf, len, "thread=%04x pid=%04x state=%d this-is-its-request-fd=%d req_toread=%u "
+                  "read_request calls=%u failed=%u last-fail ret=%d errno=%d %llums ago",
+                  t->id, t->process ? t->process->id : 0, (int)t->state, t->request_fd == fd, t->req_toread,
+                  ios_iostuck_rd[idx].calls, ios_iostuck_rd[idx].fails, ios_iostuck_rd[idx].ret,
+                  ios_iostuck_rd[idx].err, (now - ios_iostuck_rd[idx].t_ns) / 1000000ull );
+    else
+        snprintf( buf, len, "thread=%04x pid=%04x state=%d this-is-its-request-fd=%d req_toread=%u "
+                  "read_request calls=%u failed=0",
+                  t->id, t->process ? t->process->id : 0, (int)t->state, t->request_fd == fd, t->req_toread,
+                  idx < IOS_IOSTUCK_TIDS ? ios_iostuck_rd[idx].calls : 0 );
+    return 1;
+}
+
 /* read a request from a thread */
 void read_request( struct thread *thread )
 {
     int ret;
+
+    if ((thread->id >> 2) < IOS_IOSTUCK_TIDS) ios_iostuck_rd[thread->id >> 2].calls++;   /* [io-stuck] */
 
     if (!thread->req_toread)  /* no pending request */
     {
@@ -768,6 +793,7 @@ void read_request( struct thread *thread )
     }
 
 error:
+    ios_iostuck_note( thread, ret, ret < 0 ? errno : 0 );   /* [io-stuck] rev 3, log only */
     if (!ret)  /* closed pipe */
     {
         /* ml586: this kill was previously SILENT — the 0060-family autopsy
@@ -823,7 +849,9 @@ int receive_fd( struct process *process )
         struct thread *thread;
 
         if (data.tid) thread = get_thread_from_id( data.tid );
-        else thread = (struct thread *)grab_object( get_process_first_thread( process ));
+        /* srv-add-first-thread: an empty thread list logs "receive_fd BAD ... cause=no-thread"
+         * below instead of calling grab_object( NULL ) (the 0.2.37-0.2.40 hang) */
+        else if ((thread = get_process_first_thread( process ))) grab_object( thread );
 
         if (!thread || thread->process != process || thread->state == TERMINATED)
         {
@@ -1023,8 +1051,10 @@ static void master_socket_poll_event( struct fd *fd, int event )
         ws_log("[wineserver] create_process returned %p", (void*)process);
         if (process)
         {
+            struct thread *thread;
             ws_log("[wineserver] calling create_thread...");
-            create_thread( -1, process, NULL );
+            thread = create_thread( -1, process, NULL );
+            if (thread) add_process_thread( process, thread );
             ws_log("[wineserver] create_thread done, releasing...");
             release_object( process );
             ws_log("[wineserver] client fully connected!");
@@ -1051,9 +1081,23 @@ void master_socket_handle_client(int client_fd)
 
     if (process)
     {
+        struct thread *thread;
+        const char *off;
+
         ws_log("[wineserver] calling create_thread...");
-        create_thread( -1, process, NULL );
-        ws_log("[wineserver] create_thread done, releasing...");
+        thread = create_thread( -1, process, NULL );
+        /* Wine 11.22 moved add_process_thread() out of create_thread() into its callers.
+         * The 11.22 port added it to master_socket_poll_event above but not to this iOS
+         * twin, which is the path every Madeira process takes (the socketpair bypass).
+         * Without it the process has no threads: the first send_fd from the client
+         * (init step 7, tid 0) reaches receive_fd -> get_process_first_thread() == NULL ->
+         * grab_object( NULL ), and the server thread never returns (0.2.40 log, [init-hang]:
+         * "pc ... = grab_object+0", "lr ... = receive_fd+0x184", passes frozen at 402).
+         * Off: env MADEIRA_SRV_ADD_FIRST_THREAD=0 (restores the 0.2.37-0.2.40 hang). */
+        off = getenv( "MADEIRA_SRV_ADD_FIRST_THREAD" );
+        if (thread && !(off && off[0] == '0' && !off[1])) add_process_thread( process, thread );
+        ws_log("[wineserver] create_thread done (thread %04x, process %04x), releasing...",
+               thread ? thread->id : 0, process->id);
         release_object( process );
         ws_log("[wineserver] client fully connected!");
     }
@@ -1064,11 +1108,24 @@ void master_socket_handle_client(int client_fd)
 }
 #endif
 
+#ifdef WINE_IOS
+/* MADEIRA ws-bind-fallback: see madeira_ws_bind_fallback() below acquire_lock's helpers. */
+static char *madeira_ws_alt_socket;      /* full path of the socket step 1 made, or NULL */
+static int madeira_ws_master_is_pair;    /* 1: step 2, the master fd is one end of a socketpair */
+static int madeira_ws_pair_peer = -1;    /* step 2: the other end, kept open and never written */
+#endif
+
 /* remove the socket upon exit */
 static void socket_cleanup(void)
 {
     static int do_it_once;
-    if (!do_it_once++) unlink( server_socket_name );
+    if (!do_it_once++)
+    {
+        unlink( server_socket_name );
+#ifdef WINE_IOS
+        if (madeira_ws_alt_socket) unlink( madeira_ws_alt_socket );   /* ws-bind-fallback step 1 */
+#endif
+    }
 }
 
 /* create a directory and check its permissions */
@@ -1255,6 +1312,94 @@ int kill_lock_owner( int sig )
     return ret;
 }
 
+#ifdef WINE_IOS
+/* MADEIRA ws-bind-fallback (Nov 22 2026, Sentry: one player, 4 games, every start).
+ * Some iOS setups refuse bind() of a Unix socket inside the Wine prefix with EPERM, though
+ * plain files work there: Madeira run inside LiveContainer's Multitask mode (willfaust/Madeira
+ * issue #562: <prefix>/.wineserver, <prefix>, Documents and Library/Caches all refuse; TMPDIR
+ * binds fine). wineserver then dies with "bind: Operation not permitted" and no game starts.
+ * Every Madeira process reaches the server through the socketpair bypass (WineProcessBridge.m
+ * wine_process_start -> wineserver_inject_client_fd), so nothing connects to this socket by
+ * its path; it only has to exist for open_master_socket() to carry on.
+ *   Step 1: bind the same socket in <TMPDIR>/ws-<dev>-<ino>/socket (relative bind after a
+ *           chdir, so the long LiveContainer TMPDIR never hits the 104-byte sun_path limit).
+ *   Step 2: if that is refused too, use one end of a socketpair as the master fd. Its other
+ *           end stays open and is never written, so the master socket never polls readable.
+ * Only runs after bind() failed with EPERM or EACCES; every other start is unchanged.
+ * env.MADEIRA_WS_BIND_FALLBACK = 0 turns it off (the old fatal "bind: ..." error). */
+static int madeira_ws_bind_fallback( int *fd )
+{
+    int err = errno, s, pair[2];   /* errno first: getenv must not clobber it */
+    const char *env = getenv( "MADEIRA_WS_BIND_FALLBACK" );
+    const char *tmp = getenv( "TMPDIR" );
+    char *dir = NULL;
+    struct stat st;
+    struct sockaddr_un addr;
+    int slen;
+
+    if (env && env[0] == '0' && !env[1]) { errno = err; return 0; }
+    ws_log( "[ws-bind-fallback] bind in %s refused: %s (env.MADEIRA_WS_BIND_FALLBACK = 0 turns this off)",
+            server_dir, strerror( err ));
+
+    /* step 1: the app's own temporary folder */
+    if (tmp && tmp[0] == '/' && fstat( server_dir_fd, &st ) != -1 &&
+        asprintf( &dir, "%s/ws-%llx-%llx", tmp,
+                  (unsigned long long)st.st_dev, (unsigned long long)st.st_ino ) != -1)
+    {
+        if ((mkdir( dir, 0700 ) == 0 || errno == EEXIST) && chdir( dir ) == 0)
+        {
+            unlink( server_socket_name );   /* we hold the server lock, so a leftover is stale */
+            memset( &addr, 0, sizeof(addr) );
+            addr.sun_family = AF_UNIX;
+            strcpy( addr.sun_path, server_socket_name );
+            slen = sizeof(addr) - sizeof(addr.sun_path) + strlen(addr.sun_path) + 1;
+#ifdef HAVE_STRUCT_SOCKADDR_UN_SUN_LEN
+            addr.sun_len = slen;
+#endif
+            if ((s = socket( AF_UNIX, SOCK_STREAM, 0 )) != -1)
+            {
+                if (bind( s, (struct sockaddr *)&addr, slen ) == 0)
+                {
+                    chmod( server_socket_name, 0600 );
+                    if (fchdir( server_dir_fd ) == -1)
+                        fatal_error( "fchdir back to %s: %s\n", server_dir, strerror( errno ));
+                    if (asprintf( &madeira_ws_alt_socket, "%s/%s", dir, server_socket_name ) == -1)
+                        madeira_ws_alt_socket = NULL;
+                    ws_log( "[ws-bind-fallback] step 1: socket bound in %s", dir );
+                    close( *fd );
+                    *fd = s;
+                    free( dir );
+                    return 1;
+                }
+                ws_log( "[ws-bind-fallback] step 1: bind in %s refused too: %s", dir, strerror( errno ));
+                close( s );
+            }
+            else ws_log( "[ws-bind-fallback] step 1: socket: %s", strerror( errno ));
+        }
+        else ws_log( "[ws-bind-fallback] step 1: cannot use %s: %s", dir, strerror( errno ));
+        if (fchdir( server_dir_fd ) == -1)
+            fatal_error( "fchdir back to %s: %s\n", server_dir, strerror( errno ));
+        free( dir );
+    }
+    else ws_log( "[ws-bind-fallback] step 1: no usable TMPDIR" );
+
+    /* step 2: no path at all */
+    if (socketpair( AF_UNIX, SOCK_STREAM, 0, pair ) == -1)
+    {
+        ws_log( "[ws-bind-fallback] step 2: socketpair: %s", strerror( errno ));
+        errno = err;
+        return 0;
+    }
+    close( *fd );
+    *fd = pair[0];   /* pair[1] is kept open on purpose and never written */
+    madeira_ws_pair_peer = pair[1];
+    madeira_ws_master_is_pair = 1;
+    ws_log( "[ws-bind-fallback] step 2: master socket is a socketpair (fd=%d, peer %d); clients use the injected socketpair",
+            pair[0], pair[1] );
+    return 1;
+}
+#endif
+
 /* acquire the main server lock */
 static void acquire_lock(void)
 {
@@ -1263,6 +1408,13 @@ static void acquire_lock(void)
     struct flock fl;
     int fd, slen, got_lock = 0;
 
+#ifdef WINE_IOS
+    /* ws-bind-fallback: wineserver restarts inside the app for every game, so forget the last start's choice */
+    madeira_ws_master_is_pair = 0;
+    if (madeira_ws_pair_peer != -1) { close( madeira_ws_pair_peer ); madeira_ws_pair_peer = -1; }
+    free( madeira_ws_alt_socket );
+    madeira_ws_alt_socket = NULL;
+#endif
     fd = create_server_lock();
 
     fl.l_type   = F_WRLCK;
@@ -1318,8 +1470,7 @@ static void acquire_lock(void)
 #endif
     if (bind( fd, (struct sockaddr *)&addr, slen ) == -1)
     {
-        int bind_errno = errno;
-        if ((bind_errno == EEXIST) || (bind_errno == EADDRINUSE))
+        if ((errno == EEXIST) || (errno == EADDRINUSE))
         {
             if (got_lock)
                 fatal_error( "couldn't bind to the socket even though we hold the lock\n" );
@@ -1330,47 +1481,19 @@ static void acquire_lock(void)
 #endif
         }
 #ifdef WINE_IOS
-        /* Inside LiveContainer, iOS refuses to create the Unix socket ("[Wine] FATAL: bind: Operation not
-         * permitted"); the server thread then ended and the game hung on a black screen. Ported from BCD
-         * 0.1.630 (thebcd69/bcd-games, round 624, GPL-3.0-or-later). The socket name is relative to the
-         * working directory, which another thread may have changed: if we are not in the server directory,
-         * go back and try once more. If that fails too, carry on without the master socket: no client
-         * connects through it (the first Wine process and every child get a socketpair, see
-         * WineProcessBridge.m), and close_master_socket() is NULL-safe. */
-        {
-            char cwd[1024];
-            struct stat here, dir;
-            int same = 0, retried = 0;
-
-            if (!getcwd( cwd, sizeof(cwd) )) strcpy( cwd, "(getcwd failed)" );
-            same = server_dir_fd != -1 && stat( ".", &here ) == 0 && fstat( server_dir_fd, &dir ) == 0 &&
-                   here.st_ino == dir.st_ino && here.st_dev == dir.st_dev;
-            ws_log( "[wineserver] bind(%s) failed errno=%d (%s): cwd=%s server_dir=%s same-dir=%d access-w=%d got_lock=%d",
-                    server_socket_name, bind_errno, strerror( bind_errno ), cwd, server_dir, same, access( ".", W_OK ) == 0, got_lock );
-            if (!same && got_lock && server_dir_fd != -1 && fchdir( server_dir_fd ) == 0)
-            {
-                retried = 1;
-                unlink( server_socket_name );
-                if (bind( fd, (struct sockaddr *)&addr, slen ) != -1)
-                {
-                    ws_log( "[wineserver] bind(%s) succeeded in the server directory", server_socket_name );
-                    goto ios_bound;
-                }
-                bind_errno = errno;
-            }
-            ws_log( "[wineserver] %s (errno=%d); continuing without the master socket (clients connect through socketpairs)",
-                    retried ? "the retry in the server directory failed too" : "no retry", bind_errno );
-        }
-        close( fd );
-        return;
+        if ((errno == EPERM || errno == EACCES) && madeira_ws_bind_fallback( &fd ))
+            goto madeira_ws_bound;
 #endif
-        fatal_error( "bind: %s\n", strerror( bind_errno ));
+        fatal_error( "bind: %s\n", strerror( errno ));
     }
 #ifdef WINE_IOS
-ios_bound:
+madeira_ws_bound:
 #endif
     atexit( socket_cleanup );
     chmod( server_socket_name, 0600 );  /* make sure no other user can connect */
+#ifdef WINE_IOS
+    if (!madeira_ws_master_is_pair)
+#endif
     if (listen( fd, 5 ) == -1) fatal_error( "listen: %s\n", strerror( errno ));
     /* iOS: make master socket non-blocking so accept() never blocks */
     fcntl( fd, F_SETFL, O_NONBLOCK );
@@ -1380,6 +1503,12 @@ ios_bound:
         !(master_socket->fd = create_anonymous_fd( &master_socket_fd_ops, fd, &master_socket->obj, 0 )))
         fatal_error( "out of memory\n" );
     ws_log("[wineserver] acquire_lock: master_socket->fd unix_fd=%d", get_unix_fd(master_socket->fd));
+#ifdef WINE_IOS
+    /* ws-bind-fallback step 2: a socketpair master never has clients to accept; don't poll it,
+     * or a stray write to the peer would make accept() fail with EINVAL in a busy loop */
+    if (madeira_ws_master_is_pair) set_fd_events( master_socket->fd, 0 );
+    else
+#endif
     set_fd_events( master_socket->fd, POLLIN );
     make_object_permanent( &master_socket->obj );
 }

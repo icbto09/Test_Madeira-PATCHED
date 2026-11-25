@@ -24,6 +24,21 @@ struct ModsPage: View {
     @State private var working: String?
     @State private var problem: Error?
     @State private var iniNote = false
+    /// The card's download/install in flight for this game; it outlives this page (BepInExBusy).
+    @ObservedObject private var busy = BepInExBusy.shared
+    private var bepinexStep: BepInExStep? { busy.steps[game.id] }
+
+    /// The one-tap BepInEx card. env.MADEIRA_BEPINEX_BUTTON = 0 in the global settings file hides it
+    /// (a BepInEx already installed then shows as a mod in the list, with Remove).
+    private var showsBepInExCard: Bool { MadeiraConfig.flag("MADEIRA_BEPINEX_BUTTON") }   // 0: no BepInEx card on the Mods page
+    /// BepInEx 5 (the pinned release) loads in 64-bit Mono Unity games, with the program in the game's folder:
+    /// UnityPlayer.dll or a *_Data folder, no GameAssembly.dll (IL2CPP needs BepInEx 6).
+    private var looksLikeMonoUnity: Bool {
+        if game.program?.contains("/") == true || game.program?.contains("\\") == true { return false }
+        let names = ModLayout.names(game.gameFolder).map { $0.lowercased() }
+        return (names.contains("unityplayer.dll") || names.contains { $0.hasSuffix("_data") }) && !names.contains("gameassembly.dll")
+    }
+    private var listed: [ModRecord] { showsBepInExCard ? mods.filter { !BepInExLoader.isLoader($0) } : mods }
 
     private var store: URL { ModInstaller.store(game.id) }
     private var removingName: String { removing?.name ?? "" }
@@ -33,28 +48,41 @@ struct ModsPage: View {
     }
 
     var body: some View {
+        if showsBepInExCard {
+            Section {
+                bepinexCard
+            } footer: {
+                if BepInExLoader.loader(in: mods) == nil {
+                    Text("Downloads the official 64-bit release into this game's folder. You can remove it later.")
+                }
+            }
+            .disabled(!hasFolder)
+        }
         Section {
-            if mods.isEmpty {
+            if listed.isEmpty {
                 Text("Mods add to or change a game's files. Add one below; you can turn it off or remove it at any time, and the game's own files come back.")
                     .foregroundStyle(.secondary)
             }
-            ForEach(mods) { mod in row(mod) }
+            ForEach(listed) { mod in row(mod) }
         } header: {
             Text("Installed")
         } footer: {
-            if mods.count > 1 { Text("When two mods change the same file, the one added later wins.") }
+            if listed.count > 1 { Text("When two mods change the same file, the one added later wins.") }
         }
         .navigationTitle("Mods")
         .onAppear(perform: reload)
+        .onChange(of: busy.steps[game.id]) { _, step in if step == nil { reload() } }
         Section {
             Button { picker = .file } label: { Label("Choose a File", systemImage: "doc.zipper") }
+                .padRow("mods-choose-a-file", when: hasFolder && working == nil && bepinexStep == nil) { picker = .file }
             Button { picker = .folder } label: { Label("Choose a Folder", systemImage: "folder") }
+                .padRow("mods-choose-a-folder", when: hasFolder && working == nil && bepinexStep == nil) { picker = .folder }
         } header: {
             Text("Add a Mod")
         } footer: {
             Text("A .zip, .7z, .rar or .fomod file, or a folder with the mod's files in it.")
         }
-        .disabled(!hasFolder || working != nil)
+        .disabled(!hasFolder || working != nil || bepinexStep != nil)
         .sheet(item: $picker, onDismiss: {
             // The install sheet opens once the picker has gone.
             if let pick = picked { picked = nil; installing = ModInstallRequest(source: pick.0, folder: pick.1) }
@@ -90,6 +118,80 @@ struct ModsPage: View {
         }
     }
 
+    /// BepInEx: a mod loader for Unity games. Not installed: one blue button downloads the pinned release
+    /// and installs it like any mod. Installed: a tag, and a grey Remove that asks first.
+    @ViewBuilder private var bepinexCard: some View {
+        let loader = BepInExLoader.loader(in: mods)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "puzzlepiece.extension.fill").font(.title2).foregroundStyle(.blue).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(verbatim: BepInExLoader.name).font(.headline)
+                        if loader != nil {
+                            Text("Installed").font(.caption2.bold()).foregroundStyle(.green)
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(Color.green.opacity(0.18), in: Capsule())
+                        }
+                    }
+                    if loader != nil {
+                        Text("Loads automatically when you start this game.").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Mod loader for Unity games. Not installed.").font(.caption).foregroundStyle(.secondary)
+                        if !looksLikeMonoUnity {
+                            Text("This game doesn't look like a 64-bit Mono Unity game, so BepInEx may not work.").font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            if let step = bepinexStep {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    switch step {
+                    case .downloading: Text("Downloading BepInEx…").font(.subheadline)
+                    case .installing: Text("Installing BepInEx…").font(.subheadline)
+                    }
+                }
+            } else if let loader {
+                if working == loader.id { ProgressView() }
+                Button { removing = loader } label: { Text("Remove").frame(maxWidth: .infinity) }
+                    .buttonStyle(.bordered).tint(.gray)
+                    .disabled(working != nil)
+                    .padRow("mods-bepinex-remove", when: hasFolder && working == nil) { removing = loader }
+            } else {
+                Button { addBepInEx() } label: { Text("Add BepInEx").frame(maxWidth: .infinity) }
+                    .buttonStyle(.borderedProminent).tint(.blue)
+                    .disabled(working != nil)
+                    .padRow("mods-bepinex-add", when: hasFolder && working == nil) { addBepInEx() }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Downloads the pinned release, checks it against its hash and installs it, away from the main thread.
+    private func addBepInEx() {
+        guard bepinexStep == nil, BepInExLoader.loader(in: mods) == nil else { return }
+        let busy = busy, id = game.id
+        busy.steps[id] = .downloading
+        problem = nil
+        let folder = store, game = game
+        Task { @MainActor in
+            var failure: Error?
+            var zip: URL?
+            do {
+                zip = try await ModInstaller.downloadBepInEx()
+                busy.steps[id] = .installing
+                let file = zip!
+                try await Task.detached {
+                    try ModInstaller.installBepInEx(zip: file, game: game, store: folder) { _ in }
+                }.value
+            } catch { failure = error }
+            if let zip { try? FileManager.default.removeItem(at: zip) }
+            problem = failure
+            busy.steps[id] = nil   // the page reloads its list when this clears
+        }
+    }
+
     @ViewBuilder private func row(_ mod: ModRecord) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
@@ -112,7 +214,11 @@ struct ModsPage: View {
                 .buttonStyle(.borderless)
                 .accessibilityLabel(Text("Remove"))
         }
-        .disabled(working != nil)
+        .disabled(working != nil || bepinexStep != nil)
+        // The whole row is the item (pad-pages): A turns the mod on or off; Remove stays touch-only.
+        .padToggle("mods-on-\(mod.id)", Binding(get: { mod.enabled }, set: { on in
+            change(mod) { store in if on { try store.enable(mod.id) } else { try store.disable(mod.id) } }
+        }), when: working == nil && bepinexStep == nil)
     }
 
     /// "Data" or the game's folder, by name.
@@ -142,6 +248,16 @@ struct ModsPage: View {
             }
         }
     }
+}
+
+/// What the BepInEx card is doing.
+enum BepInExStep: Equatable { case downloading, installing }
+
+/// The card's work in flight, by game: it goes on when the player leaves the page, and the page
+/// shows it again (and does not offer a second install) when they come back.
+@MainActor final class BepInExBusy: ObservableObject {
+    static let shared = BepInExBusy()
+    @Published var steps: [String: BepInExStep] = [:]
 }
 
 enum ModPicker: String, Identifiable {
@@ -539,6 +655,8 @@ struct ModErrorText: View {
             case .unknownFile(let name): Text("Madeira can't open \(name). Choose a .zip, .7z, .rar or .fomod file, or a folder.")
             case .rar: Text("This .rar file can't be opened on this device. Unpack it on a computer and choose the folder, or get the mod as a .zip or .7z.")
             case .encrypted: Text("This archive has a password. Madeira can't open it.")
+            case .bepinexDownload: Text("BepInEx couldn't be downloaded. Check your connection and try again.")
+            case .bepinexHash: Text("The download was not the expected BepInEx file, so nothing was installed.")
             }
         } else if let archive = error as? ItchArchiveError {
             switch archive {

@@ -80,6 +80,11 @@ enum LogFiles {
     static func scrubbedCopy(of url: URL) throws -> URL {
         let out = shareFolder.appendingPathComponent(url.lastPathComponent)
         let changed = try PrivacyScrub.copy(from: url, to: out)
+        // (log-lastrun) This launch's log alone shares none of the game played before Madeira was opened again.
+        let extra = url.lastPathComponent == "madeira-log.txt" ? RunLedger.previousLaunchRun() + (RunLedger.tailText() ?? "") : ""
+        if !extra.isEmpty, let handle = try? FileHandle(forWritingTo: out) {
+            _ = try? handle.seekToEnd(); handle.write(Data(extra.utf8)); try? handle.close()
+        }
         LogStore.shared.log("[logs] share \(url.lastPathComponent) (\(changed) lines with personal details taken out)")
         return out
     }
@@ -217,27 +222,30 @@ struct ShareLogsButton: View {
     @State private var shared: SharedLogs?
     @State private var busy = false
     @State private var failed: String?
-    var body: some View {
-        Button {
-            guard !busy else { return }
-            busy = true
-            let entry = entry
-            let game = entry.map(ClaudeHelp.gameText)
-            let device = ClaudeHelp.deviceLine()
-            DispatchQueue.global(qos: .userInitiated).async {
-                let url = DiscordLog.file(title: entry?.title, report: GetHelp.report(game: game, title: entry?.title, device: device))
-                DispatchQueue.main.async {
-                    busy = false
-                    if let url { shared = SharedLogs(urls: [url]) } else { failed = L("Madeira couldn't write the file. Try again.") }
-                }
+    private func share() {
+        guard !busy else { return }
+        busy = true
+        let entry = entry
+        let game = entry.map(ClaudeHelp.gameText)
+        let device = ClaudeHelp.deviceLine()
+        let folder = GameOwnLogs.game(for: entry)   // (share-game-logs) read on main
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = DiscordLog.file(title: entry?.title, report: GetHelp.report(game: game, title: entry?.title, device: device), gameFolder: folder)
+            DispatchQueue.main.async {
+                busy = false
+                if let url { shared = SharedLogs(urls: [url]) } else { failed = L("Madeira couldn't write the file. Try again.") }
             }
-        } label: {
+        }
+    }
+    var body: some View {
+        Button(action: share) {
             HStack {
                 Label("Share Logs", systemImage: "doc.text")
                 if busy { Spacer(); ProgressView() }
             }
         }
         .disabled(busy)
+        .padRow(entry == nil ? "logs-share" : "logs-share-game", when: !busy, press: { share() })
         .sheet(item: $shared) { ActivitySheet(items: $0.urls) }
         .alert("Could not make the logs file", isPresented: Binding(get: { failed != nil }, set: { if !$0 { failed = nil } })) {
             Button("OK", role: .cancel) {}
@@ -306,6 +314,9 @@ struct DebugResetButton: View {
 }
 /// Settings › Logs.
 struct LogsSection: View {
+    /// The log a controller's A opened (settings-pad-rows): the page holding this section pushes it
+    /// (a navigationDestination inside a Form's rows is ignored). nil: rows open by touch only.
+    var padOpen: Binding<LogFiles.Item?>? = nil
     @State private var main: [LogFiles.Item] = []
     @State private var sessions: [LogFiles.Item] = []
 
@@ -338,13 +349,15 @@ struct LogsSection: View {
     }
 
     private func row(_ item: LogFiles.Item) -> some View {
-        NavigationLink { LogViewer(item: item) } label: {
+        NavigationLink { LogViewer(item: item).padSettingsSubpage() } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: item.title).lineLimit(1)
                 Text(verbatim: LogFiles.detail(item.url)).font(.caption).foregroundStyle(.secondary)
             }
         }
+        .padRow("log-\(item.id)", when: padOpen != nil) { padOpen?.wrappedValue = item }
     }
+
 }
 
 /// The end of one log, scrubbed, with Share for a scrubbed copy of the whole file.
@@ -404,5 +417,229 @@ struct LogViewer: View {
                 DispatchQueue.main.async { lines = tail }
             }
         }
+    }
+}
+
+//
+//  (share-game-logs, Cameron Nov 21: "why aren't all the logs coming with that? we are debugging")
+//  The log files a game writes itself, inside drive_c, added to the one shared "<game> log.txt"
+//  (DiscordLog.file: Share Logs in Settings and Game details, Save copy for Discord).
+//
+//  madeira-log.txt holds Wine's, FEX's and Madeira's lines, and the Documents/logs/<exe>-<time>.txt
+//  files are hard links to it (LogStore.startSessionLog), so they add nothing. What was missing is
+//  what the game, its launcher or Steam write on their own: a launcher's .log, Unity's Player.log,
+//  Unreal's Saved/Logs, a crash .txt, Steam's logs folder.
+//
+//  Where it looks:
+//   - the game's own folder (its library path; for an Unreal Binaries/Win64 exe, the game folder
+//     above it), 4 levels deep: log files written in the last 7 days. Never a shared folder
+//     (C:\, Program Files, Games, Steam, steamapps, users, External) or one holding another game;
+//   - users/*/AppData (Local, LocalLow, Roaming), users/*/Documents, users/*/Saved Games and
+//     Program Files (x86)/Steam/logs: log files written during this game's last run (its newest
+//     Documents/logs session, minus 2 minutes), so other games' logs stay out.
+//  Never: browser storage (LevelDB "000003.log" files in Local Storage, IndexedDB, webcache,
+//  BrowserCaches: they hold sign-in state), login/chat/changelog files, binary files, symlinks.
+//  The newest 12 files go in, each at most its last 256 KB, all together at most 1 MB; each line
+//  is scrubbed (PrivacyScrub: tokens, passwords, user names, Steam IDs, e-mails, public IPs), then cut
+//  to 2000 characters. Read-only: nothing in drive_c is changed.
+//
+//  Off switch: env.MADEIRA_SHARE_GAME_LOGS = 0 (the shared file is then as before).
+//
+enum GameOwnLogs {
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_SHARE_GAME_LOGS") }
+    static let maxFiles = 12
+    static let perFileCap: UInt64 = 256 * 1024
+    static let totalCap = 1024 * 1024
+    /// Files one walk looks at before it stops: the game folder, and the other places together.
+    static let gameVisits = 15_000
+    static let otherVisits = 25_000
+    /// Folders never walked: caches, browser storage (sign-in state), other installs, Madeira's own.
+    static let skipFolders: Set<String> = ["cache", "caches", "htmlcache", "gpucache", "code cache", "shadercache",
+                                           "shader cache", "dxcache", "nvidia", "steamapps", "crashpad", "inetcache",
+                                           "temp", "tmp", "packages", "madeira-games", "leveldb", "local storage",
+                                           "session storage", "indexeddb", "service worker", "blob_storage",
+                                           "browsercaches", "cookies", "webstorage", "databases", "external"]
+    /// Top folders (relative to drive_c, lower case) that hold many games: never walked as "the game's folder".
+    static let sharedFolders: Set<String> = ["", "games", "program files", "program files (x86)", "programdata",
+                                             "program files (x86)/steam", "program files/steam",
+                                             "program files (x86)/steam/steamapps", "program files (x86)/steam/steamapps/common",
+                                             "program files/steam/steamapps", "program files/steam/steamapps/common",
+                                             "program files/epic games", "program files (x86)/gog galaxy/games", "gog games",
+                                             "users", "windows", "external"]
+
+    struct Game { let windowsPath: String; let exe: String?; let others: [String] }
+
+    /// Main thread: the game whose logs go in. The entry when there is one (Game details), else the
+    /// library entry of the last game played (Settings › Logs), matched by title or program name.
+    static func game(for entry: LibraryEntry?) -> Game? {
+        guard enabled else { return nil }
+        let entries = LibraryModel.shared.entries
+        var chosen = entry
+        if chosen == nil, let docs = LogFiles.documents, let name = LogFiles.lastGame(in: docs)?.lowercased() {
+            chosen = entries.first { $0.title.lowercased() == name }
+                ?? entries.first { ($0.launchRelativePath.split(separator: "/").last.map { $0.lowercased() } ?? "") == name }
+        }
+        guard let chosen else { return nil }
+        let exe = chosen.launchRelativePath.split(separator: "/").last.map(String.init)
+        let others = entries.filter { $0.id != chosen.id }.map(\.windowsPath)
+        return Game(windowsPath: chosen.windowsPath, exe: exe?.lowercased().hasSuffix(".exe") == true ? exe : nil, others: others)
+    }
+
+    /// A log file by name: .log, or a .txt named as a log; never a login, chat or changelog file, never a
+    /// LevelDB/Chromium "000123.log".
+    static func isLogName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        if lower.hasPrefix("madeira") { return false }
+        if ["login", "dialog", "catalog", "changelog", "chat", "password", "token", "cookie", "blog"].contains(where: { lower.contains($0) }) { return false }
+        let stem = lower.split(separator: ".").first.map(String.init) ?? lower
+        if !stem.isEmpty, stem.allSatisfy(\.isNumber) { return false }
+        if lower.hasSuffix(".log") { return true }
+        guard lower.hasSuffix(".txt") else { return false }
+        let words = Set(stem.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        return !words.isDisjoint(with: ["log", "logs", "crash", "error", "errors", "debug", "exception", "player", "output"])
+            || stem.hasSuffix("log") && !stem.hasSuffix("blog")
+    }
+
+    /// A file with a NUL byte in its first 4 KB is binary: left out.
+    static func isText(_ url: URL) -> Bool {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? h.close() }
+        let head = (try? h.read(upToCount: 4096)) ?? Data()
+        return !head.contains(0)
+    }
+
+    /// The newest game launch from the Documents/logs/<exe>-<yyyy-MM-dd_HH-mm-ss>.txt names: of `exe`
+    /// when given and found, else of any game. A time in the future (another calendar) is ignored.
+    static func lastLaunch(in docs: URL, exe: String?) -> Date? {
+        let folder = docs.appendingPathComponent("logs", isDirectory: true)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        let stamp = DateFormatter()
+        stamp.locale = Locale(identifier: "en_US_POSIX")
+        stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let soon = Date().addingTimeInterval(300)
+        let all = names.compactMap { name -> (String, Date)? in
+            guard name.hasSuffix(".txt"), name.count > 24,
+                  let d = stamp.date(from: String(name.dropLast(4).suffix(19))), d < soon else { return nil }
+            return (String(name.dropLast(24)).lowercased(), d)
+        }
+        if let exe, let mine = all.filter({ $0.0 == exe.lowercased() }).map(\.1).max() { return mine }
+        return all.map(\.1).max()
+    }
+
+    struct Found { let url: URL; let shown: String; let modified: Date; let size: UInt64 }
+
+    /// Log files under `root`, at most `depth` folders down, written at or after `since`.
+    static func walk(_ root: URL, depth: Int, since: Date, drive: String, budget: inout Int, into found: inout [Found]) {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
+        guard budget > 0, let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
+                                                                      options: [.skipsPackageDescendants]) else { return }
+        for case let url as URL in walker {
+            budget -= 1
+            if budget <= 0 { return }
+            guard let v = try? url.resourceValues(forKeys: Set(keys)) else { continue }
+            if v.isSymbolicLink == true { if v.isDirectory == true { walker.skipDescendants() }; continue }
+            if v.isDirectory == true {
+                let name = url.lastPathComponent.lowercased()
+                if walker.level >= depth || skipFolders.contains(name) || name.hasPrefix("webcache") { walker.skipDescendants() }
+                continue
+            }
+            guard isLogName(url.lastPathComponent), let modified = v.contentModificationDate, modified >= since,
+                  let size = v.fileSize, size > 0, isText(url) else { continue }
+            let path = url.resolvingSymlinksInPath().path
+            let shown = path.hasPrefix(drive) ? "C:\\" + path.dropFirst(drive.count).replacingOccurrences(of: "/", with: "\\") : url.lastPathComponent
+            found.append(Found(url: url, shown: shown, modified: modified, size: UInt64(size)))
+        }
+    }
+
+    /// drive_c-relative, lower case path of a folder already resolved under `drive`.
+    static func relative(_ path: String, drive: String) -> String? {
+        if path + "/" == drive { return "" }
+        guard path.hasPrefix(drive) else { return nil }
+        return String(path.dropFirst(drive.count)).lowercased()
+    }
+
+    /// The section for the shared file, "" when off or nothing was found. Off the main thread.
+    static func section(game: Game?, limit: Int = totalCap) -> String {
+        guard enabled, limit > 4096, let docs = LogFiles.documents else { return "" }
+        let fm = FileManager.default
+        let driveURL = LibraryEntry.hostDrive.resolvingSymlinksInPath()
+        guard fm.fileExists(atPath: driveURL.path) else { return "" }
+        let drive = driveURL.path.hasSuffix("/") ? driveURL.path : driveURL.path + "/"
+        var found: [Found] = []
+        var walked = Set<String>()
+        // The game's own folder: its files are its own, so a week back.
+        var gameFolder = false
+        if let game, let exe = LibraryEntry.hostURL(ofWindowsPath: game.windowsPath) {
+            var folder = GetHelpUpload.listFolder(of: exe, ownFolder: true).resolvingSymlinksInPath()
+            // Unreal: <Game>/Binaries/Win64/x.exe keeps its logs in <Game>/Saved/Logs.
+            if folder.lastPathComponent.lowercased().hasPrefix("win"), folder.deletingLastPathComponent().lastPathComponent.lowercased() == "binaries" {
+                folder = folder.deletingLastPathComponent().deletingLastPathComponent()
+            }
+            let path = folder.path
+            let others = game.others.compactMap { LibraryEntry.hostURL(ofWindowsPath: $0)?.resolvingSymlinksInPath().path }
+            let holdsOther = others.contains { $0.hasPrefix(path + "/") }
+            if let rel = relative(path, drive: drive), !sharedFolders.contains(rel), !rel.hasPrefix("external"), !holdsOther {
+                gameFolder = true
+                walked.insert(path)
+                var budget = gameVisits
+                walk(folder, depth: 4, since: Date().addingTimeInterval(-7 * 24 * 3600), drive: drive, budget: &budget, into: &found)
+            }
+        }
+        // Everywhere else: only what this game's last run wrote. Steam's logs first (small).
+        let since = (lastLaunch(in: docs, exe: game?.exe) ?? Date().addingTimeInterval(-3600)).addingTimeInterval(-120)
+        var roots: [(URL, Int)] = [(driveURL.appendingPathComponent("Program Files (x86)/Steam/logs", isDirectory: true), 1)]
+        let users = driveURL.appendingPathComponent("users", isDirectory: true)
+        for user in (try? fm.contentsOfDirectory(atPath: users.path)) ?? [] {
+            let home = users.appendingPathComponent(user, isDirectory: true)
+            for (sub, depth) in [("AppData/Local", 5), ("AppData/LocalLow", 5), ("AppData/Roaming", 5),
+                                 ("Documents", 4), ("My Documents", 4), ("Saved Games", 4)] {
+                roots.append((home.appendingPathComponent(sub, isDirectory: true), depth))
+            }
+        }
+        var budget = otherVisits
+        for (root, depth) in roots {
+            // A start folder can be a link (Wine's Documents often points outside drive_c): resolve it,
+            // keep it only inside drive_c and only once.
+            let real = root.resolvingSymlinksInPath()
+            guard fm.fileExists(atPath: real.path), real.path.hasPrefix(drive),
+                  !walked.contains(where: { real.path == $0 || real.path.hasPrefix($0 + "/") }) else { continue }
+            walked.insert(real.path)
+            walk(real, depth: depth, since: since, drive: drive, budget: &budget, into: &found)
+        }
+        // One file once (resolved path), newest first.
+        var seen = Set<String>()
+        let files = found.sorted { $0.modified > $1.modified }
+            .filter { seen.insert($0.url.resolvingSymlinksInPath().path).inserted }.prefix(maxFiles)
+        guard !files.isEmpty else {
+            LogStore.shared.log("[share-game-logs] none found (game folder: \(gameFolder ? "yes" : "no"))")
+            return ""
+        }
+        let time = DateFormatter()
+        time.locale = Locale(identifier: "en_US_POSIX")
+        time.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var out = "\n\n## The game's own log files (\(files.count), newest first, personal details taken out)\n"
+        out += files.map { "- \(PrivacyScrub.line($0.shown)) (\($0.size) bytes, written \(time.string(from: $0.modified)))" }.joined(separator: "\n") + "\n"
+        var used = out.utf8.count
+        for file in files {
+            let room = limit - used - 512
+            guard room > 2048 else { out += "\n(More files were left out to keep the shared file under its size cap.)\n"; break }
+            let cap = min(perFileCap, UInt64(room))
+            let from = file.size > cap ? file.size - cap : 0
+            var part = "\n### \(PrivacyScrub.line(file.shown))\n"
+            if from > 0 { part += "(Only the newest \(cap / 1024) KB of this \(file.size / 1024) KB file.)\n" }
+            var first = from > 0
+            LogLines.forEach(in: file.url, fromByte: from) { raw in
+                if first { first = false; return }
+                // Scrub the whole line first, so a cut never splits a token past the rules.
+                var clean = PrivacyScrub.line(raw)
+                if clean.count > 2000 { clean = String(clean.prefix(2000)) + " ..." }
+                guard used + part.utf8.count + clean.utf8.count + 1 < limit else { return }
+                part += clean + "\n"
+            }
+            out += part
+            used += part.utf8.count
+        }
+        LogStore.shared.log("[share-game-logs] \(files.count) file(s), \(used) bytes (game folder: \(gameFolder ? "yes" : "no"))")
+        return out
     }
 }

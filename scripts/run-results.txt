@@ -1,0 +1,115 @@
+# Proven run results for the "Does it run?" status label (app/Madeira/RunStatus.swift).
+# scripts/make-run-status.py turns this into app/Madeira/run-status.json.
+#
+# One result per line, fields split by " | ":
+#   keys | title | device | tier | build | summary | source | last good | first good
+# keys:   comma-separated: steam:<app id>, exe:<program file name>, title:<game title> (lower case)
+# device: iPhone, iPad or unknown (the record did not say)
+# tier:   runsWell, runsWithFixes, runsWithProblems, startsOnly, doesntRun
+#         runsWithFixes: worked with fix lines. Every runsWithFixes game needs its lines shown in the app:
+#         Madeira's own list for it (GameRecommendations.swift) or a "hand" line below
+#         (tests/host/check-run-status.py fails otherwise)
+# hand lines: hand | <one of the game's keys> | <config line the player adds by hand> | <source>
+#         shown in "Why this rating" as "Add by hand: <line>"
+# title keys only match games from outside Steam (the app rates a Steam copy by its app id)
+# source: where the proof is (record file and line). A result without one is refused.
+# last good / first good: builds, or - when the record has none.
+#
+# Rule: only results a record proves. No proof = leave the game out (the app shows Not tested yet).
+# Seeded Nov 22 2026 from the PC's copy of the project index (claudepot/INDEX-wave19.md, Nov 8):
+# section 4 "Games" (Wave 5 / Wave 13 results) and "Older games" (old-project builds, marked
+# "may be stale" there, so every one of them gets the Retest flag from the generator).
+# Left out on purpose: games marked IN-PROGRESS or "play not reported" (BioShock Infinite, Voices of the Void), Discord tips from other
+# forks, GTA V (newer records in GameRecommendations.swift disagree with the index), CS2.
+# Newer results go below older ones (the later line wins a tie); see the Nov 22 block at the end.
+
+steam:413150,title:stardew valley | Stardew Valley | unknown | runsWithFixes | Wave 5 | Works (64-bit) with its own config | INDEX-wave19.md:138 | Wave 5 | -
+title:satisfactory | Satisfactory (Epic) | unknown | runsWithFixes | Wave 5 | Epic copy: works and runs fine with its 5-line game config (added by hand) | INDEX-wave19.md:139 | Wave 5 | -
+steam:1092790,title:inscryption | Inscryption | unknown | runsWithFixes | Nov 7 tester build | Works once you add env.MADEIRA_NO_GL = 1 to its own config by hand (tester confirmed) | INDEX-wave19.md:212 | Nov 7 tester build | -
+steam:2141730,title:backrooms: escape together | Backrooms: Escape Together | iPhone | doesntRun | Wave 13 | Crashes right after start (player report) | INDEX-wave19.md:134 | - | -
+steam:202970,steam:212910,title:call of duty: black ops ii | Call of Duty: Black Ops II | unknown | runsWell | build 32 | Works, campaign and Zombies switch both ways | INDEX-wave19.md:186 (Zombies app id 212910: GameRecommendations.swift blackOps2 comment) | build 32 | -
+steam:10180,title:call of duty: modern warfare 2 (2009) | Call of Duty: Modern Warfare 2 (2009) | unknown | runsWell | build 48 | Campaign works | INDEX-wave19.md:188 | build 48 | -
+steam:22380,title:fallout: new vegas | Fallout: New Vegas | unknown | runsWell | build 60 | Works full speed | INDEX-wave19.md:190 | build 60 | -
+steam:4000,title:garry's mod | Garry's Mod | unknown | runsWithProblems | build 60 | Multiplayer works at 60 fps on the x86-64 branch; 32-bit menu broken | INDEX-wave19.md:191 | - | -
+steam:108600,title:project zomboid | Project Zomboid | unknown | runsWithProblems | build 60 | Works; the menu takes about 2.5 minutes | INDEX-wave19.md:192 | build 60 | -
+steam:105600,title:terraria | Terraria | unknown | runsWell | build 34 | Works | INDEX-wave19.md:194 | build 34 | -
+steam:1574820,title:until then | Until Then | iPhone | doesntRun | public 0.2.0 | No frame, exits with 255 (player report) | INDEX-wave19.md:197 | - | -
+title:the planet crafter | The Planet Crafter | unknown | startsOnly | build 67 | Gets in game, then stops about 3 s in | INDEX-wave19.md:199 | - | -
+steam:200260,title:batman: arkham city goty | Batman: Arkham City GOTY | unknown | runsWell | build 67 | Works | INDEX-wave19.md:201 | build 67 | -
+steam:49520,title:borderlands 2 | Borderlands 2 | unknown | runsWell | build 67 | Launches and plays | INDEX-wave19.md:202 | build 67 | -
+steam:1113000,title:persona 4 golden | Persona 4 Golden | unknown | doesntRun | old build | Broken, no settings fix | INDEX-wave19.md:208 | - | -
+steam:1671210,title:deltarune | DELTARUNE | unknown | runsWithProblems | public 0.2.0 | Chapters start (by launch arguments); no music (player reports) | INDEX-wave19.md:222 | - | -
+steam:3194360,title:formula legends | Formula Legends | iPhone | doesntRun | public v0.1.3 | Broken (player report) | INDEX-wave19.md:223 | - | -
+
+# Added Nov 22 2026 from the Regression Timeline (data generated Nov 21, builds up to 0.2.70) and two
+# newer results from project memory (Fallout: New Vegas 0.2.77, Resident Evil Village 0.2.68). Only
+# Cameron's reports and run logs; Sentry and player text reports left out. "?" devices stay unknown.
+# These replace the older rows above for Slay the Spire 2, Black Ops, Grounded, LEGO Star Wars,
+# Subnautica 2, Teardown and The Escapists 2 (newer build wins). Left out: Battle.net (launcher, not a
+# game), CS2, GTA V Enhanced (GameRecommendations.swift has newer records), Satisfactory 0.2.70 (copy
+# not stated: Steam or Epic), Mafia II (Classic or Definitive not stated), MECCHA CHAMELEON and
+# Muv-Luv photonflowers* (app id not sure), BeamNG.drive 0.2.26 player FAIL (device not stated and a
+# WORKS row exists), and the older 0.2.0/Wave 13 player-log FAIL list (no build or device per game).
+steam:251570 | 7 Days to Die | iPad | runsWell | Test 15 | Runs | Regression Timeline (Nov 21): log 2d935c67 | Test 15 | -
+steam:107410 | Arma 3 | iPad | startsOnly | Test 18 | Starts, then gets stuck | Regression Timeline (Nov 21): log d092b971 | - | -
+steam:284160 | BeamNG.drive | iPad | runsWithFixes | Test 12 | Runs with its recommended settings | Regression Timeline (Nov 21): log 587324f3 | Test 12 | -
+steam:2406770 | Bodycam | iPad | doesntRun | Test 18 | Hung, then crashed | Regression Timeline (Nov 21): his report (player iPad log, hung then crashed) | - | -
+steam:49520 | Borderlands 2 | iPhone | runsWell | Test 16 | Runs | Regression Timeline (Nov 21): log 5994d404 | Test 16 | -
+steam:291550 | Brawlhalla | iPhone | doesntRun | Wave 13 | Doesn't run | Regression Timeline (Nov 21): log 85b993b3 | - | -
+steam:2835570 | Buckshot Roulette | iPhone | runsWell | 0.2.23 | Runs | Regression Timeline (Nov 21): log 42e5934a | 0.2.23 | -
+steam:42700,title:call of duty: black ops | Call of Duty: Black Ops | iPhone | runsWithProblems | 0.2.29 | Runs for a short time, then stops | Regression Timeline (Nov 21): log 8d388e85 | - | -
+steam:311210 | Call of Duty: Black Ops III | iPhone | startsOnly | 0.2.70 | Starts, then gets stuck | Regression Timeline (Nov 21): log 654def42 | - | -
+steam:1295660 | Sid Meier's Civilization VII | iPhone | doesntRun | Test 18 | Its program needs a fixed load address and cannot load | Regression Timeline (Nov 21): log (fixed-base exe cannot load) | - | -
+steam:231430 | Company of Heroes 2 | iPad | runsWell | 0.2.25 | Runs | Regression Timeline (Nov 21): log 5825d1b5 | 0.2.25 | -
+steam:1671210 | DELTARUNE | iPhone | runsWithProblems | Wave 13 | Starts with a workaround | Regression Timeline (Nov 21): log (starts with workaround) | - | -
+steam:548430 | Deep Rock Galactic | iPhone | runsWell | 0.2.45 | DX11, played 3.5 minutes, "worked perfectly" | Regression Timeline (Nov 21): his report | 0.2.45 | -
+steam:1222140 | Detroit: Become Human | iPad | doesntRun | Test 18 | iOS closed Madeira | Regression Timeline (Nov 21): player log (iOS closed Madeira) | - | -
+steam:1239080 | Door Kickers 2 | iPad | runsWell | 0.2.25 | Works with the iPad's language set to English | Regression Timeline (Nov 21): his report (iPad set to English) | 0.2.25 | -
+steam:2135150 | Elin | unknown | startsOnly | 0.2.32 | Starts, then gets stuck | Regression Timeline (Nov 21): log 358ea59c | - | -
+steam:427520 | Factorio | unknown | runsWithProblems | Wave 13 | Runs, but the screen is almost black | Regression Timeline (Nov 21): his report | - | -
+steam:22380 | Fallout: New Vegas | iPhone | runsWell | 0.2.77 | Playable | his call Nov 21 (project memory): playable on 0.2.77 | 0.2.77 | -
+steam:3551340 | Football Manager 26 | iPad | doesntRun | 0.2.29 | Hangs on the last loading screen | Regression Timeline (Nov 21): player log | - | -
+steam:962130 | Grounded | unknown | runsWithProblems | Test 8 | Ran about 1 minute | Regression Timeline (Nov 21): his report | - | -
+steam:1030300 | Hollow Knight: Silksong | unknown | runsWell | Test 16 | Works; the controller works on 0.2.23 | Regression Timeline (Nov 21): his report ("Silksong works fine") | Test 16 | -
+steam:1092790 | Inscryption | iPhone | runsWithProblems | Wave 13 | Runs for a short time, then stops | Regression Timeline (Nov 21): log 1aca38e2 | - | -
+steam:8190 | Just Cause 2 | unknown | runsWithFixes | 0.2.23 | Works with its recommended settings | Regression Timeline (Nov 21): his report | 0.2.23 | -
+steam:2552450 | Kingdom Hearts III | unknown | runsWell | 0.2.0 | Works once the Steam library .vdf file was fixed (tester) | Regression Timeline (Nov 21): his report (tester, after fixed library vdf) | 0.2.0 | -
+steam:32440,title:lego star wars: the complete saga | LEGO Star Wars: The Complete Saga | unknown | runsWell | 0.2.55 | Works | Regression Timeline (Nov 21): his report (log confirms) | 0.2.55 | -
+steam:1966720 | Lethal Company | iPhone | runsWithProblems | Test 11 | Runs for a short time, then stops | Regression Timeline (Nov 21): log 63ac99f0 | - | -
+steam:860510 | Little Nightmares II | iPhone | runsWell | Test 8 | Runs | Regression Timeline (Nov 21): log b9587c8a | Test 8 | -
+steam:2357570,title:overwatch | Overwatch 2 | iPad | doesntRun | 0.2.70 | Dies about 20 s in | Regression Timeline (Nov 21): his report | - | -
+exe:plantsvszombiesrh.exe | Plants vs. Zombies Fusion | iPhone | startsOnly | Test 12 | Starts, then gets stuck | Regression Timeline (Nov 21): log 9e556cd0 | - | -
+steam:108600 | Project Zomboid | unknown | runsWithProblems | 0.2.70 | No crash with the new Java line; iOS memory is still a problem | Regression Timeline (Nov 21): his report | - | -
+steam:1196590 | Resident Evil Village | iPhone | runsWithFixes | 0.2.68 | The prologue video shows; add env.MADEIRA_WG_64BIT = 1 to its own config by hand | his report (project memory): prologue video shows, keep env.MADEIRA_WG_64BIT=1 | 0.2.68 | -
+steam:294100 | RimWorld | iPad | runsWell | 0.2.23 | Works after changing the resolution to 1920 | Regression Timeline (Nov 21): his report | 0.2.23 | -
+steam:632360 | Risk of Rain 2 | iPad | runsWithProblems | Wave 18 | Runs for a short time, then stops | Regression Timeline (Nov 21): log d1ee3851 | - | -
+steam:2868840,title:slay the spire 2 | Slay the Spire 2 | unknown | runsWithFixes | 0.2.70 | Works with its recommended settings | Regression Timeline (Nov 21): his report ("slay the spire works") | 0.2.70 | -
+steam:413150 | Stardew Valley | unknown | runsWithFixes | Wave 19 | Works with its recommended settings | Regression Timeline (Nov 21): his report | Wave 19 | -
+steam:1962700 | Subnautica 2 | iPhone | runsWithFixes | Test 12 | Runs with its recommended settings | Regression Timeline (Nov 21): log a892d342 | Test 12 | -
+steam:440 | Team Fortress 2 | unknown | runsWell | Test 16 | Works | Regression Timeline (Nov 21): his report ("Free game works") | Test 16 | -
+steam:1167630,title:teardown | Teardown | unknown | startsOnly | Test 8 | Starts, then gets stuck | Regression Timeline (Nov 21): log 1249a92b | - | -
+steam:641990,title:the escapists 2 | The Escapists 2 | iPad | runsWithFixes | Wave 17 | Runs with its recommended settings | Regression Timeline (Nov 21): log ec53c9fa | Wave 17 | -
+steam:391540 | Undertale | unknown | runsWell | Wave 13 | Works | Regression Timeline (Nov 21): log (cameron wave13) | Wave 13 | -
+title:vintage story | Vintage Story | iPhone | doesntRun | Wave 13 | Black screen | Regression Timeline (Nov 21): his report (black screen) | - | -
+
+# Lines the player adds by hand (Nov 22 2026, fix1): games rated runsWithFixes whose lines Madeira does not
+# add itself. Subnautica 2's title key was dropped: a title key only rates copies from outside Steam, and
+# Subnautica 2's list (GameRecommendations.swift) matches only the Steam program, so a copy from another
+# store would show Runs with fixes with no lines; its one row (log a892d342) does not say the store.
+hand | steam:1196590 | env.MADEIRA_WG_64BIT = 1 | his report (project memory): prologue video shows, keep env.MADEIRA_WG_64BIT=1
+hand | steam:1092790 | env.MADEIRA_NO_GL = 1 | INDEX-wave19.md:212 (tester confirmed)
+hand | title:satisfactory | pool-split = 1 | INDEX-wave19.md:139 + GameRecommendations.swift satisfactorySteam comment (the owner's Epic list, Wave 5)
+hand | title:satisfactory | env.MADEIRA_X64_IMAGE_NOCOPY = 1 | INDEX-wave19.md:139 + GameRecommendations.swift satisfactorySteam comment
+hand | title:satisfactory | env.MADEIRA_EC_HOOK_TRACE = 0 | INDEX-wave19.md:139 + GameRecommendations.swift satisfactorySteam comment
+hand | title:satisfactory | rp-carry = 1 | INDEX-wave19.md:139 + GameRecommendations.swift satisfactorySteam comment
+hand | title:satisfactory | rp-discard = 1 | INDEX-wave19.md:139 + GameRecommendations.swift satisfactorySteam comment
+
+# Nov 22 2026 "sync all" rows (run-status-sync-nov22; newer build wins over the older rows)
+steam:2357570,title:overwatch | Overwatch 2 | iPad | doesntRun | 0.2.84 | Old hang gone; stops about 64 s in (exit C00000E5) | log ow2-0.2.84-ipad-2026-11-22-61524411 (NtTerminateProcess 0xC00000E5) | - | -
+steam:311210 | Call of Duty: Black Ops III | unknown | startsOnly | 0.2.84 | Starts past Safe Mode, then runs out of memory space | memory bo3-nov22-walls (0.2.84 result 00:44 MT: MapPage again) | - | -
+steam:641990,title:the escapists 2 | The Escapists 2 | iPhone | runsWithFixes | 0.2.84 | Runs with its recommended settings (SMC hot page off): about 60 fps and a clean quit | log from 01:16 MT Nov 22 on iPhone, 0.2.84 (SWP traps 4.65M to 19, median 60 fps, clean quit) | - | -
+
+# Nov 22 2026 "sync all 2" rows (run-status-sync-nov22-2; newer build wins)
+steam:2357570,title:overwatch | Overwatch 2 | iPad | doesntRun | 0.2.88 | Closes during start-up (loader self-check) | log ow2-0.2.88-ipad-2026-11-22-1271b689 (same assert at loader+0x441960) | - | -
+steam:311210 | Call of Duty: Black Ops III | unknown | startsOnly | 0.2.88 | Loads past the memory error, then closes by itself about 28 s in | memory bo3-nov22-walls (0.2.88 11:20 MT: all 17 pools fit, exit 27.8 s) | - | -
+steam:641990,title:the escapists 2 | The Escapists 2 | unknown | runsWithFixes | 0.2.84 | Works with its recommended settings (0.2.86 and later add env.MADEIRA_SMC_HOT_PAGE = 0) | memory escapists2-mono-patch-loop-0.2.76 (log 640c1b1b: 60 fps, quit exit 0) | 0.2.84 | -

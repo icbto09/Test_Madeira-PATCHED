@@ -1,0 +1,91 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 0ea7176..78b6e9a 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -241,6 +241,12 @@ struct FrontendThreadData {
+   // the handler, so the DF in the context it continues with is real). Cleared by RaiseException (the unix syscall
+   // path masks bit 16) and consumed by SyncThreadContext.
+   bool IosDfDelivered {};
++  // madeira [pfaf-int3]: the PF/AF RaiseException (int3 / ud / single-step, the unix syscall path) delivered with the
++  // guest RIP/RSP it delivered them at. The unix frame drops CPSR bit 27 (AF), so ntdll asks for them here
++  // (BTCpu64IosRaisePfAf) while it builds the handler's context. Consumed by that call.
++  bool IosRaiseValid {};
++  uint32_t IosRaiseFlags {};
++  uint64_t IosRaisePc {}, IosRaiseSp {};
+ #endif
+ };
+ 
+@@ -634,6 +640,9 @@ uint32_t IosPfAfKeep = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+  * the unix path (RaiseException: int3, single-step, ud) bit 16 never reached the handler, so its context says DF=0
+  * whatever the code had, and the resume keeps the JIT state's DF as before. */
+ uint32_t IosDfCtx = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
++/* madeira [pfaf-int3] (env MADEIRA_EC_PFAF_INT3 = 0 turns it off; needs [pfaf-keep] on). rev=pfaf-int3-2. See
++ * RaiseException and BTCpu64IosRaisePfAf. */
++uint32_t IosPfAfInt3 = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+ #endif
+ 
+ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+@@ -959,6 +968,14 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+   }
+ 
+ #ifdef FEX_IOS_HOST
++  // madeira [pfaf-int3]: the handler's context gets PF from CPSR bit 26, but AF (bit 27) is masked out by the unix
++  // syscall frame (cpsr_user_mask). Keep the true PF/AF of this raise, with where it was raised, for ntdll to ask for.
++  if (auto* FTD = GetFrontendThreadData(Thread)) {
++    FTD->IosRaiseValid = Exception::IosPfAfKeep && Exception::IosPfAfInt3;
++    FTD->IosRaiseFlags = EFlags & ((1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC));
++    FTD->IosRaisePc = GuestContext.Pc;
++    FTD->IosRaiseSp = GuestContext.Sp;
++  }
+   IosAssertRecord(static_cast<uint32_t>(GuestRec.ExceptionCode), EFlags, RaiseLiveTF, GuestContext); // madeira [assert-dump-2]
+ #endif
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+@@ -1762,6 +1779,12 @@ NTSTATUS ProcessInit() {
+       Exception::IosDfCtx = 0;
+     }
+     LogMan::Msg::EFmt("[df-ctx] rev=df-ctx-1 xtajit64 {}", Exception::IosDfCtx ? "on" : "off (MADEIRA_EC_DF_CTX=0)");
++    const char* PfAfInt3 = getenv("MADEIRA_EC_PFAF_INT3"); // madeira [pfaf-int3]
++    if (PfAfInt3 && PfAfInt3[0] == '0' && PfAfInt3[1] == '\0') {
++      Exception::IosPfAfInt3 = 0;
++    }
++    LogMan::Msg::EFmt("[pfaf-int3] rev=pfaf-int3-2 xtajit64 {}",
++                      !Exception::IosPfAfKeep ? "off (MADEIRA_EC_PFAF_KEEP=0)" : Exception::IosPfAfInt3 ? "on" : "off (MADEIRA_EC_PFAF_INT3=0)");
+     const char* SectionViews = getenv("MADEIRA_EC_SECTION_VIEWS"); // madeira [section-views]
+     FEX_MadeiraSectionViews = (SectionViews && SectionViews[0] == '0') ? 0 : 1;
+     const char* JitInval = getenv("MADEIRA_EC_JIT_INVAL"); // madeira [jit-inval]
+@@ -2983,6 +3006,23 @@ extern "C" uint32_t BTCpu64IosGuestContext(void* Teb, ARM64_NT_CONTEXT* Context,
+   return 1;
+ }
+ 
++/* madeira [pfaf-int3] rev=pfaf-int3-2. Ours. ntdll's prepare_exception_arm64ec calls this for the context it is
++ * about to hand the guest's exception handlers. When the exception is the one RaiseException last raised on this
++ * thread (same guest RIP and RSP), returns 0x100 | its x86 PF (bit 2) and AF (bit 4); else 0. Either way the saved
++ * value is used up, so it can never be applied to a later exception. */
++extern "C" uint32_t BTCpu64IosRaisePfAf(uint64_t Pc, uint64_t Sp) {
++  auto* Thread = GetCPUArea().ThreadState();
++  auto* FTD = Thread ? GetFrontendThreadData(Thread) : nullptr;
++  if (!FTD || !FTD->IosRaiseValid) {
++    return 0;
++  }
++  FTD->IosRaiseValid = false;
++  if (FTD->IosRaisePc != Pc || FTD->IosRaiseSp != Sp) {
++    return 0;
++  }
++  return 0x100 | FTD->IosRaiseFlags;
++}
++
+ /* madeira [dr-pass] (env MADEIRA_EC_DEBUG_REGS = 0 turns it off; ntdll reads the same switch and
+  * then never calls this). rev=dr-pass-1.
+  *
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+index 89358c8..0d65f3b 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+@@ -9,6 +9,7 @@ EXPORTS
+   BTCpu64IosCrashMailerData
+   BTCpu64IosDebugRegs
+   BTCpu64IosGuestContext
++  BTCpu64IosRaisePfAf
+   BTCpu64IosRipFromHostPC
+   BTCpu64IosSetMonoBridge
+   BTCpu64IosReleaseThreadHolds

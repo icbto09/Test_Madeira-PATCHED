@@ -125,6 +125,7 @@ enum CrashReportsCore {
     struct Details: Equatable {
         var kind: String              // "crash" or "hang"
         var appVersion: String        // the build's own stamp (BuildStamp.text)
+        var playerID: String = ""     // (player-id) the short code from Settings; empty when switched off
         var build: String
         var bundle: String
         var device: String
@@ -160,6 +161,7 @@ enum CrashReportsCore {
         var lines = [first,
                      "App: \(d.appVersion), build \(d.build) (\(d.bundle))",
                      "Device: \(d.device), \(d.os)"]
+        if !d.playerID.isEmpty { lines.append("Player ID: \(d.playerID)") }
         if !d.reportBuild.isEmpty, d.reportBuild != d.build {
             lines.append("The report is about build \(d.reportBuild), an earlier copy of Madeira: the names beside the frames are left out.")
         }

@@ -329,6 +329,48 @@ check(bepConfig == ModConfigLines.note + "\nenv.WINEDLLOVERRIDES = winhttp=n,b\n
 try! bepStore.disable(bepMod.id)
 check(bepConfig == "", "and loses it again")
 
+// MARK: 5b. The one-tap BepInEx card: the pin, the hash check, Remove
+
+check(SHA256Hasher.hex(of: Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 of abc")
+check(SHA256Hasher.hex(of: Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA-256 of nothing")
+check(SHA256Hasher.hex(of: Data("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".utf8)) == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "SHA-256 of a two-block message")
+check(SHA256Hasher.hex(of: Data(repeating: 0x61, count: 1_000_000)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "SHA-256 of a million a")
+let bigFile = scratch.appendingPathComponent("big.bin")
+let bigData = Data((0..<2_500_000).map { UInt8(truncatingIfNeeded: $0 % 251) })
+write(bigData, bigFile)
+check((try? SHA256Hasher.hex(ofFile: bigFile)) == SHA256Hasher.hex(of: bigData), "a file over 1 MB reads in pieces to the same digest")
+
+check(BepInExLoader.url.scheme == "https" && BepInExLoader.url.host == "github.com" && BepInExLoader.url.path.contains("/BepInEx/BepInEx/releases/download/v\(BepInExLoader.version)/"),
+      "the pin is an https github.com BepInEx release URL")
+check(BepInExLoader.url.lastPathComponent == "BepInEx_win_x64_\(BepInExLoader.version).zip", "the pin is the win x64 zip of that version")
+check(BepInExLoader.sha256.count == 64 && BepInExLoader.sha256.allSatisfy { "0123456789abcdef".contains($0) } && BepInExLoader.bytes > 100_000, "a real sha256 and size are pinned")
+
+let pinFile = scratch.appendingPathComponent("pin.zip")
+write("not the real release", pinFile)
+let pinData = Data("not the real release".utf8)
+check((try? BepInExLoader.verify(pinFile, bytes: Int64(pinData.count), sha256: SHA256Hasher.hex(of: pinData))) != nil, "verify: the right size and hash pass")
+check((try? BepInExLoader.verify(pinFile, bytes: Int64(pinData.count), sha256: String(repeating: "0", count: 64))) == nil, "verify: a wrong hash is refused")
+check((try? BepInExLoader.verify(pinFile, bytes: Int64(pinData.count) + 1, sha256: SHA256Hasher.hex(of: pinData))) == nil, "verify: a wrong size is refused")
+check((try? BepInExLoader.verify(pinFile)) == nil, "verify: a file that is not the pinned release is refused")
+check((try? BepInExLoader.verify(scratch.appendingPathComponent("missing.zip"))) == nil, "verify: a missing file is refused")
+do { try BepInExLoader.verify(pinFile) } catch { check((error as? ModError) == .bepinexHash, "verify: the error is the plain hash error") }
+
+check(BepInExLoader.isLoader(bepMod) && BepInExLoader.loader(in: [bepMod]) != nil, "the card finds the BepInEx mod it installed")
+var notLoader = bepMod
+notLoader.name = "Some plugin"
+check(!BepInExLoader.isLoader(notLoader) && BepInExLoader.loader(in: [notLoader]) == nil, "a plugin mod with BepInEx files is not the loader")
+notLoader = bepMod
+notLoader.kind = .plain
+check(!BepInExLoader.isLoader(notLoader), "a plain mod named BepInEx is not the loader")
+
+bepConfig = "env.WINEDLLOVERRIDES = video64=\nfps = 60\n"
+let bepBefore = snapshot(bepGame)
+try! bepStore.enable(bepMod.id)
+check(read(bepGame.appendingPathComponent("BepInEx/core/BepInEx.dll")) == "core" && read(bepGame.appendingPathComponent("winhttp.dll")) == "loader", "the card's install puts the loader in the game's folder")
+try! bepStore.remove(bepMod.id)
+check(snapshot(bepGame) == bepBefore && bepConfig == "env.WINEDLLOVERRIDES = video64=\nfps = 60\n" && !bepStore.mods.contains(where: BepInExLoader.isLoader),
+      "Remove leaves the game's folder and config byte for byte as they were")
+
 // MARK: 6. plugins.txt for the newer games, and .ini edits
 
 let sse = PluginsTxt.adding(["MyMod.esp", "MyMaster.esm"], to: "# This file is used by Skyrim to keep track of your downloaded content.\r\n*Unofficial.esp\r\n", game: .skyrimSE)

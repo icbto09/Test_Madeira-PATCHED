@@ -434,10 +434,13 @@ struct WineMonoSettingsSection: View {
             if !WineMonoModel.bundled && !mono.busy {
                 if mono.installed {
                     Button("Remove Wine Mono", role: .destructive) { confirmRemove = true }
+                        .padRow("rt-mono-remove") { confirmRemove = true }
                 } else {
                     Button { mono.install() } label: {
                         Label(mono.error == nil ? "Download Wine Mono" : "Try Again", systemImage: "arrow.down.circle")
                     }
+                    .padRow("rt-mono-install") { mono.install() }
+
                 }
             }
         } header: {

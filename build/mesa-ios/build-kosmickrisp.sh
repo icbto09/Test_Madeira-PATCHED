@@ -11,8 +11,8 @@
 # Step 1 builds them natively (Linux or macOS), step 2 cross-compiles the
 # driver with -Dmesa-clc=system -Dprecomp-compiler=system.
 #
-# Source: Mesa 26.2.4 (https://archive.mesa3d.org/mesa-26.2.4.tar.xz, sha256
-# bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9), with
+# Source: Mesa 26.3.1 (https://archive.mesa3d.org/mesa-26.3.1.tar.xz, sha256
+# 4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961), with
 # build/mesa-ios/patches/kosmickrisp-ios-*.patch applied (MIT, like Mesa).
 #
 # Build-machine needs: meson >= 1.9.1, ninja, python3 with mako/pyyaml/packaging,
@@ -25,17 +25,20 @@ set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$R/build/mesa-ios"
 WORK="${KK_WORK:-$HOME/.cache/mesa-kk}"
-SRC="${KK_MESA_SRC:-$WORK/mesa-26.2.4}"
-NATIVE="$WORK/build-native"
-TOOLS="$WORK/host-tools"
-B="$WORK/build-ios"
+SRC="${KK_MESA_SRC:-$WORK/mesa-26.3.1}"
+# Build dirs are per Mesa version: the host tools (kk_clc etc.) and meson
+# setups of one version must not be reused for another.
+V="$(basename "$SRC")"
+NATIVE="$WORK/build-native-$V"
+TOOLS="$WORK/host-tools-$V"
+B="$WORK/build-ios-$V"
 OUT="${KK_OUT:-$WORK/out}"
 LLVM_CONFIG="${KK_LLVM_CONFIG:-llvm-config}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 
 if [ ! -f "$SRC/src/kosmickrisp/meson.build" ]; then
     echo "Mesa >= 25.3 source not found at $SRC" >&2
-    echo "  curl -LO https://archive.mesa3d.org/mesa-26.2.4.tar.xz && tar -xf mesa-26.2.4.tar.xz -C \"$WORK\"" >&2
+    echo "  curl -LO https://archive.mesa3d.org/mesa-26.3.1.tar.xz && tar -xf mesa-26.3.1.tar.xz -C \"$WORK\"" >&2
     exit 1
 fi
 
@@ -90,7 +93,7 @@ if [ ! -f "$B/build.ninja" ]; then
         -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
         -Dglx=disabled -Degl=disabled -Dgbm=disabled \
         -Dllvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system \
-        -Dshader-cache=disabled -Dxmlconfig=disabled \
+        -Dshader-cache=enabled -Dxmlconfig=disabled \
         -Dzstd=disabled -Dlibunwind=disabled -Dvalgrind=disabled -Dlmsensors=disabled \
         -Dexpat=disabled -Dbuild-tests=false -Dvideo-codecs= \
         -Dvulkan-icd-dir=share/vulkan/icd.d
@@ -99,7 +102,10 @@ ninja -C "$B" src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib
 
 mkdir -p "$OUT"
 cp "$B/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib" "$OUT/libvulkan_kosmickrisp.dylib"
-install_name_tool -id @rpath/libvulkan_kosmickrisp.dylib "$OUT/libvulkan_kosmickrisp.dylib"
-xcrun -sdk iphoneos strip -x "$OUT/libvulkan_kosmickrisp.dylib"
+# No install_name_tool / strip afterwards: the link already sets the @rpath id (local symbols stay;
+# about 0.5 MB). llvm-install-name-tool and llvm-strip (LLVM 21) rewrite
+# __LINKEDIT without padding the string table to 8 bytes; dyld refuses such a dylib ("mis-aligned
+# LINKEDIT string pool"), which broke 0.2.97's driver. Refuse any output dyld would refuse.
+python3 "$HERE/check-linkedit-align.py" "$OUT/libvulkan_kosmickrisp.dylib"
 echo "$(basename "$SRC")" > "$OUT/libvulkan_kosmickrisp.version"
 ls -l "$OUT"

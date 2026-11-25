@@ -83,6 +83,18 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 Value,
                                                  HANDLE Event) final {
+    // Ported from Mullion 469787d and its null-event wait (LGPL-2.1+). Off: MADEIRA_DXMT_MULLION_FENCE_EVENT=0.
+    // A null event blocks until the value (as ID3D12Fence's does); a value the event already has raises the
+    // event at once, as Windows does, instead of waiting for Metal's listener to call back.
+    static const bool fence_event_fix = mullionFix("FENCE_EVENT");
+    if (fence_event_fix) {
+      if (!Event)
+        return event.waitUntilSignaledValue(Value, ~0ull) ? S_OK : E_FAIL;
+      if (Value <= event.signaledValue()) {
+        SetEvent(Event);
+        return S_OK;
+      }
+    }
     auto shared_event_listener = this->m_parent->GetDXMTDevice().queue().GetSharedEventListener();
     /* ml805: trace the fence path so its SILENCE is evidence.
      *
@@ -144,7 +156,7 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
     }
   }
   event.signalValue(InitialValue);
-  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt);
+  auto fence = Com(new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt));
   return fence->QueryInterface(riid, ppFence);
 }
 
@@ -194,10 +206,10 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
     return E_INVALIDARG;
   }
 
-  auto fence = new MTLD3D11FenceImpl(
+  auto fence = Com(new MTLD3D11FenceImpl(
       pDevice,
       pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port),
-      open.hSyncObject);
+      open.hSyncObject));
   return fence->QueryInterface(riid, ppFence);
 }
 

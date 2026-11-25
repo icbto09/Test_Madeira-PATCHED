@@ -34,6 +34,7 @@
 //
 
 import SwiftUI
+import CryptoKit
 import UIKit
 
 enum GetHelp {
@@ -43,6 +44,9 @@ enum GetHelp {
     /// The "<game> Stopped. Get Help?" offer in the library after a game stopped by itself or Madeira
     /// closed while it ran. 0 hides only the offer.
     static let offers = MadeiraConfig.flag("MADEIRA_GET_HELP_OFFER")
+    /// (rate-after-run) The one-tap "How did <game> go?" card after a clean run of 60 s or more.
+    /// env.MADEIRA_RATE_PROMPT = 0: the card never shows and nothing is recorded or sent.
+    static let rateEnabled = MadeiraConfig.flag("MADEIRA_RATE_PROMPT") && enabled
 
     /// The key the server asks for, from the build's Info.plist; nil when the build has none.
     static var key: String? {
@@ -60,6 +64,24 @@ enum GetHelp {
         defaults.set(id, forKey: "get-help-install-id")
         return id
     }
+    // MARK: Player ID (player-id)
+    /// Off switch: `env.MADEIRA_PLAYER_ID = 0` in madeira.cfg hides the ID and stops sending it.
+    static var playerIDOn: Bool { MadeiraConfig.flag("MADEIRA_PLAYER_ID") }
+    private static let idAlphabet = Array("23456789ABCDEFGHJKMNPQRSTUVWXYZ")   // no 0 O 1 I L
+    /// A short code a player can read out ("MD-7K3F-Q2"), made from the random install id above:
+    /// no hardware identifier, so it is not tied to the device or a person. nil when switched off.
+    static var playerID: String? {
+        guard playerIDOn, let u = UUID(uuidString: installID)?.uuid else { return nil }
+        let bytes = [u.0, u.1, u.2, u.3, u.4, u.5]
+        let c = bytes.map { idAlphabet[Int($0) % idAlphabet.count] }
+        return "MD-" + String(c[0...3]) + "-" + String(c[4...5])
+    }
+    /// The Reset ID button is hidden (Cameron: players would press it over and over);
+    /// `env.MADEIRA_PLAYER_ID_RESET = 1` in madeira.cfg brings it back.
+    static var playerResetOn: Bool { MadeiraConfig.flag("MADEIRA_PLAYER_ID_RESET", fallback: false) }
+    /// Reset ID: a fresh install id, so the short code changes with it.
+    static func resetPlayerID() { defaults.set(UUID().uuidString, forKey: "get-help-install-id") }
+
     /// The player has seen what Get Help sends, and that reports are kept (keep-reports-30:
     /// a new key, so players who agreed to the old "only if ticked" screen see it once more).
     static var consented: Bool {
@@ -83,7 +105,7 @@ enum GetHelp {
         let fm = FileManager.default
         guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return ("", false) }
         let log = ClaudeHelp.logFor(title: title, in: docs).map(HelpReport.read)
-        let cfg = try? String(contentsOf: docs.appendingPathComponent(MadeiraConfig.fileName), encoding: .utf8)
+        let cfg = MadeiraConfig.readText(docs.appendingPathComponent(MadeiraConfig.fileName))  // [cfg-lossy-help] upstream PR 629
         var text = HelpReport.text(build: BuildStamp.text, device: device, log: log, game: game, cfg: cfg, title: title)
         if let shown, !shown.isEmpty {
             text = "## What Madeira showed the player\n" + PrivacyScrub.text(shown) + "\n\n" + text
@@ -97,7 +119,8 @@ enum GetHelp {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         return GetHelpFiles.Places(
             steamRoot: MadeiraDock.clientRoot,
-            gameFolder: entry.flatMap { GetHelpFiles.gameFolder(drive: LibraryModel.drive, relativePath: $0.relativePath) },
+            gameFolder: entry.flatMap { GetHelpFiles.gameFolder(drive: LibraryModel.drive, relativePath: $0.relativePath,
+                                                                ownFolder: MadeiraConfig.flag("MADEIRA_GET_HELP_OWN_FOLDER")) },
             runLog: { docs.flatMap { ClaudeHelp.gameRunLog(title: title, in: $0) } },
             hasRun: hasRun)
     }
@@ -248,27 +271,47 @@ enum GetHelp {
 
     /// Adds the lines to the game's own config (and, get-help-steam-starts, sets Madeira Dock's
     /// "Steam starts" for Steam game `steamApp`) and keeps what Undo needs.
+    /// `source` (auto-tune-writer): Get Help, or auto-tune for one rule. Both go through here, so they share one record:
+    /// auto-tune never sets a key Get Help set, and Get Help's lines first take out an auto-tune block with the same key.
     static func apply(_ lines: [GetHelpCore.ConfigLine], steamStarts program: String? = nil, steamApp: Int? = nil,
-                      windowsPath: String, title: String) -> Applied {
+                      windowsPath: String, title: String, source: GetHelpCore.Source = .getHelp) -> Applied {
         let file = GameProfile(windowsPath: windowsPath)
         let date = Date().formatted(date: .abbreviated, time: .shortened)
-        let change = lines.isEmpty ? nil : GetHelpCore.apply(lines, to: file.text, date: date)
-        if let change {
-            file.text = change.text
-            guard file.text == change.text else {
-                LogStore.shared.log("[get-help] apply: could not write \(title)'s config", level: .error)
+        let tag = source.isAutoTune ? "[auto-tune]" : "[get-help]"
+        var record = Self.record(windowsPath) ?? GetHelpCore.Record(game: title, date: date, added: [])
+        let conflicts = GetHelpCore.conflicts(lines, source: source, record: Self.record(windowsPath))
+        var lines = lines
+        if !conflicts.dropKeys.isEmpty {
+            lines.removeAll { conflicts.dropKeys.contains($0.key.trimmingCharacters(in: .whitespaces)) }
+            LogStore.shared.log("\(tag) apply: left out \(conflicts.dropKeys.sorted().joined(separator: ", ")) for \(title): Get Help set it")
+        }
+        var text = file.text
+        if !conflicts.autoTuneBlocks.isEmpty {
+            let picked = conflicts.autoTuneBlocks
+            let removed = GetHelpCore.removing({ picked.contains($0) }, from: record)
+            text = GetHelpCore.undo(blocks: GetHelpCore.blocks(of: record), picked: { picked.contains($0) }, from: text)
+            record = removed.record ?? GetHelpCore.Record(game: title, date: date, added: [])
+            LogStore.shared.log("[get-help] apply: took out \(picked.count) auto-tune block(s) for \(title) that set the same setting(s)")
+        }
+        let change = lines.isEmpty ? nil : GetHelpCore.apply(lines, to: text, date: date, source: source)
+        if let change { text = change.text }
+        if text != file.text {
+            file.text = text
+            guard file.text == text else {
+                LogStore.shared.log("\(tag) apply: could not write \(title)'s config", level: .error)
                 return .failed
             }
         }
-        var record = Self.record(windowsPath) ?? GetHelpCore.Record(game: title, date: date, added: [])
         var count = 0
         if let change {
-            record.added += change.added
+            record = GetHelpCore.adding(change.added, source: source, date: date, to: record)
             let keys = change.added.filter { !$0.hasPrefix("#") }
             count += keys.count
-            LogStore.shared.log("[get-help] applied \(keys.count) line(s) to \(title)'s config: \(keys.joined(separator: "; "))")
+            LogStore.shared.log("\(tag) applied \(keys.count) line(s) to \(title)'s config: \(keys.joined(separator: "; "))")
         }
-        if let program, let steamApp, DockStartProgram.chosen(steamApp) != program {
+        if program != nil, steamApp != nil, source.isAutoTune {
+            LogStore.shared.log("[auto-tune] apply: Steam starts is Get Help's only; left as it is for \(title)")
+        } else if let program, let steamApp, DockStartProgram.chosen(steamApp) != program {
             let before = DockStartProgram.chosen(steamApp)
             DockStartProgram.setChosen(steamApp, program)
             // A second Apply keeps the choice from before the first, so Undo goes all the way back.
@@ -278,7 +321,8 @@ enum GetHelp {
             LogStore.shared.log("[get-help] applied Steam starts = \(program) to \(title) (app=\(steamApp), was \(before ?? "steam"))")
         }
         guard count > 0 else {
-            LogStore.shared.log("[get-help] apply: \(title) already has these setting(s)")
+            if !conflicts.autoTuneBlocks.isEmpty { save(record.added.isEmpty && record.steamStarts == nil ? nil : record, windowsPath) }
+            LogStore.shared.log("\(tag) apply: \(title) already has these setting(s)")
             return .already
         }
         record.date = date
@@ -286,13 +330,47 @@ enum GetHelp {
         return .added(count)
     }
 
-    /// Takes the lines Get Help added out of the game's config again.
+    /// (auto-tune-writer) Whether Get Help has lines (or a Steam starts choice) in this game's record.
+    static func hasGetHelp(_ record: GetHelpCore.Record) -> Bool {
+        record.steamStarts != nil || GetHelpCore.blocks(of: record).contains { !GetHelpCore.Source(tag: $0.source).isAutoTune }
+    }
+
+    /// (auto-tune-writer) When Get Help last added lines (for the Undo Get Help footer), else the record's date.
+    static func getHelpDate(_ record: GetHelpCore.Record) -> String {
+        GetHelpCore.blocks(of: record).last { !GetHelpCore.Source(tag: $0.source).isAutoTune }?.date ?? record.date
+    }
+
+    /// (auto-tune-writer) Takes auto-tune's lines out again: the newest block of `rule`, or every auto-tune block
+    /// when `rule` is nil. Get Help's lines stay. False when there was nothing to take out.
+    @discardableResult
+    static func undoAutoTune(windowsPath: String, title: String, rule: String? = nil) -> Bool {
+        guard let record = record(windowsPath) else { return false }
+        let all = GetHelpCore.blocks(of: record)
+        let mine = all.indices.filter {
+            let s = GetHelpCore.Source(tag: all[$0].source)
+            return s.isAutoTune && (rule == nil || s == .autoTune(rule!))
+        }
+        // By position: the newest block of the rule only, even when an older one looks the same.
+        let picked = Set(rule == nil ? mine : Array(mine.suffix(1)))
+        guard !picked.isEmpty else { return false }
+        let removed = GetHelpCore.removing(at: picked, from: record)
+        let file = GameProfile(windowsPath: windowsPath)
+        file.text = GetHelpCore.undo(blocks: all, pickedAt: { picked.contains($0) }, from: file.text)
+        save(removed.record, windowsPath)
+        LogStore.shared.log("[auto-tune] undo: took \(removed.lines.filter { !$0.hasPrefix("#") }.count) line(s) out of \(title)'s config")
+        return true
+    }
+
+    /// Takes the lines Get Help added out of the game's config again (auto-tune's lines stay).
     @discardableResult
     static func undo(windowsPath: String, title: String) -> Bool {
-        guard let record = record(windowsPath) else { return false }
+        guard let full = record(windowsPath) else { return false }
+        let isHelp: (GetHelpCore.Record.Block) -> Bool = { !GetHelpCore.Source(tag: $0.source).isAutoTune }
+        let split = GetHelpCore.removing(isHelp, from: full)
+        let record = GetHelpCore.Record(game: full.game, date: full.date, added: split.lines, steamStarts: full.steamStarts)
         if !record.added.isEmpty {
             let file = GameProfile(windowsPath: windowsPath)
-            file.text = GetHelpCore.undo(record.added, from: file.text)
+            file.text = GetHelpCore.undo(blocks: GetHelpCore.blocks(of: full), picked: isHelp, from: file.text)
         }
         // (get-help-steam-starts) "Steam starts" goes back, unless the player picked another program since.
         if let s = record.steamStarts {
@@ -304,7 +382,10 @@ enum GetHelp {
                 LogStore.shared.log("[get-help] undo: Steam starts left at \(current ?? "steam") for \(title): changed since Get Help set it")
             }
         }
-        save(nil, windowsPath)
+        // Auto-tune's blocks stay in the record; Steam starts went back above.
+        var left = split.record
+        left?.steamStarts = nil
+        save(left.flatMap { $0.added.isEmpty ? nil : $0 }, windowsPath)
         stopWatching(windowsPath)
         LogStore.shared.log("[get-help] undo: took \(record.added.filter { !$0.hasPrefix("#") }.count) line(s) out of \(title)'s config")
         return true
@@ -386,6 +467,68 @@ struct GetHelpTarget: Identifiable, Equatable {
     @Published var fixAsk: FixAsk?
     /// (works-now) "Does <game> work now?" after a good play of a game with a report.
     @Published var worksAsk: GetHelp.Reported?
+    /// (rate-after-run) "How did <game> go?" card.
+    @Published var rateAsk: RateAsk?
+    struct RateAsk: Identifiable, Equatable {
+        let id = UUID()
+        var title: String
+        var windowsPath: String
+        var steamApp: Int?
+        var seconds: Double
+    }
+
+    /// (rate-after-run) From LogTrail's [game-end], only for a CLEAN run: the player quit it or it ended
+    /// with exit code 0, a window showed, and no Windows error. Never after a crash or failed start
+    /// (the "<game> Stopped" offer and Get Help's auto-open own those). Runs after gameFinished (same
+    /// queue), so a "Did the fix work?" / "Does it work now?" alert that was just set wins: no second ask.
+    /// 60 s or more, once per game per day.
+    nonisolated static func ratePrompt(title: String, windowsPath: String?, seconds: Double) {
+        guard GetHelp.rateEnabled, let windowsPath, seconds >= 60 else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                guard shared.fixAsk == nil, shared.worksAsk == nil, shared.offer == nil,
+                      shared.open == nil, shared.startOpen == nil, shared.rateAsk == nil else { return }
+                let key = "rate.asked." + windowsPath
+                let last = UserDefaults.standard.double(forKey: key)
+                guard Date().timeIntervalSince1970 - last > 86_400 else { return }
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: key)
+                let entry = LibraryModel.shared.entries.first { $0.windowsPath == windowsPath }
+                shared.rateAsk = RateAsk(title: title, windowsPath: windowsPath, steamApp: entry?.steamAppID, seconds: seconds)
+                LogStore.shared.log("[rate] ask: \(title), ran \(Int(seconds)) s")
+            }
+        }
+    }
+
+    /// (rate-after-run) The answer: "worked" or "problems" (with the chips), or nil = skipped / timed out.
+    /// Appended to Documents/run-history/answers.txt (tab-separated, scrubbed, newest 300 lines) and
+    /// POSTed to /rate. Nothing personal: game title, Steam app id, build, device model, answer, chips,
+    /// seconds, a short hash of the game's own config. No name, no path, no log.
+    @MainActor func answerRate(_ ask: RateAsk, answer: String?, problems: [String]) {
+        guard rateAsk?.id == ask.id else { return }
+        rateAsk = nil
+        guard let answer else { LogStore.shared.log("[rate] skipped: \(ask.title)"); return }
+        let cfg = GameProfile(windowsPath: ask.windowsPath).text
+        let hash = SHA256.hash(data: Data(cfg.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+        let fields: [String] = [ISO8601DateFormatter().string(from: Date()), BuildStamp.text, LogRuns.device, ask.title,
+                                ask.steamApp.map(String.init) ?? "", answer, problems.joined(separator: ","),
+                                String(Int(ask.seconds)), hash]
+        LogStore.shared.log("[rate] \(ask.title): \(answer)\(problems.isEmpty ? "" : " (" + problems.joined(separator: ", ") + ")"), ran \(Int(ask.seconds)) s, config \(hash)")
+        if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let dir = docs.appendingPathComponent("run-history", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let file = dir.appendingPathComponent("answers.txt")
+            let line = PrivacyScrub.line(fields.map { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }.joined(separator: "\t"))
+            var lines = ((try? String(contentsOf: file, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+            lines.append(line)
+            try? (lines.suffix(300).joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        }
+        guard let key = GetHelp.key else { return }
+        let body: [String: Any] = ["game": ask.title, "steam_app": ask.steamApp.map { $0 as Any } ?? NSNull(), "answer": answer,
+                                   "problems": problems, "ran_seconds": Int(ask.seconds), "build": BuildStamp.text,
+                                   "device": LogRuns.device, "config_hash": hash]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        URLSession.shared.dataTask(with: GetHelpCore.urlRequest("rate", key: key, body: data)) { _, _, _ in }.resume()
+    }
     struct FixAsk: Identifiable, Equatable {
         var check: GetHelp.FixCheck
         var seconds: Double
@@ -422,8 +565,93 @@ struct GetHelpTarget: Identifiable, Equatable {
     }
 }
 
+/// (rate-after-run) "How did <game> go?": Worked / Problems / Skip, then optional chips. Never blocks:
+/// no alert, gone by itself after 20 s. Controller: A = Worked (or Send), X = Problems, B = Skip.
+/// (stock-apple-stage4) The rate card's buttons: Apple's .borderedProminent tinted, or .bordered.
+struct StockRateButton: ViewModifier {
+    let prominent: Bool
+    let color: Color
+    @ViewBuilder func body(content: Content) -> some View {
+        if prominent { content.buttonStyle(.borderedProminent).tint(color) } else { content.buttonStyle(.bordered) }
+    }
+}
+
+struct RateCard: View {
+    let ask: GetHelpCenter.RateAsk
+    @State private var choosing = false
+    @State private var picked: Set<String> = []
+    private static let chips = ["Crashed", "Black screen", "Too slow", "No sound", "Controls", "Won't start"]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(choosing ? L("What went wrong?") : String(format: L("How did %@ go?"), ask.title)).font(.headline)
+            if choosing {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 8)], alignment: .leading, spacing: 8) {
+                    ForEach(Self.chips, id: \.self) { chip in
+                        if StockApple.stage4 {
+                            // (stock-apple-stage4) Apple's bordered capsule; a picked one is filled.
+                            let on = picked.contains(chip)
+                            Button { if on { picked.remove(chip) } else { picked.insert(chip) } } label: {
+                                Text(L(chip)).font(.subheadline)
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .modifier(StockRateButton(prominent: on, color: .orange))
+                            .buttonBorderShape(.capsule)
+                            .accessibilityAddTraits(on ? .isSelected : [])
+                        } else {
+                        Button { if picked.contains(chip) { picked.remove(chip) } else { picked.insert(chip) } } label: {
+                            Text(L(chip)).font(.subheadline).padding(.horizontal, 12).padding(.vertical, 7)
+                                .background(picked.contains(chip) ? Color.orange : Color.gray.opacity(0.35), in: Capsule())
+                        }.buttonStyle(.plain)
+                        }
+                    }
+                }
+                HStack(spacing: 8) {
+                    button(L("Send"), .orange, prominent: true) { send("problems") }
+                    button(L("Skip"), .gray) { send(nil) }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    button(L("Worked"), .green, prominent: true) { send("worked") }
+                    button(L("Problems"), .orange, prominent: true) { choosing = true }
+                    button(L("Skip"), .gray) { send(nil) }
+                }
+            }
+        }
+        .padding(16)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22))
+        .task(id: "\(ask.id)\(choosing)\(picked.count)") {
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            if !Task.isCancelled { send(nil) }
+        }
+        // The controller through PadHighlight's layer (its own onReceive would also let the library act on the press).
+        .modifier(PadLayerModifier(name: "rate-card", back: { send(nil) },
+                                   play: { if choosing { send("problems") } else { choosing = true } },
+                                   accept: { send(choosing ? "problems" : "worked") }))
+    }
+    @ViewBuilder private func button(_ title: String, _ color: Color, prominent: Bool = false, _ action: @escaping () -> Void) -> some View {
+        if StockApple.stage4 {
+            // (stock-apple-stage4) Apple's buttons: the answer in its color as a prominent button, Skip plain bordered.
+            Button(action: action) {
+                Text(title).font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity)
+            }
+            .modifier(StockRateButton(prominent: prominent, color: color))
+            .controlSize(.large)
+        } else {
+        Button(action: action) {
+            Text(title).font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).padding(.vertical, 11)
+                .background(color.opacity(0.85), in: RoundedRectangle(cornerRadius: 14))
+        }.buttonStyle(.plain)
+        }
+    }
+    private func send(_ answer: String?) {
+        GetHelpCenter.shared.answerRate(ask, answer: answer, problems: answer == "problems" ? Self.chips.filter(picked.contains) : [])
+    }
+}
+
 /// The library's offer: an alert once the library shows, then the sheet; and Play Again.
 struct GetHelpOffer: ViewModifier {
+    /// iOS Reduce Motion: the one-tap card fades in instead of sliding up (env.MADEIRA_REDUCE_MOTION = 0 restores the slide).
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// LibraryView.play: Play Again in the sheet starts the game through the usual Play.
     var play: (LibraryEntry) -> Void = { _ in }
     @ObservedObject private var center = GetHelpCenter.shared
@@ -474,6 +702,15 @@ struct GetHelpOffer: ViewModifier {
                         Text("Get Help looked at this game before. If it runs well now, Yes sends its last run's logs, with personal details taken out, so the team can see what fixed it.")
                     }
             }
+            // (rate-after-run) The one-tap card. Hidden while any Get Help alert, sheet or error shows.
+            .overlay(alignment: .bottom) {
+                if let ask = center.rateAsk, center.offer == nil, center.fixAsk == nil, center.worksAsk == nil,
+                   model.error == nil, model.current == nil, center.open == nil, center.startOpen == nil {
+                    RateCard(ask: ask).padding(.horizontal, 14).padding(.bottom, 24)
+                        .transition(reduceMotion && MadeiraConfig.flag("MADEIRA_REDUCE_MOTION") ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: center.rateAsk)
             .sheet(item: $center.open, onDismiss: startPlayAgain) { target in
                 GetHelpSheet(target: target)
                     .modifier(ClaimGamepadEvents())
@@ -591,7 +828,7 @@ struct GetHelpUndoSection: View {
     @State private var undoCount = 0
     var body: some View {
         let _ = undoCount
-        if let record = GetHelp.record(windowsPath) {
+        if let record = GetHelp.record(windowsPath), GetHelp.hasGetHelp(record) {
             Section {
                 Button("Undo Get Help", systemImage: "arrow.uturn.backward") {
                     GetHelp.undo(windowsPath: windowsPath, title: title)
@@ -599,7 +836,7 @@ struct GetHelpUndoSection: View {
                     undone()
                 }
             } footer: {
-                Text(String(format: L("Takes out the settings Get Help added to this game on %@."), record.date))
+                Text(String(format: L("Takes out the settings Get Help added to this game on %@."), GetHelp.getHelpDate(record)))
             }
         }
     }
@@ -647,7 +884,8 @@ enum DiscordLog {
     static let madeiraShare = 2 * 1024 * 1024
 
     /// Writes the report and the full log to a temporary "<game> log.txt". Off the main thread.
-    static func file(title: String?, report: String) -> URL? {
+    /// `gameFolder` (share-game-logs): the game (library path, program, other games), for its own log files (GameOwnLogs, LogsView.swift).
+    static func file(title: String?, report: String, gameFolder: GameOwnLogs.Game? = nil) -> URL? {
         let safe = (title ?? "Madeira").map { "/\\:?*\"<>|".contains($0) ? "-" : $0 }
         let name = String(String(safe).prefix(60)).trimmingCharacters(in: .whitespaces) + " log.txt"
         let url = LogFiles.shareFolder.appendingPathComponent(name)
@@ -663,13 +901,27 @@ enum DiscordLog {
         let madeira = docs?.appendingPathComponent("madeira-log.txt")
         let madeiraSize = madeira.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int } ?? 0
         let wantMadeira = madeira != nil && madeiraSize > 0 && madeira?.standardizedFileURL != log?.standardizedFileURL
-        let reserve = wantMadeira ? min(madeiraSize, madeiraShare) : 0
+        // (log-lastrun, run-ledger, keep-lastgood) After the logs: the run ledger, this game's last good and last
+        // failed run, and (a share with no game named, from this launch's log) the previous launch's last game
+        // run. Their size is kept back first so the file stays near its cap.
+        var extra = RunLedger.extras(title: title, log: log)
+        if title == nil, log?.lastPathComponent == "madeira-log.txt" { extra += RunLedger.previousLaunchRun() }
+        let extraData = Data(extra.utf8)
+        // (share-game-logs) The game's own log files (a launcher's .log, Player.log, Steam's logs), after its run.
+        let gameData = Data(GameOwnLogs.section(game: gameFolder).utf8)
+        let reserve = (wantMadeira ? min(madeiraSize, madeiraShare) : 0) + extraData.count + gameData.count
         let added = log.map { appendFullLog($0, to: url, after: report.utf8.count, limit: maxBytes - reserve) } ?? 0
+        if !gameData.isEmpty, let out = try? FileHandle(forWritingTo: url) {
+            _ = try? out.seekToEnd(); out.write(gameData); try? out.close()
+        }
         var addedMadeira = 0
         if wantMadeira, let madeira {
-            addedMadeira = appendFullLog(madeira, to: url, after: report.utf8.count + added, limit: maxBytes)
+            addedMadeira = appendFullLog(madeira, to: url, after: report.utf8.count + added + gameData.count, limit: maxBytes - extraData.count)
         }
-        LogStore.shared.log("[logs] share \(name) (\(report.utf8.count) bytes report + \(added) bytes full log + \(addedMadeira) bytes madeira-log.txt, scrubbed)")
+        if !extraData.isEmpty, let out = try? FileHandle(forWritingTo: url) {
+            _ = try? out.seekToEnd(); out.write(extraData); try? out.close()
+        }
+        LogStore.shared.log("[logs] share \(name) (\(report.utf8.count) bytes report + \(added) bytes full log\(gameData.isEmpty ? "" : " + \(gameData.count) bytes game's own logs") + \(addedMadeira) bytes madeira-log.txt + \(extraData.count) bytes run history, scrubbed)")
         return url
     }
 
@@ -881,6 +1133,9 @@ enum GetHelpUpload {
         guard let key = GetHelp.key else { done(false); return }
         let deviceLine = ClaudeHelp.deviceLine()
         let device = deviceLine + "\nMadeira " + BuildStamp.text
+        // (player-id-sentry) The short Player ID from Settings, so Sentry counts this player; nil when
+        // env.MADEIRA_PLAYER_ID = 0. The server makes it the event's user (worker/src/sentry.ts).
+        let player = GetHelp.playerID
         DispatchQueue.global(qos: .utility).async {
             let report = GetHelp.report(game: gameText, title: title, device: deviceLine)
             let zip = make(title: title, windowsPath: windowsPath, report: report, gameText: gameText, device: device)
@@ -890,6 +1145,7 @@ enum GetHelpUpload {
             request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "x-request-id")
             request.setValue(title.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "", forHTTPHeaderField: "x-game")
             request.setValue(BuildStamp.text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "", forHTTPHeaderField: "x-app-version")
+            if let player { request.setValue(player, forHTTPHeaderField: "x-player-id") }
             request.setValue("application/zip", forHTTPHeaderField: "content-type")
             let finish: (Data?, URLResponse?, Error?) -> Void = { _, response, error in
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -914,7 +1170,8 @@ enum GetHelpUpload {
                                        ("madeira-log.txt", docs.appendingPathComponent("madeira-log.txt"))]
         var texts: [(String, String)] = [("report.txt", report), ("device.txt", device)]
         if let gameText { texts.append(("game-config.txt", PrivacyScrub.text(gameText))) }
-        if let cfg = try? String(contentsOf: docs.appendingPathComponent(MadeiraConfig.fileName), encoding: .utf8) {
+        // [cfg-lossy-help] upstream PR 629: lossy, so a non-UTF-8 byte does not leave madeira.cfg out of the help files
+        if let cfg = MadeiraConfig.readText(docs.appendingPathComponent(MadeiraConfig.fileName)) {
             texts.append(("madeira.cfg.txt", PrivacyScrub.text(cfg)))
         }
         texts.append(("files.txt", fileList(windowsPath)))
@@ -987,9 +1244,14 @@ enum GetHelpUpload {
     }
 
     /// The game folder (the exe's folder) a few levels deep: "size  path" per file, at most maxFiles.
+    /// (get-help-own-folder) A Steam entry's path is already the game's folder
+    /// ("...\steamapps\common\Grim Dawn"), so taking its parent listed every other installed
+    /// game and the cap cut the game's own files off (0.2.29 reports: a Grim Dawn list holding
+    /// 1949 Stardew Valley lines). The parent is taken only when the path is a file.
+    /// Switch: env.MADEIRA_GET_HELP_OWN_FOLDER = 0 (the old behaviour: always the parent).
     static func fileList(_ windowsPath: String) -> String {
         guard let exe = LibraryEntry.hostURL(ofWindowsPath: windowsPath) else { return "(no game folder: \(windowsPath))" }
-        let folder = exe.deletingLastPathComponent()
+        let folder = listFolder(of: exe, ownFolder: MadeiraConfig.flag("MADEIRA_GET_HELP_OWN_FOLDER"))
         var lines = ["# \(PrivacyScrub.text(windowsPath)) - files in its folder (bytes, path)"]
         let keys: [URLResourceKey] = [.fileSizeKey, .isDirectoryKey]
         guard let walker = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: keys) else {
@@ -1005,6 +1267,14 @@ enum GetHelpUpload {
             if lines.count > maxFiles { lines.append("(more files left out)"); break }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// (get-help-own-folder) The folder fileList walks: `path` itself when it is a folder (a
+    /// Steam entry), else the folder that holds it (a program).
+    static func listFolder(of path: URL, ownFolder: Bool, files: FileManager = .default) -> URL {
+        var isFolder: ObjCBool = false
+        if ownFolder, files.fileExists(atPath: path.path, isDirectory: &isFolder), isFolder.boolValue { return path }
+        return path.deletingLastPathComponent()
     }
 }
 
@@ -1029,6 +1299,8 @@ struct DiscordLogButton: View {
                         if busy { Spacer(); ProgressView() }
                     }
                 }
+                .padRow("adv-discord-log", when: !busy, press: { make() })
+
             } else {
                 Button(action: make) {
                     HStack(spacing: 8) {
@@ -1049,9 +1321,10 @@ struct DiscordLogButton: View {
         let entry = entry, made = report, shown = shown
         let game = entry.map(ClaudeHelp.gameText)
         let device = ClaudeHelp.deviceLine()
+        let folder = GameOwnLogs.game(for: entry)   // (share-game-logs) read on main
         DispatchQueue.global(qos: .userInitiated).async {
             let text = made ?? GetHelp.report(game: game, title: entry?.title, device: device, shown: shown)
-            let url = DiscordLog.file(title: entry?.title, report: text)
+            let url = DiscordLog.file(title: entry?.title, report: text, gameFolder: folder)
             DispatchQueue.main.async {
                 busy = false
                 if let url { file = DiscordLogFile(url: url) }
@@ -1342,15 +1615,17 @@ struct GetHelpSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(lines, id: \.self) { line in
                     if !line.plain.isEmpty { Text(line.plain).font(.body) }
-                    Text(line.line).font(.callout.monospaced()).foregroundStyle(.green)
+                    Text(line.line).font(.callout.monospaced()).foregroundStyle(StockApple.stage4 ? Color.primary : Color.green)
                 }
                 if let program {
                     if let plain = program.plain, !plain.isEmpty { Text(plain).font(.body) }
-                    Text(verbatim: "Steam starts = \(program.program)").font(.callout.monospaced()).foregroundStyle(.green)
+                    Text(verbatim: "Steam starts = \(program.program)").font(.callout.monospaced()).foregroundStyle(StockApple.stage4 ? Color.primary : Color.green)
                 }
             }
             .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+            // (stock-apple-stage4) The fix lines in a grouped-list cell, not green on black (a terminal's look).
+            .background(StockApple.stage4 ? Color(uiColor: .tertiarySystemGroupedBackground) : Color.black.opacity(0.85),
+                        in: RoundedRectangle(cornerRadius: 10))
             Text(windowsPath.isEmpty
                  ? L("Game details > Advanced > This game's config.")
                  : String(format: L("Only %@ changes. You can undo it any time."), target.title))
@@ -1395,8 +1670,8 @@ struct GetHelpSheet: View {
             } else {
                 HStack {
                     Text("Did this help?").font(.subheadline).foregroundStyle(.secondary)
-                    Button { rate(id, true) } label: { Image(systemName: "hand.thumbsup") }.buttonStyle(.bordered)
-                    Button { rate(id, false) } label: { Image(systemName: "hand.thumbsdown") }.buttonStyle(.bordered)
+                    Button { rate(id, true) } label: { Image(systemName: "hand.thumbsup") }.buttonStyle(.bordered).iconLabel("This helped")
+                    Button { rate(id, false) } label: { Image(systemName: "hand.thumbsdown") }.buttonStyle(.bordered).iconLabel("This did not help")
                 }
                 .padding(.top, 8)
             }
@@ -1502,6 +1777,7 @@ struct GetHelpSheet: View {
         lookingCloser = false
         var request = GetHelpCore.Request(install_id: GetHelp.installID, game: target.title, app_version: BuildStamp.text,
                                           reason: target.reason, report: report, keep_report: true)
+        request.player_id = GetHelp.playerID   // (player-id) beside install_id, nil when switched off
         if let places { request.can_send = GetHelpFiles.available(places) }
         task?.cancel()
         task = GetHelp.send(request) { outcome, _ in

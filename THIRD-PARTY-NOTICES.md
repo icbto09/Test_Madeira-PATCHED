@@ -32,6 +32,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Mesa** 25.0.7 (OSMesa, Zink, softpipe) | MIT (+ permissive, see `docs/license.rst`) | Patched (`build/mesa-ios/patches`). Separate dylib `gl/libOSMesa.dylib`, desktop OpenGL backend. |
 | **MoltenVK** 1.4.2 | Apache-2.0 | Unmodified. Separate dylib `gl/libMoltenVK.dylib`; contains SPIRV-Cross, SPIRV-Tools (Apache-2.0) and cereal (BSD-3-Clause). |
 | **vkd3d-proton** `750061ae2b` (with dxil-spirv and dxbc-spirv) | **LGPL-2.1-or-later**; dxil-spirv MIT (Hans-Kristian Arntzen for Valve), dxbc-spirv MIT (Philip Rebohle) | Three patches (`build/vkd3d-proton/patches`, from NutsEmu, LGPL-2.1-or-later, origin and dates in each header). Separate ARM64EC DLLs `vulkan/arm64ec-windows/d3d12.dll` and `d3d12core.dll`, built by `build/vkd3d-proton/build.sh` (corresponding source: upstream at that commit + the patches); used only with madeira.cfg `d3d12 = vkd3d`. Licence texts copied by the script into `app/Madeira/licenses/`. |
+| **OpenAL Soft** (tag pinned in `build/openal-soft/build.sh`) | **LGPL-2 or later** (upstream README: "provided under the terms of the LGPL 2 or later"; COPYING is the LGPL-2 text); bundled pffft under its own BSD-style licence (`LICENSE-pffft`), parts under BSD-3-Clause (`BSD-3Clause`), bundled fmt MIT with an object-code exception; default HRTF data is the MIT KEMAR set (docs/hrtf.txt; credit Bill Gardner and Keith Martin, MIT Media Lab 1994) | One Madeira patch (`build/openal-soft/patches`, LGPL-2-or-later like OpenAL Soft: ARM64EC build guards so the EC DLL uses the ARM64/NEON code, no change for x86), built by `build/openal-soft/build.sh` as separate dynamic DLLs `openal/arm64ec-windows/OpenAL32.dll` and `openal/i386-windows/OpenAL32.dll` (a user can replace them). Licence texts copied by the script into `app/Madeira/licenses/` (`OpenAL-Soft-LGPL-2.txt`, `OpenAL-Soft-pffft.txt`, `OpenAL-Soft-BSD-3-Clause.txt`, `OpenAL-Soft-HRTF-KEMAR.txt`). Corresponding source: https://github.com/kcat/openal-soft at the pinned tag + the patch. | Linked into the Wine prefix (system32/sysx64 for x64 programs, syswow64 for 32-bit ones) only where the prefix has no OpenAL32.dll of its own, for games that expect Creative's installer (BIT.TRIP BEAT). A real OpenAL32.dll in the prefix is never replaced. `env.MADEIRA_OPENAL = 0` leaves it out and removes earlier links. |
 | **DXVK** v3.1.1 (`b1a1c99ab5`, with dxbc-spirv and libdisplay-info) | **zlib** (Philip Rebohle, Joshua Ashton, Robin Kertels, Jeffrey Ellison); dxbc-spirv MIT (Philip Rebohle), libdisplay-info MIT (its contributors) | One Madeira patch (`build/dxvk/patches`, zlib like DXVK, marked in the source as the licence asks). Separate ARM64EC DLLs `vulkan/arm64ec-windows/dxvk-d3d11.dll`, `dxvk-d3d10core.dll` and `dxvk-dxgi.dll`, built by `build/dxvk/build.sh` (source: upstream at that commit + the patch); used only with madeira.cfg `d3d11 = dxvk`. Licence texts copied by the script into `app/Madeira/licenses/`. |
 | **LuaJIT** 2.1 | MIT | Unmodified. Separate x86-64 Windows DLL (`compat/love/lua51.dll`, built by `build/luajit-x64/build.sh`), loaded in place of a game's `lua51.dll` when that is an x64 LuaJIT needing memory below 2 GB (`build/wineserver/luajit_compat.c`); game files are not modified. |
 | **StikJIT** 1.9.0 | MPL-2.0 | Bundled XCFramework in the iOS 26 JIT helper | Enables JIT for Madeira through the device's RSD tunnel. Exact corresponding source: [`StikDebug/StikJIT` tag `1.9.0`](https://github.com/StikDebug/StikJIT/tree/1.9.0); license text: `LICENSES/MPL-2.0.txt`. The framework contains **idevice**, Copyright 2026 Jackson Coxson, under MIT; source: [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice), license text: `LICENSES/MIT-idevice.txt`. |
@@ -119,6 +120,57 @@ Rather than claim authorship of whole directories: **original Madeira-authored
 files that do not carry another license notice are licensed under
 GPL-3.0-or-later.** Files carrying their own copyright or license header are
 governed by that header.
+
+## Code from MetalSharp (AGPL-3.0)
+
+Nightly 0.2.83 and later contain code ported from **MetalSharp** (patches `fex/0025`, `fex/0026` and `fex/0031`,
+and MetalSharp-Wine), written by **BOR1NG (Avery Felts, <https://github.com/aaf2tbz>)** and licensed **AGPL-3.0**.
+Madeira thanks BOR1NG for this work. It is used in these fixes:
+
+| Fix | Where | What |
+|---|---|---|
+| Overwatch 2 "section views" (`env.MADEIRA_EC_SECTION_VIEWS = 0` off) | `build/fex-patches/0005-windows-ios-section-views.patch` (FEX `Core.cpp`, `Module.cpp`, `InvalidationTracker.cpp/.h`) and `wine/dlls/ntdll/signal_arm64ec.c` | Several views of one file mapping are tracked so a write through one view invalidates translated code in the others; the changed-code block is placed right after the current block (MetalSharp `fex/0025`, `fex/0026`). |
+| Overwatch 2 debug registers (`env.MADEIRA_EC_DEBUG_REGS = 0` off) | `wine/dlls/ntdll/signal_arm64ec.c`, FEX `Module.cpp` | The x86 debug registers pass through a thread's context (the idea is cited from MetalSharp-Wine `4614051`). |
+| Overwatch 2 XSAVE state revert (`env.MADEIRA_EC_XSTATE_REVERT = 0` off) | `wine/dlls/ntdll/signal_arm64ec.c`, `wine/dlls/ntdll/unix/system.c` | Credit in the source comments: BOR1NG, MetalSharp-Wine. |
+| Intel flag behaviour (`env.MADEIRA_FEX_INTEL_FLAGS = 1` on, off by default) | `build/fex-patches/0010-fexcore-intel-flags.patch` (FEXCore `ALUOps.cpp`, `OpcodeDispatcher.cpp/.h`, `OpcodeDispatcher/Flags.cpp`) | Where x86 leaves a flag undefined, the emulator gives what Intel hardware gives (MetalSharp `fex/0031`). |
+| Overwatch 2 clock and CPU speed (`env.MADEIRA_EC_TSC_MHZ = 0` off; MetalSharp-Wine patch 0134, LGPL) | `wine/dlls/ntdll/unix/system.c`, `wine/programs/wineboot/wineboot.c` | The CPU speed the system reports follows the timer's own frequency. Credit: BOR1NG (Avery Felts). |
+| Overwatch 2 x64 context fields (`env.MADEIRA_EC_CTX_X64_FIELDS = 0` off; MetalSharp-Wine d100ac4215, LGPL) | `wine/dlls/ntdll/signal_arm64ec.c` | The x64 fields of a thread context are carried through. Credit: BOR1NG (Avery Felts). |
+
+As that code is AGPL-3.0, the complete corresponding source of every build that contains it is published with that
+build's release at <https://github.com/camhoc/Madeira> (AGPL-3.0 section 13). Madeira's own code remains
+GPL-3.0-or-later (GPL-3.0 section 13 and AGPL-3.0 section 13 let the two be combined).
+
+## Code from MetalSharp-Wine (LGPL-2.1) and MetalSharp's FEX patches (MIT)
+
+Nightlies 0.2.91 and 0.2.92 contain fourteen Overwatch 2 items (nine in 0.2.91, four more in 0.2.92, one opt-in in 0.2.93) ported from MetalSharp-Wine (<https://github.com/metalsharp/MetalSharp-Wine>)
+and MetalSharp's FEX patches, written by **BOR1NG (Avery Felts, <https://github.com/aaf2tbz>)**. The Wine changes are
+**LGPL-2.1**, the FEX changes **MIT**. Madeira thanks BOR1NG for all of them.
+
+| Fix (off switch) | MetalSharp source | Where |
+|---|---|---|
+| bsd-sockets (`env.MADEIRA_BSD_SOCKETS = 0`) | MetalSharp-Wine 0155 (LGPL-2.1) | `wine/dlls/ntdll/unix/socket.c`, `virtual.c`, `unix_private.h`, `wine/dlls/ws2_32/unixlib.c`, `wine/server/fd.c`, `file.h`, `sock.c`, `build/wineserver/fd_ios.c`, `build/ntdll-unix/virtual_ios.c` |
+| isec-bound (`env.MADEIRA_EC_ISEC_BOUND = 0`) | MetalSharp-Wine 554d343543 (LGPL-2.1) | `wine/dlls/ntdll/signal_arm64ec.c` |
+| ro-view-cow (opt-in `env.MADEIRA_EC_RO_VIEW_COW = 1`) | MetalSharp-Wine (LGPL-2.1) | `build/ntdll-unix/virtual_ios.c` |
+| selector-answer (`env.MADEIRA_EC_SELECTOR_ANSWER = 0`) | MetalSharp-Wine (LGPL-2.1) | `build/ntdll-unix/signal_arm64_ios.c` |
+| partial-copy (`env.MADEIRA_SRV_PARTIAL_COPY = 0`) | MetalSharp-Wine 9df1933a57 (LGPL-2.1) | `build/wineserver/mach_ios.c` |
+| pop-rsp-fault (`env.MADEIRA_FEX_POP_RSP_FAULT = 0`) | FEX patch 0003 (MIT) | `build/fex-patches/0012-fexcore-pop-rsp-fault.patch` |
+| x87-flags (`env.MADEIRA_FEX_X87_FLAGS = 0`) | FEX patch 0006 (MIT) | `build/fex-patches/0013-fexcore-x87-flags.patch` |
+| x87-ctx (`env.MADEIRA_EC_X87_CTX = 0`) | FEX patch 0033 (MIT) | `build/fex-patches/0014-windows-ios-x87-ctx.patch` |
+| df-ctx (`env.MADEIRA_EC_DF_CTX = 0`) | FEX patch 0004 (MIT) | `build/fex-patches/0015-windows-ios-df-ctx.patch`, `wine/dlls/ntdll/signal_arm64ec.c`, `unwind.h` |
+| kuser-rebase (`env.MADEIRA_FEX_KUSER_REBASE = 0`) | FEX patch 0001 (MIT) | `build/fex-patches/0017-fexcore-kuser-rebase.patch` |
+| cpu-identity (`env.MADEIRA_CPU_IDENTITY = 0`) | FEX patch 0028 (MIT) and a Wine idea from 198a71f8fa (LGPL-2.1) | `build/fex-patches/0018-fexcore-cpu-identity.patch`, `build/ntdll-unix/server_ios.c`, `hw_registry_ios.h` |
+| code-buffer-big (opt-in `env.MADEIRA_FEX_CODE_BUFFER_MB = 256`) | idea from FEX patch 0045 (MIT) | `build/fex-patches/0019-fexcore-code-buffer-big.patch`, `build/ntdll-unix/virtual_ios.c` |
+| hard-error-log (`env.MADEIRA_HARD_ERROR_LOG = 0`) | MetalSharp-Wine 0084 (LGPL-2.1) | `wine/dlls/ntdll/unix/system.c` |
+| globalroot (`env.MADEIRA_GLOBALROOT = 0`) | MetalSharp-Wine 0085 (LGPL-2.1) | `wine/dlls/ntdll/unix/file.c` |
+
+## Code from Mullion (LGPL-2.1-or-later)
+
+Nightly 0.2.89 and later contain six Direct3D 11 fixes ported from **Mullion** (<https://github.com/dttdrv/mullion>, by
+dttdrv and contributors, a DXMT fork under **LGPL-2.1-or-later**, the same license as the DXMT files they touch): a null
+FinishCommandList, illegal constant-buffer ranges, releasing an object already at zero, a draw with no vertex shader,
+fences on video-support devices, and fence events. The change is `src/d3d11` and `src/util/util_mullion_fix.hpp` in the
+`dxmt` folder; each call site names the Mullion commit it came from. Off switch: `env.MADEIRA_DXMT_MULLION_FIXES = 0`
+(and one switch per fix). Thank you, dttdrv.
 
 ## Code from BCD (thebcd69/bcd-games)
 

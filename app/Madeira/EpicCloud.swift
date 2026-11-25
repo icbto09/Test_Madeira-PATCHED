@@ -347,6 +347,8 @@ struct EpicCloudSection: View {
         }
     }
 
+    /// The rows act from the controller only when the section is not greyed out (pad-pages).
+    private var rowsOn: Bool { !(installer.sessionRunning || cloud.isBusy) }
     @ViewBuilder private func rows(_ state: EpicCloud.State) -> some View {
         switch state.phase {
         case .idle, .checking:
@@ -358,6 +360,7 @@ struct EpicCloudSection: View {
         case .failed(let message):
             Text(message).font(.callout).foregroundStyle(.orange)
             Button("Try Again") { Task { await cloud.check(appName, automatic: false) } }
+                .padRow("ecloud-try-again", when: rowsOn) { Task { await cloud.check(appName, automatic: false) } }
         case .unsupported:
             EmptyView()
         case .ready:
@@ -375,12 +378,14 @@ struct EpicCloudSection: View {
             }.font(.caption).foregroundStyle(.secondary)
             Text("Nothing is changed until you choose which to keep.").font(.caption).foregroundStyle(.secondary)
             Button("Keep Epic's saves…") { confirmCloud = true }
+                .padRow("ecloud-keep-epic-s-saves", when: rowsOn) { confirmCloud = true }
                 .confirmationDialog("Use Epic's saves on this device? The files they replace are copied to Files › Madeira › Epic Cloud Backups first.",
                                     isPresented: $confirmCloud, titleVisibility: .visible) {
                     Button("Use Epic's saves", role: .destructive) { Task { await cloud.resolve(appName, useCloud: true) } }
                     Button("Cancel", role: .cancel) {}
                 }
             Button("Keep this device's saves…") { confirmDevice = true }
+                .padRow("ecloud-keep-this-device-s-saves", when: rowsOn) { confirmDevice = true }
                 .confirmationDialog("Upload this device's saves as Epic's newest snapshot? Other devices will get them. The older snapshots stay in the cloud.",
                                     isPresented: $confirmDevice, titleVisibility: .visible) {
                     Button("Upload this device's saves", role: .destructive) { Task { await cloud.resolve(appName, useCloud: false) } }
@@ -390,17 +395,21 @@ struct EpicCloudSection: View {
             Label("This device has newer saves", systemImage: "icloud.and.arrow.up").foregroundStyle(.secondary)
             summary(state)
             Button("Sync now") { Task { await cloud.syncNow(appName) } }
+                .padRow("ecloud-sync-now", when: rowsOn) { Task { await cloud.syncNow(appName) } }
         case .download:
             Label("Epic's cloud has newer saves", systemImage: "icloud.and.arrow.down").foregroundStyle(.secondary)
             summary(state)
             Button("Sync now") { Task { await cloud.syncNow(appName) } }
+                .padRow("ecloud-sync-now-2", when: rowsOn) { Task { await cloud.syncNow(appName) } }
         case .empty:
             Text("No saves in Epic's cloud or on this device for this game.").foregroundStyle(.secondary)
             Button("Sync now") { Task { await cloud.syncNow(appName) } }
+                .padRow("ecloud-sync-now-3", when: rowsOn) { Task { await cloud.syncNow(appName) } }
         default:
             Label("In sync", systemImage: "checkmark.icloud").foregroundStyle(.secondary)
             summary(state)
             Button("Sync now") { Task { await cloud.syncNow(appName) } }
+                .padRow("ecloud-sync-now-4", when: rowsOn) { Task { await cloud.syncNow(appName) } }
         }
         if let note = state.note { Text(note).font(.caption).foregroundStyle(.secondary) }
     }

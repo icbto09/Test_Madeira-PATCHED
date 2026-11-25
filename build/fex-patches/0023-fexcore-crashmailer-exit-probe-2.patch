@@ -1,0 +1,167 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e589b97..38946bc 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -639,7 +639,7 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
+   // Set up the thread manager state
+   Thread->CurrentFrame->Thread = Thread;
+ #ifdef FEX_IOS_HOST
+-  /* ml1205: the block-entry ring, when MADEIRA_BLOCK_RING is set (32 KB per thread, never freed). */
++  /* ml1205: the block-entry ring, when MADEIRA_BLOCK_RING is set (32 KB per thread; freed in DestroyThread). */
+   {
+     static int RingOn = -1;
+     if (RingOn < 0) {
+@@ -652,10 +652,15 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
+ #endif
+     }
+     if (RingOn) {
+-      const size_t Bytes = (FEXCore::Core::IosBlockRingEntries + 1) * sizeof(uint64_t);
+-      auto* Ring = static_cast<uint64_t*>(FEXCore::Allocator::aligned_alloc(64, Bytes));
+-      if (Ring) {
+-        memset(Ring, 0, Bytes);
++      /* madeira [crashmailer-exit-probe]: N entries plus the index word plus ring[-1] = N. */
++      const uint32_t N = FEXCore::Core::IosBlockRingEntriesRT;
++      const size_t Bytes = (N + 2) * sizeof(uint64_t);
++      auto* Mem = static_cast<uint64_t*>(FEXCore::Allocator::aligned_alloc(64, Bytes));
++      uint64_t* Ring = nullptr;
++      if (Mem) {
++        memset(Mem, 0, Bytes);
++        Mem[0] = N;
++        Ring = Mem + 1;
+       }
+       Thread->CurrentFrame->IosBlockRing = Ring;
+     }
+@@ -677,6 +682,14 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
+ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
+   FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
+                                      Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
++#ifdef FEX_IOS_HOST
++  /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: free the block ring (it starts one word before
++   * ring[0], see CreateThread). The ARM64EC frontend has already cleared the TEB's pointer to it. */
++  if (Thread->CurrentFrame && Thread->CurrentFrame->IosBlockRing) {
++    FEXCore::Allocator::aligned_free(Thread->CurrentFrame->IosBlockRing - 1);
++    Thread->CurrentFrame->IosBlockRing = nullptr;
++  }
++#endif
+   delete Thread;
+ }
+ 
+@@ -777,6 +790,12 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
+  * decommit_pages(), build/ntdll-unix/virtual_ios.c.
+  */
+ } // namespace (ml609: reopened below)
++#ifdef FEX_IOS_HOST
++namespace FEXCore::Core {
++uint32_t IosBlockRingEntriesRT = IosBlockRingEntries; /* madeira [crashmailer-exit-probe], see CoreState.h */
++}
++#endif
++
+ namespace FEXCore::Core {
+ namespace {
+   // Keep in sync with the literals passed by the three call sites.
+@@ -1825,12 +1844,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     const uint64_t* Ring = Thread->CurrentFrame->IosBlockRing;
+     if (Rva && Ring && !RingAtDone.load(std::memory_order_relaxed) && IosMainImageBase() && GuestRIP == IosMainImageBase() + Rva &&
+         !RingAtDone.exchange(true, std::memory_order_relaxed)) {
+-      constexpr uint32_t N = FEXCore::Core::IosBlockRingEntries;
++      const uint32_t N = static_cast<uint32_t>(Ring[-1]);   /* [crashmailer-exit-probe]: ring[-1] = size */
+       const uint64_t Next = Ring[0] & (N - 1);
+       static const char HexDigits[] = "0123456789abcdef";
+       LogMan::Msg::EFmt("[ring-at] first compile of exe+{:#x} (rip {:#x}) on thread state {}: this thread's last {} block entries, oldest first",
+                         Rva, GuestRIP, static_cast<const void*>(Thread), N);
+-      for (uint32_t i = 0; i < N; i++) {
++      for (uint32_t i = N > FEXCore::Core::IosBlockRingEntries ? N - FEXCore::Core::IosBlockRingEntries : 0; i < N; i++) { /* the newest 4096, as before */
+         const uint64_t Ent = Ring[1 + ((Next + i) & (N - 1))];
+         if (!Ent) {
+           continue;
+@@ -1882,9 +1901,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+        * DISTINCT ring entry once, up to 512 bytes (or the bytes left in its translation), in 32-byte
+        * lines. About 400 distinct entries, under 1 MB of log. */
+       {
+-        static uint64_t Seen[FEXCore::Core::IosBlockRingEntries];
++        static uint64_t Seen[FEXCore::Core::IosBlockRingEntries]; /* only the newest 4096 are walked */
+         uint32_t NSeen = 0;
+-        for (uint32_t i = 0; i < N; i++) {
++        for (uint32_t i = N > FEXCore::Core::IosBlockRingEntries ? N - FEXCore::Core::IosBlockRingEntries : 0; i < N; i++) {
+           const uint64_t Ent = Ring[1 + ((Next + i) & (N - 1))];
+           if (!Ent) {
+             continue;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index dd23485..4f1a060 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -972,7 +972,7 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+       add(ARMEmitter::Size::i64Bit, TMP4, TMP1, 8);
+       str(TMP3, TMP4, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
+       add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+-      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntries - 1);
++      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntriesRT - 1); /* [crashmailer-exit-probe] */
+       str(TMP2, TMP1, 0);
+       (void)Bind(&l_NoRing);
+     }
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index b665ad1..d59bd01 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -435,7 +435,13 @@ struct JITPointers {
+ };
+ 
+ // Each guest JIT frame has one of these
+-constexpr uint32_t IosBlockRingEntries = 4096;   /* ml1205, power of two */
++constexpr uint32_t IosBlockRingEntries = 4096;   /* ml1205, power of two: the default ring size */
++/* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: the ring size actually used, a power of two up to
++ * IosBlockRingEntriesMax, set once before the first thread and the first block (ARM64EC ProcessInit: 65536 for
++ * Overwatch.exe while the exit probe is on). Every ring also carries it in the word before ring[0], ring[-1], so
++ * readers outside FEX (ntdll's reporters) do not need this variable. Core.cpp. */
++constexpr uint32_t IosBlockRingEntriesMax = 65536;
++extern uint32_t IosBlockRingEntriesRT;
+ 
+ struct CpuStateFrame {
+   CPUState State;
+@@ -547,7 +553,7 @@ struct CpuStateFrame {
+ #endif
+ 
+   /* iOS-Madeira ml1205: per-thread ring of executed block-entry RIPs, on when
+-   * MADEIRA_BLOCK_RING is set. ring[0] is the next index, ring[1..N] the entries;
++   * MADEIRA_BLOCK_RING is set. ring[0] is the next index, ring[1..N] the entries, ring[-1] = N;
+    * null when the ring is off. Published to the thread's TEB at 0x1710 (the
+    * ActivityId field, unused by Wine) so the fault reporters can dump it. */
+   uint64_t* IosBlockRing {};
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 1a3af76..0ea7176 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1665,6 +1665,19 @@ NTSTATUS ProcessInit() {
+       LogMan::Msg::IFmt("[crashmailer-dump] rev=crashmailer-dump-1 fex: block ring on for {} (MADEIRA_BLOCK_RING=0 turns it off)",
+                         AppConfigName);
+     }
++    /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2 (env MADEIRA_EC_EXIT_PROBE = 0 turns it off):
++     * ntdll's exit probe snapshots the main thread's last 65536 blocks, so the ring is 65536 entries (512 KB per
++     * thread instead of 32 KB; rev 2: freed when the thread exits, ThreadTerm and Core.cpp DestroyThread) for
++     * Overwatch.exe only. */
++    const char* XpOpt = getenv("MADEIRA_EC_EXIT_PROBE");
++    if (FEXCore::Core::IosBlockRingForce && !(XpOpt && XpOpt[0] == '0' && XpOpt[1] == '\0')) {
++      FEXCore::Core::IosBlockRingEntriesRT = FEXCore::Core::IosBlockRingEntriesMax;
++    }
++    if (FEXCore::Core::IosBlockRingForce) {
++      LogMan::Msg::IFmt("[crashmailer-exit-probe] rev=crashmailer-exit-probe-2 fex: block ring {} entries per thread{}",
++                        FEXCore::Core::IosBlockRingEntriesRT,
++                        FEXCore::Core::IosBlockRingEntriesRT == FEXCore::Core::IosBlockRingEntries ? " (MADEIRA_EC_EXIT_PROBE=0)" : "");
++    }
+   }
+ #endif
+ 
+@@ -3743,6 +3756,13 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+   delete[] ThreadState->CurrentFrame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT];
+ 
+   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
++#ifdef FEX_IOS_HOST
++  if (ThreadState->CurrentFrame->IosBlockRing && Info.TebBaseAddress) {
++    /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: DestroyThread frees the block ring, so the
++     * TEB stops naming it first (ntdll's reporters then say "no block ring" instead of reading freed memory). */
++    __atomic_store_n(reinterpret_cast<uint64_t**>(reinterpret_cast<uintptr_t>(Info.TebBaseAddress) + 0x1710), nullptr, __ATOMIC_RELEASE);
++  }
++#endif
+   CTX->DestroyThread(ThreadState);
+   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
+   if (ThreadTID == GetCurrentThreadId()) {

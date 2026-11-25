@@ -207,10 +207,13 @@ struct WineGeckoSettingsSection: View {
             if !gecko.busy {
                 if gecko.installed {
                     Button("Remove Wine Gecko", role: .destructive) { confirmRemove = true }
+                        .padRow("rt-gecko-remove") { confirmRemove = true }
                 } else {
                     Button { gecko.install() } label: {
                         Label(gecko.error == nil ? "Download Wine Gecko" : "Try Again", systemImage: "arrow.down.circle")
                     }
+                    .padRow("rt-gecko-install") { gecko.install() }
+
                 }
             }
         } header: {

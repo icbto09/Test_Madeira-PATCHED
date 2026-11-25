@@ -1,0 +1,153 @@
+Madeira patch for OpenAL Soft 1.24.3: build the ARM64EC DLL as ARM64 (NEON), not x86-64.
+
+Licence: LGPL-2-or-later, the same as OpenAL Soft (pffft.cpp hunk: the pffft
+licence in LICENSE-pffft). Written for Madeira, Nov 21 2026.
+
+Why: clang defines __x86_64__/__amd64__ for ARM64EC on purpose (the data layout
+must match x64), next to __arm64ec__ (MinGW and MSVC mode) and _M_ARM64EC (MSVC
+mode only; clang in MinGW mode does not define it, checked with
+`clang --target=arm64ec-w64-mingw32 -dM -E`). OpenAL Soft 1.24.3 reads
+__x86_64__ as "x86", so with SSE switched off in CMake it still picks:
+  - common/alnumeric.h fastf2i()/fast_roundf(): x87 inline asm (fistpl, frndint)
+    -- fails, ARM64EC code is AArch64 machine code;
+  - common/pffft.cpp: the SSE1 branch (<xmmintrin.h>, __m128), which clang
+    cannot compile for ARM64EC;
+  - core/cpu_caps.cpp: x86 CPUID;  core/fpu_ctrl.cpp: [[gnu::target("sse")]].
+Every guard below only adds "&& !ARM64EC" (or "|| ARM64EC" on an ARM branch),
+so i686 and x86_64 builds preprocess to the same code as before.
+
+Upstream: kcat/openal-soft 2b38916a ("Changes to support arm64ec on msvc.",
+PR #1250) and 1c31c0fb ("Check for NEON first"), both first in 1.25.2, do the
+cpu_caps.cpp and NEON-before-SSE parts for MSVC (_M_ARM64EC) only; 1.25.2
+still has the x87 asm keyed on __x86_64__ in alnumeric.h, and needs C++20
+modules. This patch is the same idea for 1.24.3, also keyed on __arm64ec__.
+
+diff --git a/common/alnumeric.h b/common/alnumeric.h
+index cd9c55cfcb..3b05a4f08a 100644
+--- a/common/alnumeric.h
++++ b/common/alnumeric.h
+@@ -105,7 +105,7 @@ inline int fastf2i(float f) noexcept
+     return i;
+ 
+ #elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+-    && !defined(__SSE_MATH__)
++    && !defined(__SSE_MATH__) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ 
+     int i;
+     __asm__ __volatile__("fistpl %0" : "=m"(i) : "t"(f) : "st");
+@@ -127,7 +127,7 @@ inline int float2int(float f) noexcept
+ 
+ #elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP == 0) \
+     || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+-        && !defined(__SSE_MATH__))
++        && !defined(__SSE_MATH__) && !defined(__arm64ec__) && !defined(_M_ARM64EC))
+     const int conv_i{al::bit_cast<int>(f)};
+ 
+     const int sign{(conv_i>>31) | 1};
+@@ -158,7 +158,7 @@ inline int double2int(double d) noexcept
+ 
+ #elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP < 2) \
+     || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+-        && !defined(__SSE2_MATH__))
++        && !defined(__SSE2_MATH__) && !defined(__arm64ec__) && !defined(_M_ARM64EC))
+     const int64_t conv_i64{al::bit_cast<int64_t>(d)};
+ 
+     const int sign{static_cast<int>(conv_i64 >> 63) | 1};
+@@ -187,7 +187,7 @@ inline int double2int(double d) noexcept
+ inline float fast_roundf(float f) noexcept
+ {
+ #if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+-    && !defined(__SSE_MATH__)
++    && !defined(__SSE_MATH__) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ 
+     float out;
+     __asm__ __volatile__("frndint" : "=t"(out) : "0"(f));
+diff --git a/common/pffft.cpp b/common/pffft.cpp
+index 07b6fbccfd..5b4b61ec9a 100644
+--- a/common/pffft.cpp
++++ b/common/pffft.cpp
+@@ -150,8 +150,8 @@ force_inline v4sf vswaphl(v4sf a, v4sf b) noexcept
+ /*
+  * SSE1 support macros
+  */
+-#elif defined(__x86_64__) || defined(__SSE__) || defined(_M_X64) || \
+-    (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
++#elif (defined(__x86_64__) || defined(__SSE__) || defined(_M_X64) || \
++    (defined(_M_IX86_FP) && _M_IX86_FP >= 1)) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ 
+ #include <xmmintrin.h>
+ using v4sf = __m128;
+@@ -194,7 +194,8 @@ force_inline v4sf vswaphl(v4sf a, v4sf b) noexcept
+ /*
+  * ARM NEON support macros
+  */
+-#elif defined(__ARM_NEON) || defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64)
++#elif defined(__ARM_NEON) || defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64) \
++    || defined(__arm64ec__) || defined(_M_ARM64EC)
+ 
+ #include <arm_neon.h>
+ using v4sf = float32x4_t;
+diff --git a/core/cpu_caps.cpp b/core/cpu_caps.cpp
+index 6f901d24ea..3860328a42 100644
+--- a/core/cpu_caps.cpp
++++ b/core/cpu_caps.cpp
+@@ -4,7 +4,7 @@
+ 
+ #include "cpu_caps.h"
+ 
+-#if defined(_WIN32) && (defined(_M_ARM) || defined(_M_ARM64))
++#if defined(_WIN32) && (defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__))
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ #ifndef PF_ARM_NEON_INSTRUCTIONS_AVAILABLE
+@@ -27,7 +27,8 @@
+ namespace {
+ 
+ #if defined(HAVE_GCC_GET_CPUID) \
+-    && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
++    && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)) \
++    && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ using reg_type = unsigned int;
+ inline std::array<reg_type,4> get_cpuid(unsigned int f)
+ {
+@@ -37,7 +38,8 @@ inline std::array<reg_type,4> get_cpuid(unsigned int f)
+ }
+ #define CAN_GET_CPUID
+ #elif defined(HAVE_CPUID_INTRINSIC) \
+-    && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
++    && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)) \
++    && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ using reg_type = int;
+ inline std::array<reg_type,4> get_cpuid(unsigned int f)
+ {
+@@ -128,7 +130,7 @@ std::optional<CPUInfo> GetCPUInfo()
+ #if HAVE_NEON
+ #ifdef __ARM_NEON
+     ret.mCaps |= CPU_CAP_NEON;
+-#elif defined(_WIN32) && (defined(_M_ARM) || defined(_M_ARM64))
++#elif defined(_WIN32) && (defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__))
+     if(IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE))
+         ret.mCaps |= CPU_CAP_NEON;
+ #else
+diff --git a/core/fpu_ctrl.cpp b/core/fpu_ctrl.cpp
+index 7a4f147fa3..4ea30617ad 100644
+--- a/core/fpu_ctrl.cpp
++++ b/core/fpu_ctrl.cpp
+@@ -25,7 +25,7 @@
+ 
+ namespace {
+ 
+-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
++#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ [[gnu::target("sse")]]
+ #endif
+ [[maybe_unused]]
+@@ -53,7 +53,7 @@ void disable_denormals(unsigned int *state [[maybe_unused]])
+ #endif
+ }
+ 
+-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
++#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ [[gnu::target("sse")]]
+ #endif
+ [[maybe_unused]]

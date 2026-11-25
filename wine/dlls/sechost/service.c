@@ -28,6 +28,7 @@
 #include "winternl.h"
 #include "winuser.h"
 #include "dbt.h"
+#include "ntuser.h"   /* Madeira pad-arrival: NtUserCallTwoParam_GetGamepadState / NtUserGamepadOp_State only */
 
 #include "wine/debug.h"
 #include "wine/exception.h"
@@ -2032,8 +2033,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH StartServiceCtrlDispatcherW( const SERVICE_TABLE_E
 static HANDLE device_notify_thread;
 static struct list device_notify_list = LIST_INIT(device_notify_list);
 
+#define DEVICE_NOTIFY_MAGIC 0xdecafbad
+
 struct device_notify
 {
+    DWORD magic;
     struct list entry;
     WCHAR *path;
     HANDLE handle;
@@ -2048,6 +2052,7 @@ static struct device_notify *device_notify_copy( struct device_notify *notify, D
     struct device_notify *event;
 
     if (!(event = calloc( 1, sizeof(*event) + header->dbch_size ))) return NULL;
+    event->magic = DEVICE_NOTIFY_MAGIC;
     event->handle = notify->handle;
     event->callback = notify->callback;
     memcpy( event->header, header, header->dbch_size );
@@ -2082,14 +2087,137 @@ static BOOL notification_filter_matches( DEV_BROADCAST_HDR *filter, const WCHAR 
     return TRUE;
 }
 
+/* Hand one event to every matching registration. Copies first, so a callback
+ * that registers or unregisters does not hang on service_cs. */
+static void device_notify_deliver( DWORD code, DEV_BROADCAST_HDR *buf, const WCHAR *path )
+{
+    struct device_notify *notify, *event, *next;
+    struct list events = LIST_INIT(events);
+
+    EnterCriticalSection( &service_cs );
+    LIST_FOR_EACH_ENTRY( notify, &device_notify_list, struct device_notify, entry )
+    {
+        if (!notification_filter_matches( notify->header, notify->path, buf, path )) continue;
+        if (!(event = device_notify_copy( notify, buf ))) break;
+        list_add_tail( &events, &event->entry );
+    }
+    LeaveCriticalSection(&service_cs);
+
+    LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
+    {
+        event->callback( event->handle, code, event->header );
+        list_remove( &event->entry );
+        free( event );
+    }
+}
+
+/* Madeira pad-arrival (Nov 22): Madeira's controllers reach Windows through a
+ * host snapshot that XInput reads (win32u NtUserCallTwoParam_GetGamepadState),
+ * not through a PnP device, and a Madeira Dock session runs no PlugPlay service
+ * (every log: `\??\pipe\wine_plugplay` not found). So a program that waits for
+ * a device-arrival notice before it looks again (SDL, many engines; not
+ * Windows.Gaming.Input, which only adopts real HID devices) never learns that a controller connected after it started. This
+ * thread, started with the first RegisterDeviceNotification of the process,
+ * polls the four host slots twice a second and, when one connects or goes,
+ * hands every matching registration a DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE
+ * for a HID interface named like an XInput pad (IG_), then posts
+ * WM_DEVICECHANGE(DBT_DEVNODES_CHANGED) to this process's top-level windows,
+ * as PlugPlay does. Off: MADEIRA_PAD_ARRIVAL=0. Nothing changes on a Wine whose
+ * win32u does not know the gamepad call (it answers "no pad", so no edge). */
+static const GUID pad_arrival_hid_guid = {0x4d1e55b2, 0xf16f, 0x11cf, {0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
+
+typedef ULONG_PTR (WINAPI *pad_arrival_call2_fn)( ULONG_PTR, ULONG_PTR, ULONG );
+typedef BOOL (WINAPI *pad_arrival_enum_fn)( WNDENUMPROC, LPARAM );
+typedef DWORD (WINAPI *pad_arrival_pid_fn)( HWND, DWORD * );
+typedef BOOL (WINAPI *pad_arrival_post_fn)( HWND, UINT, WPARAM, LPARAM );
+
+static pad_arrival_pid_fn pad_arrival_pid;
+static pad_arrival_post_fn pad_arrival_post;
+
+static BOOL CALLBACK pad_arrival_window( HWND hwnd, LPARAM lparam )
+{
+    DWORD pid = 0;
+    pad_arrival_pid( hwnd, &pid );
+    if (pid == GetCurrentProcessId()) pad_arrival_post( hwnd, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0 );
+    return TRUE;
+}
+
+static DWORD WINAPI pad_arrival_proc( void *arg )
+{
+    HMODULE win32u = GetModuleHandleW( L"win32u.dll" ), user32 = GetModuleHandleW( L"user32.dll" );
+    pad_arrival_call2_fn call2 = win32u ? (pad_arrival_call2_fn)GetProcAddress( win32u, "NtUserCallTwoParam" ) : NULL;
+    pad_arrival_enum_fn enum_windows = user32 ? (pad_arrival_enum_fn)GetProcAddress( user32, "EnumWindows" ) : NULL;
+    BOOL was[4] = {0};
+    unsigned int i;
+
+    SetThreadDescription( GetCurrentThread(), L"madeira_pad_arrival" );
+    if (!call2) return 0;
+    if (user32)
+    {
+        pad_arrival_pid = (pad_arrival_pid_fn)GetProcAddress( user32, "GetWindowThreadProcessId" );
+        pad_arrival_post = (pad_arrival_post_fn)GetProcAddress( user32, "PostMessageW" );
+    }
+    /* The slots as they are now are not news: the program has just looked. */
+    for (i = 0; i < 4; i++)
+    {
+        BYTE state[16];
+        was[i] = !!call2( i | (NtUserGamepadOp_State << 8), (UINT_PTR)state, NtUserCallTwoParam_GetGamepadState );
+    }
+    ERR( "[pad-arrival] watching controller slots for this process (slot0=%d; MADEIRA_PAD_ARRIVAL=0 turns this off)\n", was[0] );
+
+    for (;;)
+    {
+        Sleep( 500 );
+        for (i = 0; i < 4; i++)
+        {
+            struct
+            {
+                DEV_BROADCAST_DEVICEINTERFACE_W iface;
+                WCHAR name[MAX_PATH];
+            } msg;
+            BYTE state[16];
+            BOOL now = !!call2( i | (NtUserGamepadOp_State << 8), (UINT_PTR)state, NtUserCallTwoParam_GetGamepadState );
+            DWORD code;
+
+            if (now == was[i]) continue;
+            was[i] = now;
+            code = now ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE;
+            memset( &msg, 0, sizeof(msg) );
+            swprintf( msg.iface.dbcc_name, ARRAY_SIZE(msg.name),
+                      L"\\\\?\\HID#VID_045E&PID_028E&IG_00#madeira&slot%u#{4d1e55b2-f16f-11cf-88cb-001111000030}", i );
+            msg.iface.dbcc_size = offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name) + (wcslen( msg.iface.dbcc_name ) + 1) * sizeof(WCHAR);
+            msg.iface.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+            msg.iface.dbcc_classguid = pad_arrival_hid_guid;
+            ERR( "[pad-arrival] slot %u %s: telling this process's device listeners\n", i, now ? "connected" : "disconnected" );
+            device_notify_deliver( code, (DEV_BROADCAST_HDR *)&msg.iface, msg.iface.dbcc_name );
+            if (enum_windows && pad_arrival_pid && pad_arrival_post) enum_windows( pad_arrival_window, 0 );
+        }
+    }
+    return 0;
+}
+
+static HANDLE pad_arrival_thread;
+
+static void pad_arrival_start( void )
+{
+    WCHAR value[8] = {0};
+
+    if (pad_arrival_thread) return;
+    if (GetEnvironmentVariableW( L"MADEIRA_PAD_ARRIVAL", value, ARRAY_SIZE(value) ) && value[0] == '0')
+    {
+        pad_arrival_thread = INVALID_HANDLE_VALUE;
+        return;
+    }
+    if (!(pad_arrival_thread = CreateThread( NULL, 0, pad_arrival_proc, NULL, 0, NULL )))
+        pad_arrival_thread = INVALID_HANDLE_VALUE;
+}
+
 static DWORD WINAPI device_notify_proc( void *arg )
 {
     WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
     WCHAR protseq[] = L"ncacn_np";
     RPC_WSTR binding_str;
     DWORD err = ERROR_SUCCESS;
-    struct device_notify *notify, *event, *next;
-    struct list events = LIST_INIT(events);
     plugplay_rpc_handle handle = NULL;
     DWORD code = 0;
     unsigned int size;
@@ -2148,22 +2276,7 @@ static DWORD WINAPI device_notify_proc( void *arg )
             break;
         }
 
-        /* Make a copy to avoid a hang if a callback tries to register or unregister for notifications. */
-        EnterCriticalSection( &service_cs );
-        LIST_FOR_EACH_ENTRY( notify, &device_notify_list, struct device_notify, entry )
-        {
-            if (!notification_filter_matches( notify->header, notify->path, (DEV_BROADCAST_HDR *)buf, path )) continue;
-            if (!(event = device_notify_copy( notify, (DEV_BROADCAST_HDR *)buf ))) break;
-            list_add_tail( &events, &event->entry );
-        }
-        LeaveCriticalSection(&service_cs);
-
-        LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
-        {
-            event->callback( event->handle, code, event->header );
-            list_remove( &event->entry );
-            free( event );
-        }
+        device_notify_deliver( code, (DEV_BROADCAST_HDR *)buf, path );
 
         MIDL_user_free(buf);
         MIDL_user_free(path);
@@ -2196,6 +2309,7 @@ HDEVNOTIFY WINAPI I_ScRegisterDeviceNotification( HANDLE handle, DEV_BROADCAST_H
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    notify->magic = DEVICE_NOTIFY_MAGIC;
     notify->handle = handle;
     notify->callback = callback;
     memcpy( notify->header, filter, filter->dbch_size );
@@ -2224,6 +2338,7 @@ HDEVNOTIFY WINAPI I_ScRegisterDeviceNotification( HANDLE handle, DEV_BROADCAST_H
 
     if (!device_notify_thread)
         device_notify_thread = CreateThread( NULL, 0, device_notify_proc, NULL, 0, NULL );
+    pad_arrival_start();
 
     LeaveCriticalSection( &service_cs );
 
@@ -2236,16 +2351,39 @@ HDEVNOTIFY WINAPI I_ScRegisterDeviceNotification( HANDLE handle, DEV_BROADCAST_H
 BOOL WINAPI I_ScUnregisterDeviceNotification( HDEVNOTIFY handle )
 {
     struct device_notify *notify = handle;
+    BOOL ret = TRUE;
 
     TRACE("%p\n", handle);
 
     if (!handle)
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
         return FALSE;
+    }
 
     EnterCriticalSection( &service_cs );
-    list_remove( &notify->entry );
+
+    __TRY
+    {
+        if (notify->magic != DEVICE_NOTIFY_MAGIC)
+        {
+            SetLastError( ERROR_INVALID_HANDLE );
+            ret = FALSE;
+        }
+        else
+        {
+            list_remove( &notify->entry );
+            free( notify->path );
+            free( notify );
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        SetLastError( ERROR_SERVICE_SPECIFIC_ERROR );
+        ret = FALSE;
+    }
+    __ENDTRY
+
     LeaveCriticalSection(&service_cs);
-    free( notify->path );
-    free( notify );
-    return TRUE;
+    return ret;
 }

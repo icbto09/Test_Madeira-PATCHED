@@ -1,0 +1,97 @@
+diff --git a/FEXCore/Source/Interface/Core/CPUID.cpp b/FEXCore/Source/Interface/Core/CPUID.cpp
+index a45ae0a..14bc7d6 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.cpp
++++ b/FEXCore/Source/Interface/Core/CPUID.cpp
+@@ -22,6 +22,7 @@ $end_info$
+ #include "git_version.h"
+ 
+ #include <cstdlib>
++#include <cstdio> // madeira [cpu-identity]: snprintf
+ #include <cstring>
+ 
+ namespace FEXCore {
+@@ -1221,26 +1222,62 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) con
+   return Function_8000_0004h(Leaf, CurrentCPUIndex());
+ }
+ 
++/* madeira [cpu-identity] (env MADEIRA_CPU_IDENTITY = 0 turns it off; on by default). rev=cpu-identity-1.
++ *
++ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0028 "FEXCore: Name the
++ * TSC's frequency in CPUID, and hide the hypervisor bit by default" and commit 198a71f8fa (LGPL-2.1 for Wine
++ * parts, MIT for FEX parts). x86 software cross-checks the clock it measures with RDTSC against the one the CPU
++ * names; his commit: "They named 0, none, 1000MHz and 24MHz before, which protectors take for a VM." Intel
++ * brand strings end in "@ x.xxGHz", the base frequency, at which an Intel TSC runs; this one now ends in the
++ * guest TSC's frequency (the host counter scaled by TSCScale, as leaf 0x15 says and leaf 0x16 names with
++ * MADEIRA_FEX_CPUID_FREQ=1). Leaf 0x16 and the hypervisor bit were ported before (cpuid-clock-leaf,
++ * fex-hv-leaf-hide); this is the brand-string part. Ours rounds to the nearest 10MHz across the GHz digit
++ * (his formula prints 1995MHz as "1.00GHz"). Madeira's own registry writer (build/ntdll-unix/hw_registry_ios.h,
++ * hwreg_brand) builds the same string for ProcessorNameString and reads the same switch. Read once per process. */
++static bool MadeiraBrandGHz() {
++  static const bool On = [] {
++    const char* E = getenv("MADEIRA_CPU_IDENTITY");
++    const bool V = !(E && E[0] == '0' && E[1] == '\0');
++    LogMan::Msg::EFmt("[cpu-identity] rev=cpu-identity-1 {}", V ? "on" : "off (MADEIRA_CPU_IDENTITY=0)");
++    return V;
++  }();
++  return On;
++}
++
++void CPUIDEmu::BrandString(uint32_t CPU, char (&Out)[49]) const {
++  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
++  const char* Name = Data.ProductName ? Data.ProductName : "";
++  const uint64_t MHz = (GetCycleCounterFrequency() << CTX->Config.TSCScale) / 1'000'000;
++  memset(Out, 0, sizeof(Out));
++  if (MHz && MadeiraBrandGHz()) {
++    const uint64_t CentiGHz = (MHz + 5) / 10;
++    snprintf(Out, sizeof(Out), "%s @ %u.%02uGHz", Name, static_cast<uint32_t>(CentiGHz / 100), static_cast<uint32_t>(CentiGHz % 100));
++  } else {
++    snprintf(Out, sizeof(Out), "%s", Name);
++  }
++}
++
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const {
+   FEXCore::CPUID::FunctionResults Res {};
+-  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
+-  memcpy(&Res, Data.ProductName, std::min(strlen(Data.ProductName), sizeof(FEXCore::CPUID::FunctionResults)));
++  char Brand[49];
++  BrandString(CPU, Brand);
++  memcpy(&Res, Brand + 0, sizeof(FEXCore::CPUID::FunctionResults));
+   return Res;
+ }
+ 
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const {
+   FEXCore::CPUID::FunctionResults Res {};
+-  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
+-  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 16);
+-  memcpy(&Res, Data.ProductName + 16, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
++  char Brand[49];
++  BrandString(CPU, Brand);
++  memcpy(&Res, Brand + 16, sizeof(FEXCore::CPUID::FunctionResults));
+   return Res;
+ }
+ 
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const {
+   FEXCore::CPUID::FunctionResults Res {};
+-  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
+-  const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 32);
+-  memcpy(&Res, Data.ProductName + 32, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
++  char Brand[49];
++  BrandString(CPU, Brand);
++  memcpy(&Res, Brand + 32, sizeof(FEXCore::CPUID::FunctionResults));
+   return Res;
+ }
+ 
+diff --git a/FEXCore/Source/Interface/Core/CPUID.h b/FEXCore/Source/Interface/Core/CPUID.h
+index 40187be..f928949 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.h
++++ b/FEXCore/Source/Interface/Core/CPUID.h
+@@ -231,6 +231,9 @@ private:
+ 
+   FEXCore::CPUID::FunctionResults Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const;
+   FEXCore::CPUID::FunctionResults Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const;
++  // madeira [cpu-identity]: the brand string leaves 0x80000002-4 return, with Intel's "@ x.xxGHz"
++  // naming the guest TSC's frequency (env MADEIRA_CPU_IDENTITY = 0: the product name alone).
++  void BrandString(uint32_t CPU, char (&Out)[49]) const;
+   FEXCore::CPUID::FunctionResults Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const;
+ 
+   FEXCore::CPUID::FunctionResults Function_8000_0005h(uint32_t Leaf) const;

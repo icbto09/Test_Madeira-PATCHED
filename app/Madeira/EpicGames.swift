@@ -468,16 +468,18 @@ struct EpicEntrySection: View {
             if let download {
                 EpicDownloadStatus(download: download)
                 switch download.state {
-                case .active, .queued: Button("Pause download") { epic.pause(app) }
-                case .paused, .failed: Button("Resume download") { epic.install(app) }
+                case .active, .queued: Button("Pause download") { epic.pause(app) }.padRow("epic-pause-download") { epic.pause(app) }
+                case .paused, .failed: Button("Resume download") { epic.install(app) }.padRow("epic-resume-download") { epic.install(app) }
                 }
             } else if epic.updateAvailable(app) {
                 Button { epic.install(app) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!epic.signedIn)
+                    .padRow("epic-update-available-downloa", when: !(!epic.signedIn)) { epic.install(app) }
             }
             if download == nil, record != nil {
                 Button { epic.repair(app) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
                     .disabled(!epic.signedIn)
+                    .padRow("epic-repair-installed-files", when: !(!epic.signedIn)) { epic.repair(app) }
                 Text("Checks every installed file against Epic's current build and downloads what is missing or changed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -489,14 +491,16 @@ struct EpicEntrySection: View {
                 }
             }
             if LibraryEntry.epicAntiCheatOffProgram[app] != nil {
-                Toggle("Start without Easy Anti-Cheat", isOn: Binding(get: { entry.epicAntiCheatOff != false },
-                                                                       set: { entry.epicAntiCheatOff = $0 ? nil : false }))
+                let noEAC = Binding(get: { entry.epicAntiCheatOff != false }, set: { entry.epicAntiCheatOff = $0 ? nil : false })
+                Toggle("Start without Easy Anti-Cheat", isOn: noEAC).padToggle("epic-no-eac", noEAC)
+
                 Text("Easy Anti-Cheat cannot run in Wine on iOS. With this on, the game starts in its own offline mode without it: offline matches, training, LAN and replays work, online matches do not.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             LabeledContent("App name", value: app)
             if record != nil, download == nil {
                 Button("Uninstall", role: .destructive) { confirmUninstall = true }
+                    .padRow("epic-uninstall", when: !cloud.isBusy) { confirmUninstall = true }
                     .disabled(cloud.isBusy)
             }
         } header: {
@@ -527,8 +531,10 @@ struct EpicSettingsSection: View {
                 LabeledContent("Signed in as", value: epic.accountName ?? "Epic Games account")
                 EpicCloudSettingRows()
                 Button("Sign out of Epic Games", role: .destructive) { confirmSignOut = true }
+                    .padRow("epic-sign-out") { confirmSignOut = true }
             } else {
                 Button { open(.epicSignIn) } label: { Label("Sign in to Epic Games", systemImage: "person.crop.circle.badge.plus") }
+                    .padRow("epic-sign-in") { open(.epicSignIn) }
             }
         } header: {
             Text("Epic Games")

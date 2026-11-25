@@ -35,11 +35,16 @@ import GameController
     @Published private(set) var shown = false
     /// The highlighted item's id.
     @Published private(set) var focus: String?
+    /// The last left/right and when (pad-pages): a held direction's repeats do not open or leave pages.
+    private var lastSide: (String, Date) = ("", .distantPast)
     /// The top layer's name, for the hints under the screen.
     @Published private(set) var layerName = PadLayer.root
 
     /// A press on an item: the item runs its own current action (PadItem's onReceive).
-    enum Kind { case press, play, menu }
+    /// (run-badge-grid) `alt`: Y on an item that has its own Y (a Library grid cover: its page).
+    /// decrease / increase (pad-pages): D-pad left / right on an item that changes its value (a slider, a
+    /// switch, a choice), when PadDpadRows is on.
+    enum Kind { case press, play, menu, alt, decrease, increase }
     let action = PassthroughSubject<(String, Kind), Never>()
 
     struct Item {
@@ -49,8 +54,14 @@ import GameController
         var menu: Bool
         /// The grid the item belongs to, for moving through covers that are not drawn yet.
         var grid: String?
+        /// (run-badge-grid) Y does the item's own thing, not Search.
+        var alt = false
         /// The view that registered it: a hidden tab's item with the same id never takes it away.
         var owner: ObjectIdentifier? = nil
+        /// Left and right change its value instead of moving the highlight (PadDpadRows).
+        var adjust = false
+        /// A row that opens a page: right with nothing to its right opens it (PadDpadRows).
+        var opens = false
     }
     private var items: [String: Item] = [:]
 
@@ -74,6 +85,15 @@ import GameController
         /// A page pushed inside a tab (a store's page, a Settings page, a game's page): LB/RB and
         /// Y still change tabs over it, as a tap on the tab bar does. A popup or sheet is not one.
         var page = false
+        /// (run-badge-grid) Y on this layer when the highlighted item has no Y of its own
+        /// (a game page: "Why this rating"). nil: Y is Search, as before.
+        var alt: (() -> Void)? = nil
+        /// (pad-layer-keep) A page another page was pushed over: its view is off screen but still in
+        /// the stack, so its layer stays (with the item to go back to) until it shows again.
+        var covered = false
+        /// (pad-layer-keep) A page whose covered page under it showed again: it is going (a swipe
+        /// back, or Back), and closes on its own onDisappear. A cancelled swipe makes it live again.
+        var leaving = false
     }
     private var layers: [Layer] = [Layer(name: PadLayer.root, back: nil, play: nil, start: nil, returnTo: nil)]
     var top: Layer { layers[layers.count - 1] }
@@ -123,17 +143,39 @@ import GameController
     func removeGrid(_ id: String) { grids[id] = nil }
 
     func push(_ name: String, start: String?, back: (() -> Void)?, play: (() -> Void)?, accept: (() -> Void)? = nil,
-              token: UUID? = nil, page: Bool = false) {
+              token: UUID? = nil, page: Bool = false, alt: (() -> Void)? = nil) {
+        // (pad-layer-keep) A covered page shown again (a page pushed over it went back): it keeps the
+        // item it goes back to, and the pages over it go (they close a moment later on their own).
+        var kept: String??
         if let i = layers.firstIndex(where: { token != nil ? $0.token == token : $0.name == name }), i > 0 {
+            if PadLayerKeep.on, layers[i].covered, i < layers.count - 1 {
+                // It goes on top with its own item to go back to; the pages that were over it stay,
+                // marked leaving, so a swipe back that is called off can put them back (leave()).
+                // The highlight goes to the row that opened the page over it.
+                let old = layers.remove(at: i)
+                let resume = layers[i].returnTo
+                for j in i..<layers.count { layers[j].leaving = true }
+                layers.append(Layer(name: name, back: back, play: play, start: start, returnTo: old.returnTo,
+                                    accept: accept, token: token, page: page, alt: alt))
+                entering = nil
+                layerName = name
+                if shown {
+                    move(to: resume.flatMap { items[$0]?.layer == name ? $0 : nil }
+                         ?? start.flatMap { items[$0] != nil ? $0 : nil } ?? first(in: name), scroll: true)
+                }
+                LogStore.shared.log("[pad-highlight] layer \(name) shown again")
+                return
+            }
+            if layers[i].covered { kept = .some(layers[i].returnTo) }
             layers.removeSubrange(i...)
         }
         // The item to come back to: only one on the layer under it (a page reopened in another
         // tab must not come back to an item of the tab it was opened from).
         // (None while a tab change is under way: the old tab's item is not on this tab.)
-        let returnTo = entering != nil ? nil : focus.flatMap { id in
+        let returnTo = kept ?? (entering != nil ? nil : focus.flatMap { id in
             items[id]?.layer == top.name || grids.values.contains(where: { $0.ids.contains(id) }) ? id : nil
-        }
-        layers.append(Layer(name: name, back: back, play: play, start: start, returnTo: returnTo, accept: accept, token: token, page: page))
+        })
+        layers.append(Layer(name: name, back: back, play: play, start: start, returnTo: returnTo, accept: accept, token: token, page: page, alt: alt))
         entering = nil
         layerName = name
         if shown { move(to: start.flatMap { items[$0] != nil ? $0 : nil } ?? first(in: name), scroll: false) }
@@ -146,19 +188,63 @@ import GameController
         guard let i = layers.firstIndex(where: { $0.name == name }) else { return }
         layers[i].back = back; layers[i].play = play
     }
+    /// (pad-layer-keep) A layer's view went off screen (PadLayerModifier.onDisappear). A page with
+    /// another page pushed over it is only covered: SwiftUI's NavigationStack calls onDisappear on
+    /// the page under a push (Apple forums 718738; oleb.net "Understanding SwiftUI view lifecycles"),
+    /// and 0.2.84-0.2.87 closed the game page's layer on every push and opened it again on the way
+    /// back (Cameron's log: "layer game closed / close game page (now the library)" on each
+    /// sub-page). Anything else closes as before. env.MADEIRA_PAD_LAYER_KEEP = 0: always closes.
+    func leave(_ name: String, token: UUID?) {
+        // A swipe back that was called off: the page under came back on top (push, above) and now goes
+        // again, while the pages over it that were leaving stay on screen. It goes back under them,
+        // covered, and they are live again.
+        if PadLayerKeep.on, let token, let i = layers.lastIndex(where: { $0.token == token }), i > 0,
+           i == layers.count - 1, layers[i].page, let k = layers.firstIndex(where: \.leaving), k < i {
+            var layer = layers.remove(at: i)
+            layer.covered = true
+            layers.insert(layer, at: k)
+            for j in (k + 1)..<layers.count { layers[j].leaving = false }
+            layerName = top.name
+            if shown { move(to: first(in: top.name), scroll: false) }
+            LogStore.shared.log("[pad-highlight] layer \(name) covered again (back called off)")
+            return
+        }
+        if PadLayerKeep.on, let token, let i = layers.lastIndex(where: { $0.token == token }), i > 0,
+           i < layers.count - 1, layers[i].page, !layers[i].leaving, layers[(i + 1)...].allSatisfy(\.page) {
+            layers[i].covered = true
+            LogStore.shared.log("[pad-highlight] layer \(name) covered")
+            return
+        }
+        pop(name, token: token)
+    }
+
     func pop(_ name: String, token: UUID? = nil) {
         guard let i = layers.lastIndex(where: { token != nil ? $0.token == token : $0.name == name }), i > 0 else { return }
         // Only this layer goes: a layer over it (the starting screen over a game page that the
         // session replaced) stays, and the highlight moves back only when this one was on top.
         let wasTop = i == layers.count - 1
-        let back = layers[i].returnTo
+        var back = layers[i].returnTo
         layers.remove(at: i)
+        // (pad-layer-keep) Pages left covered under it whose views are gone too (the tab went back to
+        // its first page, or another tab took over): they close with it, and the highlight goes back
+        // to what opened the lowest of them (the game's cover), not to a row of a page that is gone.
+        while PadLayerKeep.on, wasTop, layers.count > 1, top.covered {
+            LogStore.shared.log("[pad-highlight] layer \(top.name) closed (was covered)")
+            back = top.returnTo
+            layers.removeLast()
+        }
         layerName = top.name
         LogStore.shared.log("[pad-highlight] layer \(name) closed")
         guard wasTop else {
             // The page under it came back on top first (a game's own page closed inside a tab: the
             // game's page appeared again before this one went): the highlight goes back to its row.
-            if let back, items[back]?.layer == top.name { move(to: back, scroll: true) }
+            // (stock-apple, pad-pop-keep) Not when the highlight is already on that page: the sub-page's
+            // layer closes about half a second after the page under it came back, and a press in that time
+            // (an up after a left out of Cloud saves) was undone, the ring snapping back to the row it left
+            // (Cameron, 0.2.84 log 00:47:52.631 up to Steam, 00:47:52.842 "layer game-cloud closed", the next
+            // up again from Cloud). env.MADEIRA_PAD_POP_KEEP = 0: as before.
+            let already = PadPopKeep.on && focus.flatMap { items[$0]?.layer } == top.name
+            if let back, items[back]?.layer == top.name, !already { move(to: back, scroll: true) }
             return
         }
         // A tab was picked while this page was open on the old tab: the highlight goes to the
@@ -300,7 +386,11 @@ import GameController
     /// The nearest item in the top layer that lies `direction` from `from`: mostly straight
     /// ahead, a little to the side when nothing is.
     func nearest(from: CGRect, direction: String, skip: Set<String>) -> String? {
+        // The console look's rails (FluxScreens.swift, ids "fx-..."): between a rail row and the page
+        // beside it Left and Right also take an item that does not line up, when none does.
         var best: (String, CGFloat)?
+        var loose: (String, CGFloat)?
+        let fromRail = focus?.hasPrefix("fx-") ?? false
         for (id, item) in items where item.layer == top.name && !skip.contains(id) && id != focus && item.frame.width > 0 {
             let f = item.frame
             let ahead: CGFloat, side: CGFloat
@@ -312,11 +402,17 @@ import GameController
             default: continue
             }
             // Left and right stay in the row: an item with no overlap at all is skipped.
-            if direction == "left" || direction == "right", side > 0 { continue }
+            if direction == "left" || direction == "right", side > 0 {
+                if id.hasPrefix("fx-") != fromRail {
+                    let score = max(0, ahead) + side * 3
+                    if loose == nil || score < loose!.1 { loose = (id, score) }
+                }
+                continue
+            }
             let score = max(0, ahead) + side * 3
             if best == nil || score < best!.1 { best = (id, score) }
         }
-        return best?.0
+        return best?.0 ?? loose?.0
     }
     /// How far apart two spans are (0 when they overlap).
     private func gap(_ a0: CGFloat, _ a1: CGFloat, _ b0: CGFloat, _ b1: CGFloat) -> CGFloat {
@@ -368,8 +464,36 @@ import GameController
             LogStore.shared.log("[pad-highlight] re-homed from a gone item")
             return
         }
+        // (run-badge-grid) Y (sent as "add") on an item or a layer with a Y of its own; else Search below.
+        if command == "add" {
+            if let focus, let item = items[focus], item.layer == top.name, item.alt {
+                show(); action.send((focus, .alt)); return
+            }
+            if let alt = top.alt { show(); alt(); return }
+        }
         switch command {
         case "up", "down", "left", "right":
+            if PadDpadRows.on, command == "left" || command == "right" {
+                // A held direction repeats every 0.1 s: opening or leaving a page takes a fresh press,
+                // so a held left does not close page after page, nor a held right change the new page.
+                let repeated = lastSide.0 == command && Date().timeIntervalSince(lastSide.1) < 0.4
+                lastSide = (command, Date())
+                // Left toward the console look's rail still goes there, not into the row's value.
+                if command == "left", let id = next(command), id.hasPrefix("fx-") { move(to: id); return }
+                // A slider, switch or choice row: left and right change it, as on a console's settings.
+                if let focus, let item = items[focus], item.layer == top.name, item.adjust {
+                    action.send((focus, command == "left" ? .decrease : .increase)); return
+                }
+                if let id = next(command) { move(to: id); return }
+                // Nothing that way: right opens the highlighted row's page, left goes back a page.
+                if repeated { return }
+                if command == "right", let focus, let item = items[focus], item.layer == top.name, item.opens {
+                    action.send((focus, .press))
+                } else if command == "left", top.page, let back = top.back {
+                    back()
+                }
+                return
+            }
             if let id = next(command) { move(to: id) }
         case "pageUp", "pageDown":
             if let id = jump(down: command == "pageDown") { move(to: id) }
@@ -418,7 +542,13 @@ enum PadLayer {
 }
 
 private struct PadLayerKey: EnvironmentKey { static let defaultValue = PadLayer.root }
+private struct PadLayerAltKey: EnvironmentKey { static let defaultValue: (() -> Void)? = nil }
 extension EnvironmentValues {
+    /// (run-badge-grid) Y on the next layer in (PadLayerModifier reads it, and clears it inside).
+    var padLayerAlt: (() -> Void)? {
+        get { self[PadLayerAltKey.self] }
+        set { self[PadLayerAltKey.self] = newValue }
+    }
     /// The layer the views inside belong to (PadHighlight).
     var padLayer: String {
         get { self[PadLayerKey.self] }
@@ -462,6 +592,8 @@ struct PadItem: ViewModifier {
     var grid: String? = nil
     var play: (() -> Void)? = nil
     var menu: (() -> Void)? = nil
+    /// (run-badge-grid) What Y does on this item; nil: Y is the layer's (Search).
+    var alt: (() -> Void)? = nil
     /// The item is a capsule or a circle (buttons, pills, chips): the outline is a capsule around it.
     var capsule = false
     /// Where the outline sits: negative is a gap outside the item (the usual 4 pt), 0 is on its own
@@ -469,6 +601,10 @@ struct PadItem: ViewModifier {
     /// card, so it follows the card's curve instead of poking out). Its corners are always
     /// `cornerRadius - inset`, which keeps it concentric with the item.
     var inset: CGFloat = -4
+    /// D-pad left (-1) and right (+1) change the item's value (PadDpadRows).
+    var adjust: ((Int) -> Void)? = nil
+    /// The item opens a page: D-pad right opens it (PadDpadRows).
+    var opens = false
     let press: () -> Void
     @Environment(\.padLayer) private var layer
     /// Its last place: a page that comes back (a pushed page closed) is not measured again
@@ -480,33 +616,45 @@ struct PadItem: ViewModifier {
     @State private var on = false
     func body(content: Content) -> some View {
         content
+            // (stock-apple) Apple's focus look, one style per kind (Apple rulebook 13.22, 13.25): a list
+            // row lights up as a whole row; a cover (a picture that fills its cell) lifts with its ring (below).
+            .background {
+                if StockApple.on, on, StockApple.isRow(capsule: capsule, grid: grid, inset: inset) {
+                    RoundedRectangle(cornerRadius: max(0, cornerRadius - inset), style: .continuous)
+                        .fill(StockApple.ring.opacity(0.18))
+                        .padding(inset)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay {
                 // Every outline is concentric with its item (Apple's rule; Cameron, Nov 9: "make sure things
                 // line up"): the same shape, moved out or in by `inset`, corners changed by the same amount.
                 Group {
                     if capsule {
-                        Capsule().strokeBorder(Color.accentColor, lineWidth: 3)
+                        Capsule().strokeBorder(StockApple.ring, lineWidth: 3)
                     } else {
                         RoundedRectangle(cornerRadius: max(0, cornerRadius - inset), style: .continuous)
-                            .strokeBorder(Color.accentColor, lineWidth: 3)
+                            .strokeBorder(StockApple.ring, lineWidth: 3)
                     }
                 }
                 .padding(inset)
-                .opacity(on ? 1 : 0)
+                // (stock-apple) A row shows the whole-row light only, no ring as well.
+                .opacity(on && !(StockApple.on && StockApple.isRow(capsule: capsule, grid: grid, inset: inset)) ? 1 : 0)
                 .allowsHitTesting(false)
             }
+            .modifier(StockAppleLift(on: on, cover: grid != nil))
             .zIndex(on ? 1 : 0)
             .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
                 last.frame = frame
                 guard last.visible else { return }
-                PadHighlight.shared.register(id, .init(frame: frame, layer: layer, play: play != nil, menu: menu != nil, grid: grid,
-                                                        owner: ObjectIdentifier(last)))
+                PadHighlight.shared.register(id, .init(frame: frame, layer: layer, play: play != nil, menu: menu != nil, grid: grid, alt: alt != nil,
+                                                        owner: ObjectIdentifier(last), adjust: adjust != nil, opens: opens))
             }
             .onAppear {
                 last.visible = true
                 if last.frame != .zero {
-                    PadHighlight.shared.register(id, .init(frame: last.frame, layer: layer, play: play != nil, menu: menu != nil, grid: grid,
-                                                            owner: ObjectIdentifier(last)))
+                    PadHighlight.shared.register(id, .init(frame: last.frame, layer: layer, play: play != nil, menu: menu != nil, grid: grid, alt: alt != nil,
+                                                            owner: ObjectIdentifier(last), adjust: adjust != nil, opens: opens))
                 }
             }
             .onDisappear {
@@ -522,6 +670,9 @@ struct PadItem: ViewModifier {
                 case .press: press()
                 case .play: play?()
                 case .menu: menu?()
+                case .alt: alt?()
+                case .decrease: adjust?(-1)
+                case .increase: adjust?(1)
                 }
             }
     }
@@ -535,13 +686,17 @@ struct PadLayerModifier: ViewModifier {
     var play: (() -> Void)? = nil
     var accept: (() -> Void)? = nil
     var page = false
+    /// (run-badge-grid) Y on the layer (PadHighlight.Layer.alt), set from outside with
+    /// .padLayerAlt; the layers inside this one (its sheets and popups) do not get it.
+    @Environment(\.padLayerAlt) private var alt
     /// This view's own layer (two pages with one layer name can be up in different tabs).
     @State private var token = UUID()
     func body(content: Content) -> some View {
         content
             .environment(\.padLayer, name)
-            .onAppear { PadHighlight.shared.push(name, start: start, back: back, play: play, accept: accept, token: token, page: page) }
-            .onDisappear { PadHighlight.shared.pop(name, token: token) }
+            .environment(\.padLayerAlt, nil)
+            .onAppear { PadHighlight.shared.push(name, start: start, back: back, play: play, accept: accept, token: token, page: page, alt: alt) }
+            .onDisappear { PadHighlight.shared.leave(name, token: token) }
     }
 }
 
@@ -564,11 +719,15 @@ struct PadScrollFollow: ViewModifier {
 extension View {
     /// A controller-reachable item (PadHighlight): `id` is unique on the screen.
     /// `when`: false leaves the view out of the highlight (a pill that only shows a state).
+    /// `adjust`: D-pad left (-1) / right (+1) change the item's value; `opens`: D-pad right opens
+    /// its page (PadDpadRows).
     @ViewBuilder func padItem(_ id: String, cornerRadius: CGFloat = 16, grid: String? = nil,
-                              play: (() -> Void)? = nil, menu: (() -> Void)? = nil, when: Bool = true, capsule: Bool = false,
-                              inset: CGFloat = -4, press: @escaping () -> Void) -> some View {
+                              play: (() -> Void)? = nil, menu: (() -> Void)? = nil, alt: (() -> Void)? = nil, when: Bool = true, capsule: Bool = false,
+                              inset: CGFloat = -4, adjust: ((Int) -> Void)? = nil, opens: Bool = false,
+                              press: @escaping () -> Void) -> some View {
         if PadHighlight.enabled && when {
-            modifier(PadItem(id: id, cornerRadius: cornerRadius, grid: grid, play: play, menu: menu, capsule: capsule, inset: inset, press: press))
+            modifier(PadItem(id: id, cornerRadius: cornerRadius, grid: grid, play: play, menu: menu, alt: alt, capsule: capsule, inset: inset,
+                             adjust: adjust, opens: opens, press: press))
         } else { self }
     }
     /// A layer over the screens below (PadHighlight): `start` is its safe first item, `back` B.
@@ -577,6 +736,8 @@ extension View {
                                accept: (() -> Void)? = nil, page: Bool = false) -> some View {
         if PadHighlight.enabled { modifier(PadLayerModifier(name: name, start: start, back: back, play: play, accept: accept, page: page)) } else { self }
     }
+    /// (run-badge-grid) What Y does on the layer just inside this (put it right after .padLayer).
+    func padLayerAlt(_ alt: (() -> Void)?) -> some View { environment(\.padLayerAlt, alt) }
     /// Scrolls to the highlighted item (inside a ScrollViewReader).
     @ViewBuilder func padScrollFollow(_ reader: ScrollViewProxy, toTop: Set<String> = []) -> some View {
         if PadHighlight.enabled { modifier(PadScrollFollow(reader: reader, toTop: toTop)) } else { self }
@@ -590,7 +751,10 @@ extension View {
 /// bottom (Cameron, Wave 10, after the window's claim). While a controller is connected the
 /// Form's list takes no system focus; touch, and Madeira's own commands, work as before.
 struct PadNoSystemFocus: UIViewRepresentable {
-    func makeUIView(context: Context) -> Probe { Probe() }
+    /// (pad-focus-hold) The app-wide one (every tab's stack, every sheet): it only holds the focus,
+    /// it leaves the lists' own focus alone (a keyboard still walks them with no controller).
+    var app = false
+    func makeUIView(context: Context) -> Probe { let probe = Probe(); probe.app = app; return probe }
     func updateUIView(_ view: Probe, context: Context) {}
 
     /// Wave 12 (Cameron's log): the list's cells took the system focus even with allowsFocus
@@ -599,7 +763,12 @@ struct PadNoSystemFocus: UIViewRepresentable {
     /// focus whenever it lands elsewhere in its window, and does not let a direction move it
     /// away. Touch hides the highlight and lets focus go.
     final class Probe: UIView {
+        var app = false
         private var watch: NSObjectProtocol?
+        /// (pad-focus-hold) A controller connected, or the highlight shown again, after this view was
+        /// laid out: hold the focus then too, not only when the system's focus moves.
+        private var connectWatch: NSObjectProtocol?
+        private var shownSink: AnyCancellable?
         private static var appliedLogged = false
         private static var heldLogged = false
         override init(frame: CGRect) {
@@ -609,17 +778,25 @@ struct PadNoSystemFocus: UIViewRepresentable {
             focusEffect = nil
         }
         required init?(coder: NSCoder) { nil }
-        deinit { if let watch { NotificationCenter.default.removeObserver(watch) } }
+        deinit {
+            if let watch { NotificationCenter.default.removeObserver(watch) }
+            if let connectWatch { NotificationCenter.default.removeObserver(connectWatch) }
+        }
         private var holding: Bool {
             PadHighlight.enabled && PadHighlight.shared.shown && window != nil && !GCController.controllers().isEmpty
         }
         override var canBecomeFocused: Bool { holding }
         override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+            // (pad-focus-hold) A text field may always take the focus (Search's Type a Name, a sign-in
+            // code): the keyboard must not drop because the holder keeps the focus.
+            if PadFocusHold.on, context.nextFocusedItem is UITextInput { return super.shouldUpdateFocus(in: context) }
             if context.previouslyFocusedItem === self, holding { return false }
             return super.shouldUpdateFocus(in: context)
         }
         private func hold() {
             guard holding, let system = UIFocusSystem.focusSystem(for: self), system.focusedItem !== self else { return }
+            // (pad-focus-hold) Not from a text field that has the focus (it is being typed in).
+            if PadFocusHold.on, system.focusedItem is UITextInput { return }
             system.requestFocusUpdate(to: self)
             system.updateFocusIfNeeded()
             if !Self.heldLogged {
@@ -630,9 +807,27 @@ struct PadNoSystemFocus: UIViewRepresentable {
         override func didMoveToWindow() {
             super.didMoveToWindow()
             if let watch { NotificationCenter.default.removeObserver(watch); self.watch = nil }
+            if let connectWatch { NotificationCenter.default.removeObserver(connectWatch); self.connectWatch = nil }
+            shownSink = nil
             guard window != nil else { return }
             watch = NotificationCenter.default.addObserver(forName: UIFocusSystem.didUpdateNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.hold() }
+            }
+            if PadFocusHold.on {
+                connectWatch = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        if !self.app { self.apply() }
+                        self.hold()
+                    }
+                }
+                shownSink = PadHighlight.shared.$shown.removeDuplicates().filter { $0 }
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] _ in MainActor.assumeIsolated { self?.hold() } }
+            }
+            if app {
+                DispatchQueue.main.async { [weak self] in self?.hold() }
+                return
             }
             // The list is in the hierarchy once the Form's first layout ran.
             DispatchQueue.main.async { [weak self] in self?.apply(); self?.hold() }
@@ -643,6 +838,9 @@ struct PadNoSystemFocus: UIViewRepresentable {
             LogStore.shared.log("[pad-highlight] a page's list takes no system focus (\(count))")
         }
         private func apply() {
+            // (pad-focus-hold) Now that this view is there with no controller too: a keyboard alone
+            // keeps walking the list; the list stops taking the focus once a controller connects.
+            if PadFocusHold.on, GCController.controllers().isEmpty { return }
             // Inside a row: the list is an ancestor.
             var up = superview
             while let view = up {
@@ -680,6 +878,7 @@ struct PadSheet: ViewModifier {
     @Environment(\.dismiss) private var dismiss
     func body(content: Content) -> some View {
         content
+            .padFocusHold()
             .modifier(ClaimGamepadEvents())
             .padLayer("sheet", back: { dismiss() }, accept: accept)
             .onAppear { PadHighlight.shared.sheets += 1 }
@@ -704,11 +903,265 @@ extension View {
     /// A Form the system's focus must not walk while a controller is connected
     /// (PadNoSystemFocus): the game's pages.
     @ViewBuilder func padNoSystemFocus() -> some View {
-        if PadHighlight.enabled, GamepadInput.enabled, !GCController.controllers().isEmpty {
+        // (pad-focus-hold) Also when the controller connects after the page was built: the view only
+        // holds while a controller is connected (Probe.holding), so it can always be there.
+        if PadHighlight.enabled, GamepadInput.enabled, PadFocusHold.on || !GCController.controllers().isEmpty {
             background(PadNoSystemFocus().frame(width: 1, height: 1).allowsHitTesting(false))
         } else { self }
     }
 
     /// A sheet over the tabs: B closes it and A runs `accept` (PadSheet).
     func padSheet(accept: (() -> Void)? = nil) -> some View { modifier(PadSheet(accept: accept)) }
+    /// (pad-focus-hold) iPadOS's own focus off every screen while Madeira's highlight shows: on iPad
+    /// the controller also walks the system's focus, whose blue fill and ring moved apart from
+    /// Madeira's white ring and gray row (Matrix, Nov 24: "one menu is selected Grey and the other
+    /// is selected highlighted in Blue"). The page blocker (padNoSystemFocus) was on a few pages only.
+    /// One holder per tab stack and per sheet (a sheet's focus is its own). env.MADEIRA_PAD_FOCUS_HOLD = 0: as before.
+    @ViewBuilder func padFocusHold() -> some View {
+        if PadFocusHold.on, PadHighlight.enabled, GamepadInput.enabled {
+            background(PadNoSystemFocus(app: true).frame(width: 1, height: 1).allowsHitTesting(false))
+        } else { self }
+    }
+}
+
+// MARK: - Settings rows (settings-pad-rows)
+
+/// (stock-apple, Nov 22 2026, Cameron: "I wanted the whole app basically just to look like Apple.")
+/// Stage 1: the Library grid and the game page use Apple's stock parts (a large title, a segmented
+/// control, grouped lists, plain prominent buttons), and the controller's highlight copies Apple's
+/// focus look: covers lift with a ring, list rows light up as a whole row, buttons get a ring, all in
+/// one color. Glass buttons drop their "interactive" press glow (suspected, unproven, source of the
+/// yellow and green blobs in 0.2.84: Apple forums 816909, 826485).
+/// env.MADEIRA_STOCK_APPLE = 0: everything as in 0.2.84. Read once.
+/// (stock-apple) A highlighted cover lifts a little, with a shadow, as Apple's focused pictures do.
+/// Nothing at all is added with the switch off or on a non-cover item (no shadow pass per row).
+struct StockAppleLift: ViewModifier {
+    let on: Bool
+    let cover: Bool
+    @ViewBuilder func body(content: Content) -> some View {
+        if StockApple.on, cover {
+            content
+                .scaleEffect(on ? 1.05 : 1)
+                .shadow(color: .black.opacity(on ? 0.5 : 0), radius: 14, y: 8)
+                .animation(PadHighlight.animation, value: on)
+        } else {
+            content
+        }
+    }
+}
+
+/// (pad-pop-keep) A sub-page closing late never moves a highlight that is already on the page under it
+/// (PadHighlight.pop). env.MADEIRA_PAD_POP_KEEP = 0: as in 0.2.84. Read once.
+/// (pad-layer-keep) A page with another page pushed over it keeps its layer (PadHighlight.leave).
+/// env.MADEIRA_PAD_LAYER_KEEP = 0: as in 0.2.87. Read once.
+enum PadLayerKeep {
+    static let on = MadeiraConfig.flag("MADEIRA_PAD_LAYER_KEEP")
+}
+
+enum PadPopKeep {
+    static let on = MadeiraConfig.flag("MADEIRA_PAD_POP_KEEP")
+}
+
+/// (pad-focus-hold) See View.padFocusHold. Read once.
+enum PadFocusHold {
+    static let on = MadeiraConfig.flag("MADEIRA_PAD_FOCUS_HOLD")
+}
+
+enum StockApple {
+    static let on = MadeiraConfig.flag("MADEIRA_STOCK_APPLE")
+    /// Stage 2 (Nov 22 2026, Cameron's yes): the game page's rating as a list row, and the Stores,
+    /// Settings and Downloads tabs as Apple's plain lists on a wide iPad too (no rail beside a stage).
+    /// env.MADEIRA_STOCK_APPLE_2 = 0: as in 0.2.87. Needs stage 1 on. Read once.
+    static let stage2 = on && MadeiraConfig.flag("MADEIRA_STOCK_APPLE_2")
+    /// Stage 3 (Nov 22 2026, Cameron's pick "Spidy's design (B)"): game art behind the Library and the
+    /// game page, one JIT and Memory+ button, smaller run marks, the Store tab as one list of every
+    /// store's games, and "Why this rating" as a pushed page. Only the look changes; every feature
+    /// stays reachable by touch and controller. env.MADEIRA_STOCK_APPLE_3 = 0: all of it off, as in
+    /// 0.2.88. Needs stage 1 on. Read once. Each part below has its own switch too.
+    static let stage3 = on && MadeiraConfig.flag("MADEIRA_STOCK_APPLE_3")
+    /// Stage 4 (Nov 24 2026, Cameron: "for the stock Apple look, we never finished that?"): the starting
+    /// screen, the store pages, first-time setup, Get Help, the rate card and the last custom pills as
+    /// Apple's grouped lists and buttons. Only the look changes. env.MADEIRA_STOCK_APPLE_4 = 0: as in
+    /// 0.2.99. Needs stage 1 on. Read once.
+    static let stage4 = on && MadeiraConfig.flag("MADEIRA_STOCK_APPLE_4")
+    /// env.MADEIRA_ART_HEADER = 0: no game art behind the Library and the game page.
+    static let artHeader = stage3 && MadeiraConfig.flag("MADEIRA_ART_HEADER")
+    /// env.MADEIRA_JIT_BOLT = 0: the Library keeps its two JIT and Memory+ pills.
+    static let jitBolt = stage3 && MadeiraConfig.flag("MADEIRA_JIT_BOLT")
+    /// env.MADEIRA_STORE_LIST = 0: the Store tab is the list of store pages again.
+    static let storeList = stage3 && MadeiraConfig.flag("MADEIRA_STORE_LIST")
+    /// env.MADEIRA_WHY_PAGE = 0: "Why this rating" opens as a sheet from the game page again.
+    static let whyPage = stage3 && MadeiraConfig.flag("MADEIRA_WHY_PAGE")
+    /// Settings › Appearance › Game art behind pages (on when never set).
+    static let artKey = "madeiraArtBehindPages"
+    /// Settings › Appearance › Names on covers (on when never set; a new install starts with it off).
+    static let namesKey = "madeiraGridCoverNames"
+    /// The ring's color: the label color (white in dark mode), the same on every screen; 0.2.84 used
+    /// the accent color, which a tint above the item could change.
+    static var ring: Color { on ? Color.primary : Color.accentColor }
+    /// A list row: every row in Madeira's lists (padRow, NewLookLinkRow, the game page's rows) is
+    /// tagged with inset -6; covers, cards and buttons use the usual -4, a tab in the tab bar 0.
+    static func isRow(capsule: Bool, grid: String?, inset: CGFloat) -> Bool {
+        !capsule && grid == nil && inset == -6
+    }
+}
+
+/// Settings' pages (SettingsPageView) had a layer of their own but almost no items on it, so
+/// past the Settings tab's list the highlight had nowhere to go and only B worked (Cameron, Nov
+/// 21 2026: "when you get deep into setting the controller doesn't work the farther you get into
+/// tabs"). Each row of those pages is now an item: A flips a switch, steps a picker to its next
+/// choice, or presses a button or opens a link, as a tap does. env.MADEIRA_PAD_SETTINGS_ROWS = 0:
+/// as in 0.2.81 (only Console look and Cover size). Read once.
+enum PadSettingsRows {
+    static let on = MadeiraConfig.flag("MADEIRA_PAD_SETTINGS_ROWS")
+}
+
+/// pad-pages (Cameron, Nov 22 2026, 0.2.83: "the D-pad doesn't work for [the sliders]" and "the
+/// D-pad doesn't work to move in and out of settings"): on a slider, switch or choice row left and
+/// right change it; with nothing to the right, right opens a row's page; with nothing to the left,
+/// left goes back a page. env.MADEIRA_PAD_DPAD_ROWS = 0: left and right only move, as in 0.2.83. Read once.
+enum PadDpadRows {
+    static let on = MadeiraConfig.flag("MADEIRA_PAD_DPAD_ROWS")
+}
+
+/// Controller binds, Gyro aim & turbo and Mouse put their Reset on the page once (Library.swift
+/// page(_:)): on the page's Sections it came out 5 to 7 times (Cameron, Nov 22 2026, 0.2.83).
+/// env.MADEIRA_PAGE_TOOLBAR_ONCE = 0: as in 0.2.83. Read once.
+enum PageToolbarOnce {
+    static let on = MadeiraConfig.flag("MADEIRA_PAGE_TOOLBAR_ONCE")
+}
+
+/// The value `by` steps from `current` in `values`, held at the first and last (a value not in
+/// `values` goes to the first).
+func padStep<T: Equatable>(_ values: [T], from current: T, by: Int) -> T {
+    guard let first = values.first else { return current }
+    guard let index = values.firstIndex(of: current) else { return first }
+    return values[min(values.count - 1, max(0, index + by))]
+}
+
+extension View {
+    /// A Settings row the controller reaches (PadSettingsRows): A runs `press`.
+    @ViewBuilder func padRow(_ id: String, when: Bool = true, adjust: ((Int) -> Void)? = nil, opens: Bool = false,
+                             press: @escaping () -> Void) -> some View {
+        // padRowFill: a button row's outline is the whole row, as on Settings' list (NewLookPadFix.ringMatch).
+        if PadSettingsRows.on {
+            padRowFill().padItem(id, cornerRadius: 12, when: when, inset: -6, adjust: adjust, opens: opens, press: press)
+        } else { self }
+    }
+    /// A switch row: A flips it; left turns it off, right on (PadDpadRows).
+    func padToggle(_ id: String, _ isOn: Binding<Bool>, when: Bool = true) -> some View {
+        padRow(id, when: when, adjust: { let v = $0 > 0; if isOn.wrappedValue != v { isOn.wrappedValue = v } }) { isOn.wrappedValue.toggle() }
+    }
+    /// A picker row: A steps to the next of `values` (after the last, the first); left and right
+    /// step back and on, stopping at the ends (PadDpadRows).
+    func padPicker<T: Equatable>(_ id: String, _ selection: Binding<T>, _ values: [T], when: Bool = true) -> some View {
+        padRow(id, when: when && !values.isEmpty, adjust: { let v = padStep(values, from: selection.wrappedValue, by: $0); if v != selection.wrappedValue { selection.wrappedValue = v } }) {
+            selection.wrappedValue = padNext(values, after: selection.wrappedValue)
+        }
+    }
+    /// A slider row: A steps to the next of `values` (after the last, the first; a value between
+    /// two steps goes to the next step above it); left and right step down and up, stopping at the ends.
+    func padSlider(_ id: String, _ value: Binding<Double>, _ values: [Double], when: Bool = true) -> some View {
+        padRow(id, when: when && !values.isEmpty, adjust: { by in
+            let now = value.wrappedValue
+            let v = by > 0 ? (values.first(where: { $0 > now + 0.0001 }) ?? values[values.count - 1])
+                           : (values.last(where: { $0 < now - 0.0001 }) ?? values[0])
+            if abs(v - now) > 0.0001 { value.wrappedValue = v }  // at an end: no write
+        }) {
+            let now = value.wrappedValue
+            value.wrappedValue = values.first(where: { $0 > now + 0.0001 }) ?? values[0]
+        }
+    }
+    /// A slider over `range` (pad-pages): left and right move it by `step`, held repeats; A steps up
+    /// by `step` and wraps to the bottom after the top.
+    func padRange(_ id: String, _ value: Binding<Double>, in range: ClosedRange<Double>, step: Double, when: Bool = true) -> some View {
+        padRow(id, when: when, adjust: { by in
+            let now = value.wrappedValue
+            let v = min(range.upperBound, max(range.lowerBound, now + Double(by) * step))
+            if abs(v - now) > 0.0001 { value.wrappedValue = v }  // at an end: no write
+        }) {
+            let up = value.wrappedValue + step
+            value.wrappedValue = up > range.upperBound + 0.0001 ? range.lowerBound : min(range.upperBound, up)
+        }
+    }
+    /// A page pushed from a Settings page (Advanced › Logs, a log): B goes back a page, and the
+    /// system focus stays off its list as on the Settings page under it.
+    @ViewBuilder func padSettingsSubpage() -> some View {
+        if PadSettingsRows.on { modifier(PadSettingsForm()).modifier(NewLookSettingsChrome()) } else { self }
+    }
+}
+
+/// A Settings page's Form, as a game's pages are (Library.swift page(_:)): it scrolls to follow
+/// the highlight, so rows below the screen are laid out and reachable, and the system's focus
+/// stays off its rows while Madeira's highlight walks them (PadNoSystemFocus). Off with PadSettingsRows.
+struct PadSettingsForm: ViewModifier {
+    @ViewBuilder func body(content: Content) -> some View {
+        if PadSettingsRows.on {
+            ScrollViewReader { reader in content.padScrollFollow(reader) }.padNoSystemFocus()
+        } else { content }
+    }
+}
+
+// MARK: - Links inside a page's rows (pad-pages)
+
+/// A page pushed by the controller from a row (padLink): the destination, shown by the page's
+/// PadPushHost. Equal by id, so each push is a new page.
+struct PadPushPage: Identifiable, Hashable {
+    let id = UUID()
+    let view: AnyView
+    static func == (a: PadPushPage, b: PadPushPage) -> Bool { a.id == b.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// How a row inside a page asks the page to push a destination.
+final class PadPushBox: @unchecked Sendable {
+    let push: (AnyView) -> Void
+    init(_ push: @escaping (AnyView) -> Void) { self.push = push }
+}
+
+private struct PadPushKey: EnvironmentKey { static var defaultValue: PadPushBox? { nil } }
+extension EnvironmentValues {
+    /// The nearest page that can push a row's destination (PadPushHost), nil outside one.
+    var padPush: PadPushBox? {
+        get { self[PadPushKey.self] }
+        set { self[PadPushKey.self] = newValue }
+    }
+}
+
+/// On a page's Form (not inside its rows, where SwiftUI ignores a navigationDestination): pushes
+/// what a padLink row inside asks for. A NavigationLink cannot be pressed from code, so a row with
+/// one gets padLink and the controller's A or D-pad right opens the same page through here.
+struct PadPushHost: ViewModifier {
+    @State private var page: PadPushPage?
+    @State private var box: PadPushBox?  // made once, so padLink rows are not redrawn each render
+    @ViewBuilder func body(content: Content) -> some View {
+        if PadSettingsRows.on {
+            content
+                .environment(\.padPush, box)
+                .onAppear { if box == nil { let page = $page; box = PadPushBox { page.wrappedValue = PadPushPage(view: $0) } } }
+                .navigationDestination(item: $page) { $0.view }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// A NavigationLink row the controller can open (A, or D-pad right): pushes `destination`
+    /// through the page's PadPushHost, with B back.
+    func padLink<Destination: View>(_ id: String, when: Bool = true, @ViewBuilder _ destination: @escaping () -> Destination) -> some View {
+        modifier(PadLinkRow(id: id, when: when, destination: destination))
+    }
+}
+
+private struct PadLinkRow<Destination: View>: ViewModifier {
+    let id: String
+    let when: Bool
+    let destination: () -> Destination
+    @Environment(\.padPush) private var push
+    func body(content: Content) -> some View {
+        content.padRow(id, when: when && push != nil, opens: true) {
+            push?.push(AnyView(destination().padSettingsSubpage()))
+        }
+    }
 }

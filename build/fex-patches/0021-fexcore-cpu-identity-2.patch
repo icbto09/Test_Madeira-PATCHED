@@ -1,0 +1,289 @@
+diff --git a/FEXCore/Source/Interface/Core/CPUID.cpp b/FEXCore/Source/Interface/Core/CPUID.cpp
+index 14bc7d6..e672f62 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.cpp
++++ b/FEXCore/Source/Interface/Core/CPUID.cpp
+@@ -156,6 +156,25 @@ constexpr uint32_t FAMILY_IDENTIFIER = GenerateFamily(CPUFamily {
+ });
+ #endif
+ 
++// madeira [cpu-x64-identity] (env MADEIRA_CPU_X64_IDENTITY = 0 turns it off; on by default; needs the master
++// MADEIRA_CPU_IDENTITY). rev=cpu-identity-2. The owner's call (Nov 23): the CPU is named as an x64 PC's would
++// be, instead of "Unknown ARM CPU" with an Intel signature no real part has (family 6 model 0xA6 is Comet
++// Lake-U, which has 2-6 cores with Hyper-Threading, never 8 cores / 8 threads, and no Comet Lake runs at 1.00 GHz).
++// The part: Intel Core i3-N305 (Alder Lake-N), a real 8-core / 8-thread part with no Hyper-Threading, so the
++// topology the PEB, SLPI, registry and CPUID name (8 x 1) is its own. Its CPUID signature is family 6,
++// model 0xBE, stepping 0 (0xB06E0). Like every Intel part from the 12th generation on, its brand string carries
++// no "@ x.xxGHz", so it cannot disagree with leaf 0x16, ~MHz and NtPowerInformation (all 1000 MHz here, the
++// guest TSC rate). The registry writer (build/ntdll-unix/hw_registry_ios.h) uses the same two values.
++constexpr uint32_t MADEIRA_X64_FAMILY_IDENTIFIER = GenerateFamily(CPUFamily {
++  .Stepping = 0,
++  .Model = 0xE,
++  .ExtendedModel = 0xB,
++  .FamilyID = 6,
++  .ExtendedFamilyID = 0,
++  .ProcessorType = 0,
++});
++static const char MADEIRA_X64_BRAND[] = "Intel(R) Core(TM) i3-N305";
++
+ #ifdef ARCHITECTURE_arm64
+ uint64_t GetCycleCounterFrequency() {
+   uint64_t Result {};
+@@ -471,6 +490,43 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_0h(uint32_t Leaf) const {
+   return Res;
+ }
+ 
++/* madeira [cpu-identity] switches, rev=cpu-identity-2. Read once per process.
++ *   MADEIRA_CPU_IDENTITY=0        master: everything below off (the pre-cpu-identity answers).
++ *   MADEIRA_CPU_IDENTITY_BRAND=0  only the brand part off: no " @ x.xxGHz" suffix (here and in the registry).
++ *   MADEIRA_FEX_CPU_COUNT=0       only the count part off: one logical CPU in CPUID (and one CentralProcessor key).
++ *   MADEIRA_CPU_X64_IDENTITY=0    only the x64 name off: "Unknown ARM CPU" and family 6 model 0xA6 again
++ *                                 (see MADEIRA_X64_FAMILY_IDENTIFIER; Wine side: hw_registry_ios.h, system.c,
++ *                                 signal_arm64ec.c).
++ * The count part makes CPUID name the processor count the PEB, GetSystemInfo, KUSER_SHARED_DATA and
++ * SystemLogicalProcessorInformationEx already name (Windows/Common/CPUFeatures.cpp fills one CPU entry per
++ * processor), with 1 thread per core: leaf 1 HTT=1 and EBX[23:16]=count, leaf 4 EAX[31:26]=count-1 (already),
++ * leaf 0xB SMT level 1 / core level count, leaf 0x8000_0008 ApicIdSize=log2. The registry side
++ * (build/ntdll-unix/hw_registry_ios.h, hwreg_identity_*) parses the same three variables the same way.
++ * Overwatch 2 (0.2.94 log): with the registry saying 8 CentralProcessor keys and CPUID saying 1 logical
++ * processor its loader crashed at 5 s on a mis-derived pointer; with 1 and 1 it ran. */
++static bool MadeiraEnvOff(const char* Name) {
++  const char* E = getenv(Name);
++  return E && E[0] == '0' && E[1] == '\0';
++}
++
++static bool MadeiraBrandGHz() {
++  static const bool On = !MadeiraEnvOff("MADEIRA_CPU_IDENTITY") && !MadeiraEnvOff("MADEIRA_CPU_IDENTITY_BRAND");
++  return On;
++}
++
++// MADEIRA_CPU_X64_IDENTITY=0 (or the master off): the old signature (family 6 model 0xA6) and brand.
++static bool MadeiraX64Identity() {
++  static const bool On = !MadeiraEnvOff("MADEIRA_CPU_IDENTITY") && !MadeiraEnvOff("MADEIRA_CPU_X64_IDENTITY");
++  return On;
++}
++
++// MADEIRA cpuid-cpu-count (FEX-Emu PR #6120, Ryan Houdek, MIT; upstream has it since eb7a9f2 + 65da98d): leaf 1
++// HTT and leaf 0x8000_0008 ApicIdSize, plus leaf 0xB (ours). Off restores the old answers bit for bit.
++static bool MadeiraCpuCountFix() {
++  static const bool On = !MadeiraEnvOff("MADEIRA_CPU_IDENTITY") && !MadeiraEnvOff("MADEIRA_FEX_CPU_COUNT");
++  return On;
++}
++
+ // Processor Info and Features bits
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
+   FEXCore::CPUID::FunctionResults Res {};
+@@ -478,7 +534,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
+   // Hypervisor bit is normally set but some applications have issues with it.
+   uint32_t Hypervisor = HideHypervisorBit() ? 0 : 1;
+ 
+-  Res.eax = FAMILY_IDENTIFIER;
++  Res.eax = MadeiraX64Identity() ? MADEIRA_X64_FAMILY_IDENTIFIER : FAMILY_IDENTIFIER; // madeira [cpu-x64-identity]
+ 
+   // MADEIRA ml980: the local APIC ID must be one of the `Cores` addressable IDs reported in the
+   // same register. GetCPUID() is a raw host core number that is not bounded by Cores, so a host
+@@ -553,7 +609,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
+             (1 << 25) | // SSE
+             (1 << 26) | // SSE2
+             (0 << 27) | // Self Snoop
+-            (0 << 28) | // (HTT) Max APIC IDs reserved field is valid
++            (MadeiraCpuCountFix() ? (1u << 28) : 0u) | // (HTT) Max APIC IDs reserved field is valid (madeira [cpu-identity-2])
+             (1 << 29) | // Thermal monitor
+             (0 << 30) | // Reserved
+             (0 << 31);  // Pending break enable
+@@ -907,6 +963,32 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
+   return Res;
+ }
+ 
++// 0xB: Extended topology enumeration. madeira [cpu-identity-2], ours (upstream FEX leaves 0xB reserved).
++// One package of `Cores` cores with one thread each, the topology leaf 1/4, SystemLogicalProcessorInformationEx
++// and the registry describe. EDX is the x2APIC ID, the same number leaf 1 EBX[31:24] gives on this CPU. With the
++// count part off it is all zero, as before (Intel: EBX = 0 at sub-leaf 0 means "leaf 0xB not supported").
++FEXCore::CPUID::FunctionResults CPUIDEmu::Function_0Bh(uint32_t Leaf) const {
++  FEXCore::CPUID::FunctionResults Res {};
++  if (!MadeiraCpuCountFix()) {
++    return Res;
++  }
++  constexpr uint32_t LevelSMT = 1;
++  constexpr uint32_t LevelCore = 2;
++  if (Leaf == 0) {
++    Res.eax = 0;                        // Bits to shift the x2APIC ID to reach the core ID: 1 thread per core
++    Res.ebx = 1;                        // Logical processors at this level (threads per core)
++    Res.ecx = (LevelSMT << 8) | Leaf;   // Level type, level number
++  } else if (Leaf == 1) {
++    Res.eax = FEXCore::ilog2(std::bit_ceil(Cores)); // Bits to shift the x2APIC ID to reach the package ID
++    Res.ebx = Cores;                                // Logical processors in the package
++    Res.ecx = (LevelCore << 8) | Leaf;
++  } else {
++    Res.ecx = Leaf & 0xFF;              // Invalid level: EAX = EBX = 0, level type 0
++  }
++  Res.edx = CurrentCPUIndex();          // x2APIC ID
++  return Res;
++}
++
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_0Dh(uint32_t Leaf) const {
+   // Leaf 0
+   FEXCore::CPUID::FunctionResults Res {};
+@@ -1136,7 +1218,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0001h(uint32_t Leaf) con
+ #endif
+   FEXCore::CPUID::FunctionResults Res {};
+ 
+-  Res.eax = FAMILY_IDENTIFIER;
++  Res.eax = MadeiraX64Identity() ? MADEIRA_X64_FAMILY_IDENTIFIER : FAMILY_IDENTIFIER; // madeira [cpu-x64-identity]
+ 
+   Res.ecx = (1 << 0) |                               // LAHF/SAHF
+             (1 << 1) |                               // 0 = Single core product, 1 = multi core product
+@@ -1233,23 +1315,17 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) con
+  * MADEIRA_FEX_CPUID_FREQ=1). Leaf 0x16 and the hypervisor bit were ported before (cpuid-clock-leaf,
+  * fex-hv-leaf-hide); this is the brand-string part. Ours rounds to the nearest 10MHz across the GHz digit
+  * (his formula prints 1995MHz as "1.00GHz"). Madeira's own registry writer (build/ntdll-unix/hw_registry_ios.h,
+- * hwreg_brand) builds the same string for ProcessorNameString and reads the same switch. Read once per process. */
+-static bool MadeiraBrandGHz() {
+-  static const bool On = [] {
+-    const char* E = getenv("MADEIRA_CPU_IDENTITY");
+-    const bool V = !(E && E[0] == '0' && E[1] == '\0');
+-    LogMan::Msg::EFmt("[cpu-identity] rev=cpu-identity-1 {}", V ? "on" : "off (MADEIRA_CPU_IDENTITY=0)");
+-    return V;
+-  }();
+-  return On;
+-}
+-
++ * hwreg_brand) builds the same string for ProcessorNameString and reads the same switches. Read once per process.
++ * rev=cpu-identity-2: the suffix is also off with MADEIRA_CPU_IDENTITY_BRAND=0 (MadeiraBrandGHz, above Function_01h). */
+ void CPUIDEmu::BrandString(uint32_t CPU, char (&Out)[49]) const {
+   auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
+   const char* Name = Data.ProductName ? Data.ProductName : "";
+   const uint64_t MHz = (GetCycleCounterFrequency() << CTX->Config.TSCScale) / 1'000'000;
+   memset(Out, 0, sizeof(Out));
+-  if (MHz && MadeiraBrandGHz()) {
++  if (MadeiraX64Identity()) {
++    // madeira [cpu-x64-identity]: the real part's own string, which names no frequency.
++    snprintf(Out, sizeof(Out), "%s", MADEIRA_X64_BRAND);
++  } else if (MHz && MadeiraBrandGHz()) {
+     const uint64_t CentiGHz = (MHz + 5) / 10;
+     snprintf(Out, sizeof(Out), "%s @ %u.%02uGHz", Name, static_cast<uint32_t>(CentiGHz / 100), static_cast<uint32_t>(CentiGHz % 100));
+   } else {
+@@ -1362,9 +1438,11 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0008h(uint32_t Leaf) con
+             (CTX->HostFeatures.SupportsCLZERO << 0); // CLZERO support
+ 
+   uint32_t CoreCount = Cores - 1;
+-  Res.ecx = (0 << 16) |                    // PerfTscSize: Performance timestamp count size
+-            (std::bit_ceil(Cores) << 12) | // ApicIdSize: Number of bits in ApicID
+-            (CoreCount << 0);              // Count count subtract one
++  // madeira [cpu-identity-2] (FEX-Emu 65da98d): ApicIdSize is a bit count, log2 of the ID space, not the space itself.
++  const uint32_t ApicIdSize = MadeiraCpuCountFix() ? FEXCore::ilog2(std::bit_ceil(Cores)) : std::bit_ceil(Cores);
++  Res.ecx = (0 << 16) |          // PerfTscSize: Performance timestamp count size
++            (ApicIdSize << 12) | // ApicIdSize: Number of bits in ApicID
++            (CoreCount << 0);    // Count count subtract one
+ 
+   return Res;
+ }
+@@ -1516,5 +1594,10 @@ CPUIDEmu::CPUIDEmu(const FEXCore::Context::ContextImpl* ctx)
+   LogMan::Msg::EFmt("[cpuid] ml980 PerCPUData entries={} host cpu now={} source={} -- brand-string/hybrid leaves "
+                     "subscript the table with the host cpu index; indices are wrapped into range",
+                     PerCPUData.size(), GetCPUID(), SupportsCPUIndexInTPIDRRO ? "TPIDRRO_EL0" : "getcpu");
++  // madeira [cpu-identity-2]: which parts are on, and the topology CPUID now names.
++  LogMan::Msg::EFmt("[cpu-identity] rev=cpu-identity-2 fex x64={} brand={} count={} signature={:#x} logical={} htt={} apicidsize={}",
++                    MadeiraX64Identity() ? "on" : "off", MadeiraBrandGHz() ? "on" : "off", MadeiraCpuCountFix() ? "on" : "off",
++                    MadeiraX64Identity() ? MADEIRA_X64_FAMILY_IDENTIFIER : FAMILY_IDENTIFIER, Cores, MadeiraCpuCountFix() ? 1 : 0,
++                    MadeiraCpuCountFix() ? FEXCore::ilog2(std::bit_ceil(Cores)) : std::bit_ceil(Cores));
+ }
+ } // namespace FEXCore
+diff --git a/FEXCore/Source/Interface/Core/CPUID.h b/FEXCore/Source/Interface/Core/CPUID.h
+index f928949..a0f9200 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.h
++++ b/FEXCore/Source/Interface/Core/CPUID.h
+@@ -215,6 +215,8 @@ private:
+   FEXCore::CPUID::FunctionResults Function_04h(uint32_t Leaf) const;
+   FEXCore::CPUID::FunctionResults Function_06h(uint32_t Leaf) const;
+   FEXCore::CPUID::FunctionResults Function_07h(uint32_t Leaf) const;
++  // madeira [cpu-identity-2]: leaf 0xB (x2APIC topology), zero (as before) with the count part off.
++  FEXCore::CPUID::FunctionResults Function_0Bh(uint32_t Leaf) const;
+   FEXCore::CPUID::FunctionResults Function_0Dh(uint32_t Leaf) const;
+   FEXCore::CPUID::FunctionResults Function_15h(uint32_t Leaf) const;
+   FEXCore::CPUID::FunctionResults Function_16h(uint32_t Leaf) const;
+@@ -278,8 +280,8 @@ private:
+     &CPUIDEmu::Function_Reserved,
+     // 0x0A: Architectural performance monitoring
+     &CPUIDEmu::Function_Reserved,
+-    // 0x0B: Extended topology enumeration
+-    &CPUIDEmu::Function_Reserved,
++    // 0x0B: Extended topology enumeration (madeira [cpu-identity-2])
++    &CPUIDEmu::Function_0Bh,
+     // 0x0C: Reserved?
+     &CPUIDEmu::Function_Reserved,
+     // 0x0D: Processor extended state enumeration
+@@ -390,8 +392,8 @@ private:
+     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
+     // 0x0A: Architectural performance monitoring
+     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
+-    // 0x0B: Extended topology enumeration
+-    {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
++    // 0x0B: Extended topology enumeration (madeira [cpu-identity-2]: EDX is the x2APIC ID of the current CPU)
++    {SupportsConstant::NONCONSTANT, NeedsLeafConstant::NEEDSLEAFCONSTANT},
+     // 0x0C: Reserved?
+     {SupportsConstant::CONSTANT, NeedsLeafConstant::NOLEAFCONSTANT},
+     // 0x0D: Processor extended state enumeration
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index befad3d..f808d2d 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -159,7 +159,58 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+                       HostFeatures.SupportsAFP, Probe ? Probe : "none");
+   }
+ #endif
+-  HostFeatures.CPUMIDRs.push_back(0u);
++  /* madeira [cpu-identity-2] (fex-cpu-count, FEX patch 0005 reworked): one CPUMIDRs entry per processor.
++   * The iOS host has no MIDR registry to read, and this pushed ONE entry, so FEXCore's CPUID
++   * (Cores = CPUMIDRs.size()) said 1 logical processor while the PEB, GetSystemInfo, KUSER_SHARED_DATA,
++   * SystemLogicalProcessorInformationEx and (with cpu-identity) the registry said 8. Overwatch 2's loader
++   * crashed at 5 s with 8 CentralProcessor keys and 1 CPUID processor, and ran with 1 and 1.
++   *
++   * The count is the PEB's NumberOfProcessors, which init_peb (build/ntdll-unix/env_ios.c) set from
++   * madeira_reported_cpu_count() = `madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count`, the same
++   * expression the registry writer (server_ios.c, ios_hw_registry_publish) uses for its key count. So the two
++   * sides cannot diverge. Upstream FEX counts the CentralProcessor keys instead (the non-iOS branch below); we
++   * count them too, as a check: if the session's registry has a different number of keys (it was written by
++   * the session's first process, which may have run with other settings), CPUID follows the registry the
++   * program sees and the log says MISMATCH. All entries are MIDR 0, as the single one was: nothing is called
++   * hybrid and the brand is unchanged. Capped at 64 (8-bit CPUID fields, one processor group).
++   * Off: MADEIRA_FEX_CPU_COUNT=0, or the master MADEIRA_CPU_IDENTITY=0 (FEXCore CPUID.cpp reads the same
++   * two variables for the HTT bit and leaf 0xB). */
++  {
++    const auto EnvOff = [](const char* Name) {
++      const char* E = getenv(Name);
++      return E && E[0] == '0' && E[1] == '\0';
++    };
++    const bool CountOn = !EnvOff("MADEIRA_CPU_IDENTITY") && !EnvOff("MADEIRA_FEX_CPU_COUNT");
++    uint32_t Count = 1;
++    uint32_t PebCount = 0;
++    uint32_t Keys = 0;
++    if (CountOn) {
++      const auto* Peb = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb;
++      PebCount = Peb ? Peb->NumberOfProcessors : 0;
++      Count = PebCount == 0 ? 1 : PebCount > 64 ? 64 : PebCount;
++      // Upstream's way of counting (the non-iOS branch): open CentralProcessor\0, \1, ... until one is missing.
++      while (Keys < 64) {
++        HKEY Key = OpenProcessorKey(Keys);
++        if (!Key) {
++          break;
++        }
++        RegCloseKey(Key);
++        ++Keys;
++      }
++      if (Keys && Keys != Count) {
++        Count = Keys;
++      }
++    }
++    HostFeatures.CPUMIDRs.assign(Count, 0u);
++    if (!CountOn) {
++      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count off: CPUID reports 1 CPU (MADEIRA_FEX_CPU_COUNT=0 or MADEIRA_CPU_IDENTITY=0)");
++    } else if (!Keys) {
++      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count {} CPUs reported through CPUID (peb={}, no CentralProcessor keys)", Count, PebCount);
++    } else {
++      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count {} CPUs reported through CPUID (peb={} registry={} {})", Count, PebCount,
++                        Keys, Keys == PebCount ? "MATCH" : "MISMATCH: following the registry");
++    }
++  }
+   HostFeatures.ProcessPID = ProcessPID;
+   HostFeatures.ProcessFeatures.HostType = HostType;
+   HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;

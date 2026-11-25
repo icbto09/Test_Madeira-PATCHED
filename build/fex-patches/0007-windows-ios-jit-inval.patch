@@ -1,0 +1,116 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index bc451b8..36efeaa 100755
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -155,6 +155,11 @@ static inline uint64_t IosNowNs() {
+ extern "C" {
+ uint32_t FEX_MadeiraSectionViews = 0;
+ }
++/* madeira [jit-inval]: 1 = no per-instruction code check on an instruction that failed to decode.
++ * Set from the ARM64EC frontend (MADEIRA_EC_JIT_INVAL=0 clears it); 0 in WOW64 = old behaviour. */
++extern "C" {
++uint32_t FEX_MadeiraJitInvalCheck = 0;
++}
+ 
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+ /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+@@ -1287,7 +1292,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
+-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock) {
++        // madeira [jit-inval]: an instruction that failed to decode (NoExec/partial, InstSize 0, no TableInfo)
++        // has no bytes to check. Its check made the NoExec stub at Overwatch's entry ask for its own removal
++        // forever (0.2.83 log: "aligned: skipped" 8145 -> 536870865, no exception raised) instead of raising the
++        // execute fault the protector waits for. FEX_MadeiraJitInvalCheck = 0 (MADEIRA_EC_JIT_INVAL=0): old code.
++        const bool CheckThisInst = !FEX_MadeiraJitInvalCheck || (TableInfo && DecodedInfo->InstSize != 0);
++        if (CheckThisInst && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock)) {
+           // Compare against the bytes the decoder read, not a second read of guest memory: code
+           // rewritten between the two reads (HotSpot's `jmp $` placeholder replaced by the final jump
+           // while a thread was translating it) would be checked against its new bytes but run as the
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index e69c916..8dd1bc5 100755
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -72,6 +72,7 @@ extern "C" char ios_va_log[];
+ extern "C" int ios_va_log_len;
+ 
+ extern "C" uint32_t FEX_MadeiraSectionViews; // madeira [section-views], Core.cpp
++extern "C" uint32_t FEX_MadeiraJitInvalCheck; // madeira [jit-inval], Core.cpp
+ #ifdef FEX_IOS_HOST
+ /* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
+  * TU because ARM64EC class-method access to the static table directly from
+@@ -1082,7 +1083,15 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
++    // madeira [jit-inval]: a removal FEXCore asked for is never filtered (MADEIRA_EC_JIT_INVAL=0: old behaviour).
++    static std::atomic<int8_t> NoFilterCached {-1};
++    int8_t NoFilter = NoFilterCached.load(std::memory_order_relaxed);
++    if (NoFilter < 0) {
++      const char* E = getenv("MADEIRA_EC_JIT_INVAL");
++      NoFilter = (E && E[0] == '0') ? 0 : 1;
++      NoFilterCached.store(NoFilter, std::memory_order_relaxed);
++    }
++    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false, NoFilter != 0);
+   }
+ 
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+@@ -1403,6 +1412,9 @@ NTSTATUS ProcessInit() {
+     LogMan::Msg::EFmt("[pfaf-keep] rev=pfaf-keep-2 xtajit64 {}", Exception::IosPfAfKeep ? "on" : "off (MADEIRA_EC_PFAF_KEEP=0)");
+     const char* SectionViews = getenv("MADEIRA_EC_SECTION_VIEWS"); // madeira [section-views]
+     FEX_MadeiraSectionViews = (SectionViews && SectionViews[0] == '0') ? 0 : 1;
++    const char* JitInval = getenv("MADEIRA_EC_JIT_INVAL"); // madeira [jit-inval]
++    FEX_MadeiraJitInvalCheck = (JitInval && JitInval[0] == '0') ? 0 : 1;
++    LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 xtajit64 {}", FEX_MadeiraJitInvalCheck ? "on" : "off (MADEIRA_EC_JIT_INVAL=0)");
+     LogMan::Msg::EFmt("[section-views] rev=section-views-1 xtajit64 {}", FEX_MadeiraSectionViews ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)");
+     LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
+                       "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index fc7da6a..41da443 100755
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -592,7 +592,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+   return {SectionBase, SectionSize};
+ }
+ 
+-void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
++void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, bool NoFilter) {
+   if (IntervalsLock.HeldByThisThread()) {
+     // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
+     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+@@ -622,6 +622,18 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     MayHoldCode = XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+     MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+   }
++  if (NoFilter && !MayHoldCode) {
++    /* madeira [jit-inval] safety net: FEXCore's own JIT asked for this removal (a block found its code
++     * changed), so the "no code here" filter must not skip it. In the 0.2.83 Overwatch run the NoExec stub
++     * at 0x1405431e0 asked for its own removal and the filter skipped it forever; jit-inval-2's Core.cpp
++     * change stops that stub from checking itself, this keeps any other JIT removal from being dropped. */
++    static std::atomic<uint32_t> ForcedLog {0};
++    if (ForcedLog.fetch_add(1, std::memory_order_relaxed) < 16) {
++      LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 forced removal at {:#x}+{:#x}: the filter would have skipped it "
++                        "(page not executable now; MADEIRA_EC_JIT_INVAL=0 restores the filter)", Address, Size);
++    }
++    MayHoldCode = true;
++  }
+ 
+   if (MayHoldCode) {
+     InvalKeptAligned.fetch_add(1, std::memory_order_relaxed);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index f60e365..7584299 100755
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -51,7 +51,9 @@ public:
+     uint64_t SectionSize;
+   };
+   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
+-  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
++  // NoFilter (madeira [jit-inval]): FEX's own JIT asked for this removal (a block found its code
++  // changed), so the "no code here" filter must not skip it.
++  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, bool NoFilter = false);
+   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
+   // MADEIRA: if HotPage is given, it is set when the fault hit an already hot page (see EnableHotSMCPages),
+   // which is unprotected again but not invalidated.

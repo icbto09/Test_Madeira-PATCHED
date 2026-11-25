@@ -310,17 +310,21 @@ struct IniFileText: Equatable {
     let kind: Kind
     var utf8: Bool { kind == .utf8 }
 
-    init?(data: Data) {
+    /// `utf16` false (env.MADEIRA_INI_UTF16 = 0) skips UTF-16 detection and reads the file as before this fix.
+    init?(data: Data, utf16: Bool = true) {
         let utf8Mark = Data([0xEF, 0xBB, 0xBF])
         let bytes = [UInt8](data)
         var detected: Kind?
         var marked = false
-        if bytes.starts(with: [0xFF, 0xFE]) { detected = .utf16LE; marked = true }
+        if !utf16 { detected = nil }
+        else if bytes.starts(with: [0xFF, 0xFE]) { detected = .utf16LE; marked = true }
         else if bytes.starts(with: [0xFE, 0xFF]) { detected = .utf16BE; marked = true }
         else if !data.starts(with: utf8Mark) { detected = IniFileText.unmarkedUTF16(bytes) }
         if let detected {
             let body = Data(marked ? bytes.dropFirst(2) : bytes[...])
-            guard bytes.count % 2 == 0, let s = String(data: body, encoding: detected == .utf16LE ? .utf16LittleEndian : .utf16BigEndian) else { return nil }
+            let enc: String.Encoding = detected == .utf16LE ? .utf16LittleEndian : .utf16BigEndian
+            // A file that does not survive decode then re-encode (lone surrogate) is not opened: saving it would damage it.
+            guard bytes.count % 2 == 0, let s = String(data: body, encoding: enc), s.data(using: enc) == body else { return nil }
             text = s; bom = marked; kind = detected
             return
         }
@@ -692,6 +696,7 @@ struct GameIniFilesSection: View {
                 } label: {
                     Label("Unity game options", systemImage: "slider.horizontal.3")
                 }
+                .padLink("ini-unity") { UnityOptionsPage(gameFolder: gameFolder) }
             } footer: {
                 Text("Resolution, window mode, quality and the game's own options, which Unity games keep in the registry instead of a file.")
             }
@@ -706,6 +711,7 @@ struct GameIniFilesSection: View {
                         Text(GameIniFiles.label(file, gameFolder: gameFolder)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                     }
                 }
+                .padLink("ini-file-\(file)") { IniFileEditor(file: file, title: (file as NSString).lastPathComponent) }
             }
             .onDelete { offsets in
                 for i in offsets { GameIniFiles.remove(files[i], for: windowsPath) }
@@ -721,6 +727,12 @@ struct GameIniFilesSection: View {
             } label: {
                 Label("Add settings file", systemImage: "plus")
             }
+            .padLink("ini-add") {
+                IniFilePicker(gameFolder: gameFolder, added: Set(files.map { $0.lowercased() })) { file in
+                    GameIniFiles.add(file, for: windowsPath)
+                    files = GameIniFiles.files(windowsPath)
+                }
+            }
             NavigationLink {
                 IniFileImport(gameFolder: gameFolder) { file in
                     GameIniFiles.add(file, for: windowsPath)
@@ -729,6 +741,13 @@ struct GameIniFilesSection: View {
             } label: {
                 Label("Import settings file", systemImage: "square.and.arrow.down")
             }
+            .padLink("ini-import") {
+                IniFileImport(gameFolder: gameFolder) { file in
+                    GameIniFiles.add(file, for: windowsPath)
+                    files = GameIniFiles.files(windowsPath)
+                }
+            }
+
         } footer: {
             Text("A game's own settings files, like Fallout.ini, Engine.ini, autoexec.cfg or settings.xml. Changes are saved into the file; close the game first. Swipe left to take a file off this list (the file stays).")
         }
@@ -911,7 +930,7 @@ struct IniSettingAdd: View {
                             ForEach(sections.filter { !$0.isEmpty }, id: \.self) { name in
                                 Button(name) { section = name }
                             }
-                        } label: { Image(systemName: "chevron.up.chevron.down") }
+                        } label: { Image(systemName: "chevron.up.chevron.down") }.iconLabel("Choose section")
                     }
                 }
             } footer: {
@@ -1104,11 +1123,13 @@ struct IniFileEditor: View {
     /// background; the page shows a spinner meanwhile and the log says how long each step took.
     private func load() async {
         let url = url, file = file
+        // MADEIRA_INI_UTF16=0: open UTF-16 .ini files the old way (as Latin-1), off switch for [ini-utf16]
+        let iniUTF16 = MadeiraConfig.flag("MADEIRA_INI_UTF16", fallback: true)
         let started = Date()
         let result = await Task.detached(priority: .userInitiated) { () -> (Data, IniFileText, IniDocument, Double, Double)? in
             guard let data = try? Data(contentsOf: url) else { return nil }
             let read = Date().timeIntervalSince(started)
-            guard let decoded = IniFileText(data: data) else { return nil }
+            guard let decoded = IniFileText(data: data, utf16: iniUTF16) else { return nil }
             let doc = IniDocument(text: decoded.text, cfgLines: GameIniFiles.isCfg(file), xml: GameIniFiles.isXML(file))
             return (data, decoded, doc, read, Date().timeIntervalSince(started))
         }.value

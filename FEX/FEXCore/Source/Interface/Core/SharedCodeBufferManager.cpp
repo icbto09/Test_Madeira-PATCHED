@@ -8,7 +8,9 @@
 #include <FEXCore/Utils/MathUtils.h>
 
 #ifdef FEX_IOS_HOST
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #endif
 
@@ -23,6 +25,50 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+/* madeira [code-buffer-big] rev=code-buffer-big-1, env MADEIRA_FEX_CODE_BUFFER_MB = <N> (MB, 129-1024;
+ * unset, empty, not a number or 128 and below: MAX_CODE_SIZE as before).
+ * idea: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine, Discord Nov 22; MIT
+ *
+ * The 128 MB cap above is not a correctness limit of the JIT. Everything that branches out of a block
+ * copes with a target beyond B/BL range: ExitFunctionLink patches the callsite only when the offset
+ * IsInt26 and otherwise links through the record's HostCode (ldr + br), the dispatcher and the shared
+ * routines are loaded from CpuStateFrame::Pointers, and the *_OrRestart branches only reach labels in
+ * the block being compiled (its jump thunks sit at its own end). So a larger buffer needs no new
+ * branch encoding. On iOS the size it gets is decided by the JIT pool (ntdll virtual_ios.c): a carve
+ * above 128 MB comes only from pool-low's region C, and only with this same variable set; anything
+ * the pool cannot afford is refused and the ladder in the CodeBuffer constructor steps down to it.
+ * ARM64EC only: WoW64 FEX cannot use region C (AllocatorHooks.h) and keeps MAX_CODE_SIZE. */
+static size_t IosBigCodeSize() {
+  static const size_t Size = [] {
+    const char* E = getenv("MADEIRA_FEX_CODE_BUFFER_MB");
+    if (!E || *E < '1' || *E > '9') {
+      return size_t {0};
+    }
+    char* End = nullptr;
+    unsigned long Mb = strtoul(E, &End, 10);
+    if (!End || *End || Mb <= MAX_CODE_SIZE / (1024 * 1024)) {
+      return size_t {0};
+    }
+    if (Mb > 1024) {
+      Mb = 1024;
+    }
+    return static_cast<size_t>(Mb & ~15UL) * 1024 * 1024; /* whole 16 MB steps, as the pool hands out */
+  }();
+  return Size;
+}
+#else
+static size_t IosBigCodeSize() {
+  return 0;
+}
+#endif
+
+/* MAX_CODE_SIZE, or MADEIRA_FEX_CODE_BUFFER_MB when it is set (see above). */
+static size_t MaxCodeSize() {
+  const size_t Big = IosBigCodeSize();
+  return Big > MAX_CODE_SIZE ? Big : MAX_CODE_SIZE;
+}
+
 CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   : AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
@@ -31,7 +77,10 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
    * halve the request down to 1MB (freelist gaps often satisfy small carves), and if even that
    * fails force a fault at a recognizable address so the fault pipeline reports it. */
   while (!Ptr && Size > 0x100000) {
-    Size >>= 1;
+    /* code-buffer-big-1: a request above MAX_CODE_SIZE steps down by halves but never past
+     * MAX_CODE_SIZE (a 384 MB ask tries 192, then 128), so the opt-in never ends with less than the
+     * 128 MB it would have got without it. Below MAX_CODE_SIZE the ladder is the ml364 one. */
+    Size = Size > MAX_CODE_SIZE ? std::max<size_t>(Size >> 1, MAX_CODE_SIZE) : Size >> 1;
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   }
   if (Ptr && Size != AllocatedSize) {
@@ -114,6 +163,14 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 
   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
 
+  if (Size > MAX_CODE_SIZE) {
+    static std::atomic<int> BigLogCount {0};
+    if (BigLogCount.fetch_add(1, std::memory_order_relaxed) < 32) {
+      LogMan::Msg::EFmt("[code-buffer-big] rev=code-buffer-big-1 max={}MB granted={}MB", MaxCodeSize() >> 20,
+                        Buffer->TotalAllocationSize() >> 20);
+    }
+  }
+
 #ifdef FEX_IOS_HOST
   /* ml460 (#75): generation bookkeeping. prev_use_count at swap time is the direct pinning
    * measurement: 1 (the manager) + one per thread still holding the outgoing generation. */
@@ -175,14 +232,14 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
   // ml1052: pool tail carves are fixed-size and never coalesce, so a doubling ladder strands
   // odd-sized carves. A process that fills its first buffer is hot: go straight to the maximum
   // (a refusal halves it down).
-  NewCodeBufferSize = MAX_CODE_SIZE;
+  NewCodeBufferSize = MaxCodeSize();
 #else
-  NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
+  NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MaxCodeSize());
 #endif
   return AllocateNew(NewCodeBufferSize);
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
-  return AllocateNew(MAX_CODE_SIZE);
+  return AllocateNew(MaxCodeSize());
 }
 } // namespace FEXCore::CPU

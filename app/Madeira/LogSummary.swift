@@ -152,6 +152,7 @@ enum LogSummary {
 
         mutating func feed(_ raw: String) {
             let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
+            if line.contains("] [flight] ") { return }   // (flight-recorder) Wine's copied traces are no new facts (literal = FlightRecorder.tag, so check-help-report needs no LogTrail.swift)
             if let time = LogSummary.timestamp(line) {
                 if facts.firstTime == nil { facts.firstTime = time }
                 facts.lastTime = time

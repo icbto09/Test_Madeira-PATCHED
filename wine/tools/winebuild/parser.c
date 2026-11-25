@@ -283,7 +283,8 @@ static int parse_spec_arguments( ORDDEF *odp, DLLSPEC *spec, int optional )
             error( "First argument of a thiscall function must be a pointer\n" );
             return 0;
         }
-        if (odp->flags & FLAG_CPU_MASK & ~FLAG_CPU(CPU_i386))
+        if (odp->flags & FLAG_CPU_MASK & ~FLAG_CPU(CPU_i386) ||
+             (!(odp->flags & FLAG_CPU_MASK) && target.cpu != CPU_i386))
         {
             error( "A thiscall function can only be exported on i386\n" );
             return 0;
@@ -296,8 +297,10 @@ static int parse_spec_arguments( ORDDEF *odp, DLLSPEC *spec, int optional )
             error( "A fastcall function must use the stdcall convention\n" );
             return 0;
         }
-        if ((i && odp->u.func.args[0] != ARG_PTR && odp->u.func.args[0] != ARG_LONG) ||
-            (i > 1 && odp->u.func.args[1] != ARG_PTR && odp->u.func.args[1] != ARG_LONG))
+        if (target.cpu != CPU_i386)
+            odp->flags &= ~FLAG_FASTCALL;
+        else if ((i && odp->u.func.args[0] != ARG_PTR && odp->u.func.args[0] != ARG_LONG) ||
+                 (i > 1 && odp->u.func.args[1] != ARG_PTR && odp->u.func.args[1] != ARG_LONG))
             odp->flags |= FLAG_NORELAY;  /* no relay debug possible for non-standard fastcall args */
     }
     if (odp->flags & FLAG_SYSCALL)
@@ -337,9 +340,6 @@ static int parse_spec_export( ORDDEF *odp, DLLSPEC *spec )
 
     if (odp->type == TYPE_VARARGS)
         odp->flags |= FLAG_NORELAY;  /* no relay debug possible for varags entry point */
-
-    if (target.cpu != CPU_i386)
-        odp->flags &= ~FLAG_FASTCALL;
 
     if (!(token = GetToken(1)))
     {
@@ -740,7 +740,7 @@ static void add_apiset_value( struct apiset *apiset, struct apiset_entry *entry,
     if (entry->val_count < ARRAY_SIZE(entry->values) - 1)
     {
         struct apiset_value *val = &entry->values[entry->val_count++];
-        char *sep = strchr( value, ':' );
+        const char *sep = strchr( value, ':' );
 
         if (sep)
         {

@@ -435,7 +435,13 @@ struct JITPointers {
 };
 
 // Each guest JIT frame has one of these
-constexpr uint32_t IosBlockRingEntries = 4096;   /* ml1205, power of two */
+constexpr uint32_t IosBlockRingEntries = 4096;   /* ml1205, power of two: the default ring size */
+/* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: the ring size actually used, a power of two up to
+ * IosBlockRingEntriesMax, set once before the first thread and the first block (ARM64EC ProcessInit: 65536 for
+ * Overwatch.exe while the exit probe is on). Every ring also carries it in the word before ring[0], ring[-1], so
+ * readers outside FEX (ntdll's reporters) do not need this variable. Core.cpp. */
+constexpr uint32_t IosBlockRingEntriesMax = 65536;
+extern uint32_t IosBlockRingEntriesRT;
 
 struct CpuStateFrame {
   CPUState State;
@@ -547,7 +553,7 @@ struct CpuStateFrame {
 #endif
 
   /* iOS-Madeira ml1205: per-thread ring of executed block-entry RIPs, on when
-   * MADEIRA_BLOCK_RING is set. ring[0] is the next index, ring[1..N] the entries;
+   * MADEIRA_BLOCK_RING is set. ring[0] is the next index, ring[1..N] the entries, ring[-1] = N;
    * null when the ring is off. Published to the thread's TEB at 0x1710 (the
    * ActivityId field, unused by Wine) so the fault reporters can dump it. */
   uint64_t* IosBlockRing {};
@@ -555,6 +561,7 @@ struct CpuStateFrame {
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
 extern uint32_t IosGuestBranchTraceEnabled;
+extern uint32_t IosBlockRingForce; /* madeira [crashmailer-dump]: ARM64EC Module.cpp */
 static_assert(sizeof(CpuStateFrame::IosGuestBranchHistoryType) == 272);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) % 8 == 0);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) + 272 <= 32760);

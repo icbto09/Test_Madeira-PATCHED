@@ -28,25 +28,29 @@
 
 #if defined(__aarch64__) || defined(__arm64ec__)
 
+static const ULONG exception_flags_mask = CONTEXT_EXCEPTION_ACTIVE |
+    CONTEXT_SERVICE_ACTIVE | CONTEXT_EXCEPTION_REQUEST | CONTEXT_EXCEPTION_REPORTING;
+
 static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
 {
-    ULONG ret = CONTEXT_ARM64;
+    ULONG ret = CONTEXT_ARM64 | (flags & exception_flags_mask);
 
     flags &= ~CONTEXT_AMD64;
     if (flags & CONTEXT_AMD64_CONTROL) ret |= CONTEXT_ARM64_CONTROL;
     if (flags & CONTEXT_AMD64_INTEGER) ret |= CONTEXT_ARM64_INTEGER;
-    if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= CONTEXT_ARM64_FLOATING_POINT;
+    if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= CONTEXT_ARM64_FLOATING_POINT_LOW;
+    if (flags & CONTEXT_AMD64_XSTATE) ret |= CONTEXT_ARM64_FLOATING_POINT_HIGH;
     return ret;
 }
 
 static inline ULONG ctx_flags_arm_to_x64( ULONG flags )
 {
-    ULONG ret = CONTEXT_AMD64;
+    ULONG ret = CONTEXT_AMD64 | (flags & exception_flags_mask);
 
     flags &= ~CONTEXT_ARM64;
     if (flags & CONTEXT_ARM64_CONTROL) ret |= CONTEXT_AMD64_CONTROL;
     if (flags & CONTEXT_ARM64_INTEGER) ret |= CONTEXT_AMD64_INTEGER;
-    if (flags & CONTEXT_ARM64_FLOATING_POINT) ret |= CONTEXT_AMD64_FLOATING_POINT;
+    if (flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW)) ret |= CONTEXT_AMD64_FLOATING_POINT;
     return ret;
 }
 
@@ -71,6 +75,17 @@ static inline UINT cpsr_to_eflags( UINT cpsr )
     if (cpsr & 0x20000000) ret |= 0x0001;  /* carry */
     if (cpsr & 0x40000000) ret |= 0x0040;  /* zero */
     if (cpsr & 0x80000000) ret |= 0x0080;  /* negative */
+    /* madeira [pfaf-keep]: xtajit64 puts x86 PF/AF in the RES0 bits 26/27 of contexts it hands to
+     * the guest, and ntdll's NtRaiseException wrapper sets them from an x64 context (both only with
+     * MADEIRA_EC_PFAF_KEEP on). eflags_to_cpsr does not
+     * map them back on purpose: the way back is the per-thread stash in signal_arm64ec.c. */
+    if (cpsr & 0x04000000) ret |= 0x0004;  /* parity */
+    if (cpsr & 0x08000000) ret |= 0x0010;  /* aux carry */
+    /* madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 / Wine patch 0017
+     * (MIT/LGPL). xtajit64 puts x86 DF in the RES0 bit 16 of contexts it hands to the guest (MADEIRA_EC_DF_CTX on;
+     * his patch uses 16 for DF and 17 for AF, ours keeps AF at 27). Not mapped back in eflags_to_cpsr, for the
+     * [pfaf-keep] reason: the way back is the per-thread stash in signal_arm64ec.c. */
+    if (cpsr & 0x00010000) ret |= 0x0400;  /* direction */
     return ret;
 }
 
@@ -122,8 +137,10 @@ static inline UINT fpcsr_to_mxcsr( UINT fpcr, UINT fpsr )
     return ret;
 }
 
-static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_NT_CONTEXT *ec_ctx )
+static inline NTSTATUS context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_NT_CONTEXT *ec_ctx )
 {
+    NTSTATUS status = STATUS_SUCCESS;
+    YMMCONTEXT *ymm = NULL;
     UINT64 fpcsr;
 
     arm_ctx->ContextFlags = ctx_flags_x64_to_arm( ec_ctx->ContextFlags );
@@ -162,16 +179,32 @@ static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_
     arm_ctx->Sp   = ec_ctx->Sp;
     arm_ctx->Pc   = ec_ctx->Pc;
     memcpy( arm_ctx->V, ec_ctx->V, 16 * sizeof(arm_ctx->V[0]) );
-    memset( arm_ctx->V + 16, 0, sizeof(*arm_ctx) - offsetof( ARM64_NT_CONTEXT, V[16] ));
+    memset( arm_ctx->Bcr, 0, sizeof(*arm_ctx) - offsetof( ARM64_NT_CONTEXT, Bcr ));
     fpcsr = mxcsr_to_fpcsr( ec_ctx->AMD64_MxCsr );
     arm_ctx->Fpcr = fpcsr;
     arm_ctx->Fpsr = fpcsr >> 32;
+
+    if ((ec_ctx->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(ec_ctx + 1);
+        XSTATE *xstate = (XSTATE *)((char *)context_ex + context_ex->XState.Offset);
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) || context_ex->XState.Length > sizeof(*xstate))
+            status = STATUS_INVALID_PARAMETER;
+        else if (xstate->Mask & XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX ))
+        {
+            if (context_ex->XState.Length == sizeof(*xstate)) ymm = &xstate->YmmContext;
+            else status = STATUS_BUFFER_OVERFLOW;
+        }
+    }
+    if (ymm) memcpy( &arm_ctx->V[16], ymm, sizeof(*ymm) );
+    else memset( arm_ctx->V + 16, 0, sizeof(*ymm) );
+    return status;
 }
 
-static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
+static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx, ULONG flags )
 {
     memset( ec_ctx, 0, sizeof(*ec_ctx) );
-    ec_ctx->ContextFlags = ctx_flags_arm_to_x64( arm_ctx->ContextFlags );
+    ec_ctx->ContextFlags = flags;
     ec_ctx->AMD64_SegCs  = 0x33;
     ec_ctx->AMD64_SegDs  = 0x2b;
     ec_ctx->AMD64_SegEs  = 0x2b;
@@ -216,6 +249,16 @@ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_N
     ec_ctx->X17_3 = arm_ctx->X17 >> 48;
 
     memcpy( ec_ctx->V, arm_ctx->V, sizeof(ec_ctx->V) );
+
+    if ((ec_ctx->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(ec_ctx + 1);
+        XSTATE *xstate = (XSTATE *)((char *)context_ex + context_ex->XState.Offset);
+        xstate->Mask &= XSTATE_MASK_AVX;
+        xstate->CompactionMask = 0;
+        if (xstate->Mask & XSTATE_MASK_AVX)
+            memcpy( &xstate->YmmContext, &arm_ctx->V[16], sizeof(xstate->YmmContext) );
+    }
 }
 
 #endif /* __aarch64__ || __arm64ec__ */

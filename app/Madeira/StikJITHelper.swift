@@ -209,6 +209,15 @@ enum StikJITHelper {
                                    Int(scLayout2Alias), kr), level: .error)
     }
 
+    /// quiet-false-errors: "[no-footprint] pool applied=false" is written on every player
+    /// run, including runs that played fine (all 18 of 18 RAN Get Help reports, Nov 22), so
+    /// at [ERR] it only filled crash reports (GET-HELP-LOGS-87). It stays in the log as INFO.
+    /// env.MADEIRA_QUIET_FALSE_ERRORS = 0 puts it back to [ERR].
+    static let quietFalseErrors = MadeiraConfig.flag("MADEIRA_QUIET_FALSE_ERRORS")
+    static func noFootprintLevel(_ applied: Bool) -> LogStore.LogEntry.Level {
+        applied ? .success : (quietFalseErrors ? .info : .error)
+    }
+
     // 0 treats JIT as ready whenever CS_DEBUGGED is set, as before, without asking whether a debugger is attached.
     private static let attachCheck = MadeiraConfig.flag("MADEIRA_JIT_ATTACH_CHECK")
 
@@ -246,13 +255,34 @@ enum StikJITHelper {
     /// the 128MB window. Only the first 4KB of each exe are read. nil when none
     /// needs more than 128MB.
     static func fixedBaseWindowMB(in folder: URL) -> (mb: Int, exe: String)? {
+        fixedBaseWindowWalk(in: folder, limited: false).need
+    }
+
+    /// [start-scan] The same walk, with what it did (`summary`, for the log). `limited`
+    /// (env.MADEIRA_START_SCAN_BG, on by default): it stops after 200000 entries or 3
+    /// seconds, whichever comes first, and says so; the exes read up to then still count.
+    /// Known limit: one file-system call that never returns still holds the walk (the
+    /// UI stays live; the log's last line is then "exe-window walk starting").
+    /// Touches no shared state, so it may run off the main thread.
+    static func fixedBaseWindowWalk(in folder: URL, limited: Bool) -> (need: (mb: Int, exe: String)?, summary: String) {
         let winBase: UInt64 = 0x140000000, ceiling: UInt64 = 0x180000000
         guard let walker = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil,
-                                                          options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
+                                                          options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+            return (need: nil, summary: "folder could not be opened")
+        }
         var best: (end: UInt64, exe: String)? = nil
         var seen = 0
+        var entries = 0
+        var stopped = "end of folder"
+        let started = Date()
         for case let url as URL in walker {
+            entries += 1
+            if limited {
+                if entries > 200_000 { stopped = "entry limit 200000"; break }
+                if entries % 256 == 0, Date().timeIntervalSince(started) > 3 { stopped = "time limit 3 s"; break }
+            }
             guard url.pathExtension.lowercased() == "exe" else { continue }
+            if limited, Date().timeIntervalSince(started) > 3 { stopped = "time limit 3 s"; break }
             seen += 1
             if seen > 256 { break }
             guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
@@ -278,9 +308,11 @@ enum StikJITHelper {
                 best = (end: end, exe: url.lastPathComponent)
             }
         }
-        guard let found = best else { return nil }
+        let summary = "entries=\(entries) exes=\(min(seen, 256)) stopped=\(seen > 256 ? "exe limit 256" : stopped)"
+            + (best == nil && stopped != "end of folder" ? " (stopped early: a fixed-base exe after this point is not seen; set exe-window-mb by hand if the game needs it)" : "")
+        guard let found = best else { return (need: nil, summary: summary) }
         let mb = Int((found.end - winBase + (16 << 20) - 1) >> 24) * 16
-        return (mb: mb, exe: found.exe)
+        return (need: (mb: mb, exe: found.exe), summary: summary)
     }
 
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
@@ -1114,7 +1146,7 @@ enum StikJITHelper {
                         let exemptA = jit_make_region_no_footprint(rwPtr, poolSize, "pool-RW-alias")
                         let exemptB = jit_make_region_no_footprint(rwPtr + holeEnd, Int(second.size), "pool-RW-alias-2")
                         let exemptM = poolMid.map { jit_make_region_no_footprint(rwPtr + Int($0.base - rxAddrV), Int($0.size), "pool-RW-alias-mid") } ?? true
-                        LogStore.shared.log("[no-footprint] pool applied=\(exemptA && exemptB && exemptM)", level: exemptA && exemptB && exemptM ? .success : .error)
+                        LogStore.shared.log("[no-footprint] pool applied=\(exemptA && exemptB && exemptM)", level: StikJITHelper.noFootprintLevel(exemptA && exemptB && exemptM))
                         splitHoles(aSize: poolSize, bOff: holeEnd, rxBase: rxAddrV)
                         if poolMid == nil {
                         LogStore.shared.log(String(format: "[pool-split] JIT pool = RX [0x%lx,0x%lx) %luMB + [0x%lx,0x%lx) %luMB as one "
@@ -1161,7 +1193,7 @@ enum StikJITHelper {
                     let exemptA = jit_make_region_no_footprint(rwPtr, poolSize, "pool-RW-alias")
                     let exemptB = jit_make_region_no_footprint(rwPtr + holeEnd, Int(second.size), "pool-RW-alias-2")
                     let exemptM = poolMid.map { jit_make_region_no_footprint(rwPtr + Int($0.base - rxAddrV), Int($0.size), "pool-RW-alias-mid") } ?? true
-                    LogStore.shared.log("[no-footprint] pool applied=\(exemptA && exemptB && exemptM)", level: exemptA && exemptB && exemptM ? .success : .error)
+                    LogStore.shared.log("[no-footprint] pool applied=\(exemptA && exemptB && exemptM)", level: StikJITHelper.noFootprintLevel(exemptA && exemptB && exemptM))
                     splitHoles(aSize: poolSize, bOff: holeEnd, rxBase: rxAddrV)
                     if poolMid == nil {
                     LogStore.shared.log(String(format: "[pool-split] JIT pool = RX [0x%lx,0x%lx) %luMB + [0x%lx,0x%lx) %luMB as one "
@@ -1197,7 +1229,7 @@ enum StikJITHelper {
                     + "offset=0x\(String(Int(rw) - Int(rxAddrV), radix: 16)) windowHeld=\(windowHeld) rwOverlap=false",
                     level: .success)
                 let exempt = jit_make_region_no_footprint(rwPtr, poolSize, "pool-RW-alias")
-                LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
+                LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: StikJITHelper.noFootprintLevel(exempt))
                 lowReady(rwLow, low, rw)
                 LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
                 poolTaken = true
@@ -1321,7 +1353,7 @@ enum StikJITHelper {
         // ml359: log the verdict through LogStore.log (which appends to the
         // file) — the ml358 run lost it because the jit_log callback only fed
         // the UI view. Detail (kr / footprint delta) is in the jit_log lines.
-        LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
+        LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: StikJITHelper.noFootprintLevel(exempt))
 
         LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
         poolTaken = true

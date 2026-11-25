@@ -151,6 +151,7 @@ void server_release(server_t *server)
         CertFreeCertificateChain(server->cert_chain);
     free(server->name);
     free(server->scheme_host_port);
+    free(server->addr);
     free(server);
 }
 
@@ -1157,6 +1158,7 @@ static BOOL HTTP_DoAuthorization( http_request_t *request, LPCWSTR pszAuthValue,
                                                 in.pvBuffer ? &in_desc : NULL,
                                                 0, &pAuthInfo->ctx, &out_desc,
                                                 &pAuthInfo->attr, &pAuthInfo->exp);
+        free(in.pvBuffer);
         if (sec_status == SEC_E_OK)
         {
             pAuthInfo->finished = TRUE;
@@ -1760,9 +1762,8 @@ static BOOL HTTP_DealWithProxy(appinfo_t *hIC, http_session_t *session, http_req
 static DWORD HTTP_ResolveName(http_request_t *request)
 {
     server_t *server = request->proxy ? request->proxy : request->server;
-    int addr_len;
 
-    if(server->addr_len)
+    if(server->addr)
         return ERROR_SUCCESS;
 
     INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
@@ -1770,16 +1771,14 @@ static DWORD HTTP_ResolveName(http_request_t *request)
                           server->name,
                           (lstrlenW(server->name)+1) * sizeof(WCHAR));
 
-    addr_len = sizeof(server->addr);
-    if (!GetAddress(server->name, server->port, (SOCKADDR*)&server->addr, &addr_len, server->addr_str))
+    if (!(server->addr = GetAddress(server->name, server->port)))
         return ERROR_INTERNET_NAME_NOT_RESOLVED;
 
-    server->addr_len = addr_len;
     INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
                           INTERNET_STATUS_NAME_RESOLVED,
-                          server->addr_str, strlen(server->addr_str)+1);
+                          server->addr->addr_str, strlen(server->addr->addr_str)+1);
 
-    TRACE("resolved %s to %s\n", debugstr_w(server->name), server->addr_str);
+    TRACE("resolved %s to %s\n", debugstr_w(server->name), server->addr->addr_str);
     return ERROR_SUCCESS;
 }
 
@@ -1965,13 +1964,17 @@ static void HTTPREQ_CloseConnection(object_header_t *hdr)
 static DWORD str_to_buffer(const WCHAR *str, void *buffer, DWORD *size, BOOL unicode)
 {
     int len;
+
+    if (!size)
+        return ERROR_INVALID_PARAMETER;
+
     if (unicode)
     {
         WCHAR *buf = buffer;
 
         if (str) len = lstrlenW(str);
         else len = 0;
-        if (*size < (len + 1) * sizeof(WCHAR))
+        if (!buf || *size < (len + 1) * sizeof(WCHAR))
         {
             *size = (len + 1) * sizeof(WCHAR);
             return ERROR_INSUFFICIENT_BUFFER;
@@ -1988,7 +1991,7 @@ static DWORD str_to_buffer(const WCHAR *str, void *buffer, DWORD *size, BOOL uni
 
         if (str) len = WideCharToMultiByte(CP_ACP, 0, str, -1, NULL, 0, NULL, NULL);
         else len = 1;
-        if (*size < len)
+        if (!buf || *size < len)
         {
             *size = len;
             return ERROR_INSUFFICIENT_BUFFER;
@@ -2434,14 +2437,16 @@ static void write_cache_file(http_request_t *req, const BYTE *buf, DWORD len)
     }
 
     if(len) {
-        BOOL bres;
         DWORD written;
 
-        bres = WriteFile(req->hCacheFile, buf, len, &written, NULL);
-        if(bres)
+        if(WriteFile(req->hCacheFile, buf, len, &written, NULL)) {
             req->cache_size += written;
-        else
-            FIXME("WriteFile failed: %lu\n", GetLastError());
+        }else {
+            WARN("WriteFile failed: %lu\n", GetLastError());
+            CloseHandle(req->hCacheFile);
+            req->hCacheFile = NULL;
+            return;
+        }
     }
 
     if(req->data_stream->vtbl->end_of_data(req->data_stream, req))
@@ -2455,13 +2460,13 @@ static void create_cache_entry(http_request_t *req)
     BOOL b = TRUE;
 
     /* FIXME: We should free previous cache file earlier */
-    if(req->req_file) {
-        req_file_release(req->req_file);
-        req->req_file = NULL;
-    }
     if(req->hCacheFile) {
         CloseHandle(req->hCacheFile);
         req->hCacheFile = NULL;
+    }
+    if(req->req_file) {
+        req_file_release(req->req_file);
+        req->req_file = NULL;
     }
 
     if(req->hdr.dwFlags & INTERNET_FLAG_NO_CACHE_WRITE)
@@ -2517,10 +2522,15 @@ static void create_cache_entry(http_request_t *req)
     b = CreateUrlCacheEntryW(url, req->contentLength == ~0 ? 0 : req->contentLength, NULL, file_name, 0);
     if(!b) {
         WARN("Could not create cache entry: %08lx\n", GetLastError());
+        free(url);
         return;
     }
 
-    create_req_file(file_name, &req->req_file);
+    if(create_req_file(file_name, &req->req_file) != ERROR_SUCCESS) {
+        DeleteFileW(file_name);
+        free(url);
+        return;
+    }
     req->req_file->url = url;
     req->content_pos = 0;
     req->cache_size = 0;
@@ -3043,6 +3053,11 @@ static DWORD read_req_file(http_request_t *req, BYTE *buffer, DWORD size, DWORD 
     LARGE_INTEGER off;
     BYTE buf[1024];
 
+    if (!req->hCacheFile && !req->req_file->is_committed) {
+        *read = 0;
+        return ERROR_SUCCESS;
+    }
+
     while (req->content_pos > req->cache_size) {
         res = read_http_stream(req, (BYTE*)buf, min(sizeof(buf), req->content_pos - req->cache_size),
                                &ret_read, allow_blocking);
@@ -3151,7 +3166,7 @@ static void async_read_file_proc(task_header_t *hdr)
 
     TRACE("req %p buf %p size %lu read_pos %lu ret_read %p\n", req, task->buf, task->size, task->read_pos, task->ret_read);
 
-    if(req->req_file && req->req_file->file_handle) {
+    if(req->req_file && req->req_file->file_handle && (req->hCacheFile || req->req_file->is_committed)) {
         DWORD ret, ret_read;
         BYTE buf[1024];
         while (req->content_pos > req->cache_size) {
@@ -4911,6 +4926,7 @@ static void http_process_keep_alive(http_request_t *req)
 
 static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
 {
+    server_t *server;
     netconn_t *netconn = NULL;
     DWORD res;
 
@@ -4959,13 +4975,9 @@ static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
 
     TRACE("connecting to %s, proxy %s\n", debugstr_w(request->server->name),
           request->proxy ? debugstr_w(request->proxy->name) : "(null)");
-
-    INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
-                          INTERNET_STATUS_CONNECTING_TO_SERVER,
-                          request->server->addr_str,
-                          strlen(request->server->addr_str)+1);
-
-    res = create_netconn(request->proxy ? request->proxy : request->server, request->security_flags,
+    server = request->proxy ? request->proxy : request->server;
+    assert(server->addr);
+    res = create_netconn(server, &request->hdr, request->security_flags,
                          (request->hdr.ErrorMask & INTERNET_ERROR_MASK_COMBINED_SEC_CERT) != 0,
                          request->hdr.connect_timeout, &netconn);
     if(res != ERROR_SUCCESS) {
@@ -4974,11 +4986,6 @@ static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
     }
 
     request->netconn = netconn;
-
-    INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
-            INTERNET_STATUS_CONNECTED_TO_SERVER,
-            request->server->addr_str, strlen(request->server->addr_str)+1);
-
     *reusing = FALSE;
     TRACE("Created connection to %s: %p\n", debugstr_w(request->server->name), netconn);
     return ERROR_SUCCESS;
@@ -5592,7 +5599,7 @@ BOOL WINAPI HttpSendRequestExA(HINTERNET hRequest,
 
     if (lpBuffersIn)
     {
-        BuffersInW.dwStructSize = sizeof(LPINTERNET_BUFFERSW);
+        BuffersInW.dwStructSize = sizeof(INTERNET_BUFFERSW);
         if (lpBuffersIn->lpcszHeader)
         {
             if (lpBuffersIn->dwHeadersLength == 0 && *lpBuffersIn->lpcszHeader != '\0')

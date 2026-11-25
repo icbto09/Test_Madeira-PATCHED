@@ -43,7 +43,7 @@ enum HelpReport {
         "[srv-stuck]", "[srv-own]", "[srv-queues]", "[mach-deliver]", "[mach_exc]", "[waiters]", "[winios",
         "[placed]", "[thread-sample]", "[xlate-exec]", "[alert-ring]", "[footprint]", "[freeze] alive",
         "[ios_audio]", "[hwinput]", "[bigres-use]", "[draw-dump]", "[fdtrace]", "[x18-", "[cs-life]",
-        "[mem-census]", "[span-census]", "[bc-census]", "[rip-profile]",
+        "[mem-census]", "[span-census]", "[bc-census]", "[rip-profile]", "] [flight] ",
     ]
 
     /// Wine ended: the tail is taken here, so idle lines after the game don't push the end out.
@@ -55,11 +55,19 @@ enum HelpReport {
     static let tailCount = 150
     static let maxTailBytes = 18_000
     static let lineWidth = 220
+    /// (crash-capture) The Wine "[crash-report]" block is kept line for line (no number or address
+    /// stripping, so stack and backtrace lines stay apart), up to this many lines and bytes.
+    /// Off: env.MADEIRA_REPORT_CRASH_BLOCK = 0 in madeira.cfg (the lines then go the old key-line way).
+    static let maxCrashLines = 80
+    static let maxCrashBytes = 8_000
 
     struct LogPart {
         var name = ""
         var key: [String] = []
         var tail: [String] = []
+        /// (crash-capture) the "[crash-report]" block Wine writes at a crash, kept as written.
+        var crash: [String] = []
+        var crashDropped = 0
         var tailEndsAtExit = false
         var lines = 0
         var noise = 0
@@ -88,6 +96,8 @@ enum HelpReport {
     /// One pass over the log: key lines, the tail and LogSummary's facts.
     static func read(_ url: URL) -> LogPart {
         var part = LogPart(name: url.lastPathComponent)
+        let keepCrash = MadeiraConfig.flag("MADEIRA_REPORT_CRASH_BLOCK")   // 0: Get Help and shared logs treat Wine's [crash-report] lines like any other line (no Crash report section), as before
+        var crashBytes = 0
         var reader = LogSummary.Reader()
         var entries: [(text: String, count: Int)] = []
         var index: [String: Int] = [:]
@@ -101,6 +111,17 @@ enum HelpReport {
             part.lines += 1
             reader.feed(line)
             let lower = line.lowercased()
+            if keepCrash, lower.contains("[crash-report]") {
+                if part.crash.count < maxCrashLines, crashBytes < maxCrashBytes {
+                    let text = String(line.prefix(300))
+                    part.crash.append(text)
+                    crashBytes += text.utf8.count + 1
+                } else {
+                    part.crashDropped += 1
+                }
+                part.keyFound += 1
+                return
+            }
             if noiseTags.contains(where: { lower.contains($0) }) { part.noise += 1; return }
 
             if ring.count < tailCount { ring.append(clipped(line)) } else { ring[ringStart] = clipped(line); ringStart = (ringStart + 1) % tailCount }
@@ -198,6 +219,12 @@ enum HelpReport {
             out.append("## Key log lines (\(log.keyFound) found, repeats counted as xN; \(log.noise) periodic diagnostic lines skipped)")
             out += log.key.isEmpty ? ["(none)"] : log.key
             out.append("")
+            if !log.crash.isEmpty {
+                out.append("## Crash report (Wine's own block from the log, kept as written; backtrace entries marked (scan) are guesses)")
+                out += log.crash
+                if log.crashDropped > 0 { out.append("[crash-report] ... \(log.crashDropped) more lines left out here ...") }
+                out.append("")
+            }
             out.append(log.tailEndsAtExit ? "## Last lines before Wine exited" : "## Last lines of the log")
             out += log.tail
         }

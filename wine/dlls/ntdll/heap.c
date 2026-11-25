@@ -2273,6 +2273,54 @@ void heap_thread_detach(void)
     RtlLeaveCriticalSection( &process_heap->cs );
 }
 
+/* Madeira (heap-null-guard): RtlFreeHeap, RtlReAllocateHeap and RtlSizeHeap all fail
+ * cleanly when unsafe_heap_from_handle() says the handle is not a heap, but
+ * RtlAllocateHeap goes on and dereferences the NULL it returned (upstream Wine dropped the
+ * check after 8.0; this puts it back, so Madeira differs from upstream here). On 0.2.41 (Wine 11.22)
+ * dockhost.exe died that way while wininet.dll initialised: "err:heap:unsafe_heap_from_handle
+ * Invalid handle 0000000000000000!", then "AV READ of 8A0" in RtlAllocateHeap and
+ * "wininet.dll failed to initialize". Now the call fails with STATUS_INVALID_HANDLE and
+ * NULL (Wine 8.0's behaviour), and the first 16 such calls log the immediate native caller
+ * (for emulated x64 code that is a thunk or the emulator, not the program). Off:
+ * env MADEIRA_HEAP_NULL_GUARD=0 (back to the fault). */
+static BOOL heap_null_guard( HANDLE handle, SIZE_T size, void *caller )
+{
+    static LONG state;   /* 0 unread, 1 on, 2 off */
+    static LONG logged;
+    LONG st = ReadNoFence( &state );
+
+    if (!st)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_HEAP_NULL_GUARD" );
+        value.Buffer = buffer;
+        value.MaximumLength = sizeof(buffer);
+        st = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+              value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 2 : 1;
+        state = st;
+    }
+    if (st != 1) return FALSE;
+    if (InterlockedIncrement( &logged ) <= 16)
+    {
+        LDR_DATA_TABLE_ENTRY *mod = NULL;
+        ULONG lock_result = 0;
+        ULONG_PTR magic = 0;
+        /* LdrFindEntryForAddress wants the loader lock: try for it, never wait */
+        if (!LdrLockLoaderLock( 2 /* try only */, &lock_result, &magic ) && lock_result == 1)
+        {
+            if (LdrFindEntryForAddress( caller, &mod )) mod = NULL;
+            LdrUnlockLoaderLock( 0, magic );
+        }
+        ERR( "[heap-null-guard] RtlAllocateHeap( %p, size %#Ix ) refused: not a heap; caller %p = %s+%#Ix "
+             "(off: env.MADEIRA_HEAP_NULL_GUARD = 0)\n", handle, size, caller,
+             mod ? debugstr_us( &mod->BaseDllName ) : "?",
+             mod ? (ULONG_PTR)caller - (ULONG_PTR)mod->DllBase : (ULONG_PTR)0 );
+    }
+    return TRUE;
+}
+
 /***********************************************************************
  *           RtlAllocateHeap   (NTDLL.@)
  */
@@ -2292,7 +2340,9 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
 #ifdef __i386__
 retry:
 #endif
-    if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
+    if (!heap && heap_null_guard( handle, size, __builtin_return_address(0) ))
+        status = STATUS_INVALID_HANDLE;
+    else if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
         status = STATUS_NO_MEMORY;
     else if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
         status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr MADEIRA_CALLER_ARG(caller) );
@@ -2330,6 +2380,9 @@ retry:
 
     TRACE( "handle %p, flags %#lx, size %#Ix, return %p, status %#lx.\n", handle, flags, size, ptr, status );
     heap_set_status( heap, flags, status );
+#ifdef __arm64ec__
+    if (ios_po_mode == 2) ios_po_heap( 0, handle, size, ptr, __builtin_return_address(0) );   /* [ptr-origin-1] */
+#endif
     return ptr;
 }
 
@@ -2371,6 +2424,9 @@ BOOLEAN WINAPI DECLSPEC_HOTPATCH RtlFreeHeap( HANDLE handle, ULONG flags, void *
 
     TRACE( "handle %p, flags %#lx, ptr %p, return %u, status %#lx.\n", handle, flags, ptr, !status, status );
     heap_set_status( heap, flags, status );
+#ifdef __arm64ec__
+    if (ios_po_mode == 2) ios_po_heap( 1, handle, 0, ptr, __builtin_return_address(0) );   /* [ptr-origin-1] */
+#endif
     return !status;
 }
 

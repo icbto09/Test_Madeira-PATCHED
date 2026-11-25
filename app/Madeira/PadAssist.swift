@@ -284,54 +284,61 @@ struct PadAssistPage: View {
 
     var body: some View {
         Section {
-            Toggle("Gyro aim", isOn: bind(\.gyro))
+            Toggle("Gyro aim", isOn: bind(\.gyro)).padToggle("pa-gyro", bind(\.gyro))
             if settings?.gyro == true {
                 Picker("Gyro", selection: bind(\.source)) {
                     Text("Automatic").tag(PadAssistSettings.Source.auto)
                     Text("Controller").tag(PadAssistSettings.Source.controller)
                     Text("This device").tag(PadAssistSettings.Source.device)
                 }
+                .padPicker("pa-source", bind(\.source), [PadAssistSettings.Source.auto, .controller, .device])
                 Picker("Active", selection: bind(\.when)) {
                     Text("Always").tag(PadAssistSettings.When.always)
                     Text("While holding LT").tag(PadAssistSettings.When.lt)
                     Text("While holding LB").tag(PadAssistSettings.When.lb)
                     Text("While holding RB").tag(PadAssistSettings.When.rb)
                 }
+                .padPicker("pa-when", bind(\.when), [PadAssistSettings.When.always, .lt, .lb, .rb])
                 Picker("Moves", selection: bind(\.output)) {
                     Text("Automatic").tag(PadAssistSettings.Output.auto)
                     Text("Right stick").tag(PadAssistSettings.Output.stick)
                     Text("Mouse").tag(PadAssistSettings.Output.mouse)
                 }
+                .padPicker("pa-output", bind(\.output), [PadAssistSettings.Output.auto, .stick, .mouse])
                 Picker("Turn with", selection: bind(\.turn)) {
                     Text("Twist (yaw)").tag(PadAssistSettings.Turn.yaw)
                     Text("Tilt (roll)").tag(PadAssistSettings.Turn.roll)
                 }
+                .padPicker("pa-turn", bind(\.turn), [PadAssistSettings.Turn.yaw, .roll])
                 LabeledContent("Sensitivity") {
                     HStack {
                         Slider(value: bind(\.sensitivity), in: 0.25...4)
                         Text(String(format: "%.2g×", settings?.sensitivity ?? 1)).monospacedDigit().frame(width: 44, alignment: .trailing)
                     }
                 }
+                .padRange("pa-sensitivity", bind(\.sensitivity), in: 0.25...4, step: 0.05)
                 LabeledContent("Anti-dead zone") {
                     HStack {
                         Slider(value: bind(\.antiDeadzone), in: 0...0.5)
                         Text("\(Int(((settings?.antiDeadzone ?? 0.25) * 100).rounded()))%").monospacedDigit().frame(width: 44, alignment: .trailing)
                     }
                 }
-                Toggle("Invert up and down", isOn: bind(\.invertY))
-                Toggle("Invert left and right", isOn: bind(\.invertX))
+                .padRange("pa-antideadzone", bind(\.antiDeadzone), in: 0...0.5, step: 0.01)
+                Toggle("Invert up and down", isOn: bind(\.invertY)).padToggle("pa-invert-y", bind(\.invertY))
+                Toggle("Invert left and right", isOn: bind(\.invertX)).padToggle("pa-invert-x", bind(\.invertX))
             }
         } header: { Text("Gyro aim") } footer: {
             Text("Moving the controller (or this device) aims. Automatic gyro uses the controller's (DualSense, DualShock 4, Switch Pro) and this device's otherwise. Automatic moves the right stick when the game sees a controller and the mouse otherwise. Without a controller, only Always works. Raise the anti-dead zone if slow stick aim does nothing.")
         }
         Section {
             ForEach(PadAssistSettings.turboChoices, id: \.self) { name in
-                Toggle(name, isOn: Binding(get: { settings?.turbo.contains(name) == true }, set: { on in
+                let turbo = Binding(get: { settings?.turbo.contains(name) == true }, set: { on in
                     var next = settings ?? PadAssistSettings()
                     next.turbo.removeAll { $0 == name }
                     if on { next.turbo.append(name) }
                     settings = next
-                }))
+                })
+                Toggle(name, isOn: turbo).padToggle("pa-turbo-\(name)", turbo)
             }
             if settings?.turbo.isEmpty == false {
                 LabeledContent("Presses a second") {
@@ -340,6 +347,7 @@ struct PadAssistPage: View {
                         Text("\(Int(settings?.turboRate ?? 10))").monospacedDigit().frame(width: 44, alignment: .trailing)
                     }
                 }
+                .padRange("pa-turbo-rate", bind(\.turboRate), in: 5...30, step: 1)
             }
         } header: { Text("Turbo") } footer: {
             Text("A turbo button repeats while you hold it, on the controller and on touch controls.")

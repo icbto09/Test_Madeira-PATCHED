@@ -1,0 +1,1038 @@
+{
+ "version": 1,
+ "generated": "2026-11-22",
+ "newestBuild": "0.2.90",
+ "games": [
+  {
+   "keys": [
+    "steam:251570"
+   ],
+   "title": "7 Days to Die",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWell",
+     "build": "Test 15",
+     "summary": "Runs",
+     "source": "Regression Timeline (Nov 21): log 2d935c67"
+    }
+   ],
+   "lastGood": "Test 15",
+   "retest": true,
+   "retestBuild": "Test 15"
+  },
+  {
+   "keys": [
+    "steam:107410"
+   ],
+   "title": "Arma 3",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "startsOnly",
+     "build": "Test 18",
+     "summary": "Starts, then gets stuck",
+     "source": "Regression Timeline (Nov 21): log d092b971"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 18"
+  },
+  {
+   "keys": [
+    "steam:2141730",
+    "title:backrooms: escape together"
+   ],
+   "title": "Backrooms: Escape Together",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "Wave 13",
+     "summary": "Crashes right after start (player report)",
+     "source": "INDEX-wave19.md:134"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:200260",
+    "title:batman: arkham city goty"
+   ],
+   "title": "Batman: Arkham City GOTY",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 67",
+     "summary": "Works",
+     "source": "INDEX-wave19.md:201"
+    }
+   ],
+   "lastGood": "build 67",
+   "retest": true,
+   "retestBuild": "build 67"
+  },
+  {
+   "keys": [
+    "steam:284160"
+   ],
+   "title": "BeamNG.drive",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWithFixes",
+     "build": "Test 12",
+     "summary": "Runs with its recommended settings",
+     "source": "Regression Timeline (Nov 21): log 587324f3"
+    }
+   ],
+   "lastGood": "Test 12",
+   "retest": true,
+   "retestBuild": "Test 12"
+  },
+  {
+   "keys": [
+    "steam:2406770"
+   ],
+   "title": "Bodycam",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "Test 18",
+     "summary": "Hung, then crashed",
+     "source": "Regression Timeline (Nov 21): his report (player iPad log, hung then crashed)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 18"
+  },
+  {
+   "keys": [
+    "steam:49520",
+    "title:borderlands 2"
+   ],
+   "title": "Borderlands 2",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 67",
+     "summary": "Launches and plays",
+     "source": "INDEX-wave19.md:202"
+    },
+    {
+     "device": "iPhone",
+     "tier": "runsWell",
+     "build": "Test 16",
+     "summary": "Runs",
+     "source": "Regression Timeline (Nov 21): log 5994d404"
+    }
+   ],
+   "lastGood": "Test 16",
+   "retest": true,
+   "retestBuild": "Test 16"
+  },
+  {
+   "keys": [
+    "steam:291550"
+   ],
+   "title": "Brawlhalla",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "Wave 13",
+     "summary": "Doesn't run",
+     "source": "Regression Timeline (Nov 21): log 85b993b3"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:2835570"
+   ],
+   "title": "Buckshot Roulette",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWell",
+     "build": "0.2.23",
+     "summary": "Runs",
+     "source": "Regression Timeline (Nov 21): log 42e5934a"
+    }
+   ],
+   "lastGood": "0.2.23",
+   "retest": true,
+   "retestBuild": "0.2.23"
+  },
+  {
+   "keys": [
+    "steam:42700",
+    "title:call of duty: black ops"
+   ],
+   "title": "Call of Duty: Black Ops",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWithProblems",
+     "build": "0.2.29",
+     "summary": "Runs for a short time, then stops",
+     "source": "Regression Timeline (Nov 21): log 8d388e85"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "0.2.29"
+  },
+  {
+   "keys": [
+    "steam:202970",
+    "steam:212910",
+    "title:call of duty: black ops ii"
+   ],
+   "title": "Call of Duty: Black Ops II",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 32",
+     "summary": "Works, campaign and Zombies switch both ways",
+     "source": "INDEX-wave19.md:186 (Zombies app id 212910: GameRecommendations.swift blackOps2 comment)"
+    }
+   ],
+   "lastGood": "build 32",
+   "retest": true,
+   "retestBuild": "build 32"
+  },
+  {
+   "keys": [
+    "steam:311210"
+   ],
+   "title": "Call of Duty: Black Ops III",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "startsOnly",
+     "build": "0.2.70",
+     "summary": "Starts, then gets stuck",
+     "source": "Regression Timeline (Nov 21): log 654def42"
+    },
+    {
+     "device": "unknown",
+     "tier": "startsOnly",
+     "build": "0.2.84",
+     "summary": "Starts past Safe Mode, then runs out of memory space",
+     "source": "memory bo3-nov22-walls (0.2.84 result 00:44 MT: MapPage again)"
+    },
+    {
+     "device": "unknown",
+     "tier": "startsOnly",
+     "build": "0.2.88",
+     "summary": "Loads past the memory error, then closes by itself about 28 s in",
+     "source": "memory bo3-nov22-walls (0.2.88 11:20 MT: all 17 pools fit, exit 27.8 s)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "0.2.88"
+  },
+  {
+   "keys": [
+    "steam:10180",
+    "title:call of duty: modern warfare 2 (2009)"
+   ],
+   "title": "Call of Duty: Modern Warfare 2 (2009)",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 48",
+     "summary": "Campaign works",
+     "source": "INDEX-wave19.md:188"
+    }
+   ],
+   "lastGood": "build 48",
+   "retest": true,
+   "retestBuild": "build 48"
+  },
+  {
+   "keys": [
+    "steam:231430"
+   ],
+   "title": "Company of Heroes 2",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWell",
+     "build": "0.2.25",
+     "summary": "Runs",
+     "source": "Regression Timeline (Nov 21): log 5825d1b5"
+    }
+   ],
+   "lastGood": "0.2.25",
+   "retest": true,
+   "retestBuild": "0.2.25"
+  },
+  {
+   "keys": [
+    "steam:548430"
+   ],
+   "title": "Deep Rock Galactic",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWell",
+     "build": "0.2.45",
+     "summary": "DX11, played 3.5 minutes, \"worked perfectly\"",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "lastGood": "0.2.45",
+   "retest": true,
+   "retestBuild": "0.2.45"
+  },
+  {
+   "keys": [
+    "steam:1671210",
+    "title:deltarune"
+   ],
+   "title": "DELTARUNE",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "public 0.2.0",
+     "summary": "Chapters start (by launch arguments); no music (player reports)",
+     "source": "INDEX-wave19.md:222"
+    },
+    {
+     "device": "iPhone",
+     "tier": "runsWithProblems",
+     "build": "Wave 13",
+     "summary": "Starts with a workaround",
+     "source": "Regression Timeline (Nov 21): log (starts with workaround)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:1222140"
+   ],
+   "title": "Detroit: Become Human",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "Test 18",
+     "summary": "iOS closed Madeira",
+     "source": "Regression Timeline (Nov 21): player log (iOS closed Madeira)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 18"
+  },
+  {
+   "keys": [
+    "steam:1239080"
+   ],
+   "title": "Door Kickers 2",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWell",
+     "build": "0.2.25",
+     "summary": "Works with the iPad's language set to English",
+     "source": "Regression Timeline (Nov 21): his report (iPad set to English)"
+    }
+   ],
+   "lastGood": "0.2.25",
+   "retest": true,
+   "retestBuild": "0.2.25"
+  },
+  {
+   "keys": [
+    "steam:2135150"
+   ],
+   "title": "Elin",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "startsOnly",
+     "build": "0.2.32",
+     "summary": "Starts, then gets stuck",
+     "source": "Regression Timeline (Nov 21): log 358ea59c"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "0.2.32"
+  },
+  {
+   "keys": [
+    "steam:427520"
+   ],
+   "title": "Factorio",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "Wave 13",
+     "summary": "Runs, but the screen is almost black",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:22380",
+    "title:fallout: new vegas"
+   ],
+   "title": "Fallout: New Vegas",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 60",
+     "summary": "Works full speed",
+     "source": "INDEX-wave19.md:190"
+    },
+    {
+     "device": "iPhone",
+     "tier": "runsWell",
+     "build": "0.2.77",
+     "summary": "Playable",
+     "source": "his call Nov 21 (project memory): playable on 0.2.77"
+    }
+   ],
+   "lastGood": "0.2.77",
+   "retest": true,
+   "retestBuild": "0.2.77"
+  },
+  {
+   "keys": [
+    "steam:3551340"
+   ],
+   "title": "Football Manager 26",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "0.2.29",
+     "summary": "Hangs on the last loading screen",
+     "source": "Regression Timeline (Nov 21): player log"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "0.2.29"
+  },
+  {
+   "keys": [
+    "steam:3194360",
+    "title:formula legends"
+   ],
+   "title": "Formula Legends",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "public v0.1.3",
+     "summary": "Broken (player report)",
+     "source": "INDEX-wave19.md:223"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "public v0.1.3"
+  },
+  {
+   "keys": [
+    "steam:4000",
+    "title:garry's mod"
+   ],
+   "title": "Garry's Mod",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "build 60",
+     "summary": "Multiplayer works at 60 fps on the x86-64 branch; 32-bit menu broken",
+     "source": "INDEX-wave19.md:191"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "build 60"
+  },
+  {
+   "keys": [
+    "steam:962130"
+   ],
+   "title": "Grounded",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "Test 8",
+     "summary": "Ran about 1 minute",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 8"
+  },
+  {
+   "keys": [
+    "steam:1030300"
+   ],
+   "title": "Hollow Knight: Silksong",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "Test 16",
+     "summary": "Works; the controller works on 0.2.23",
+     "source": "Regression Timeline (Nov 21): his report (\"Silksong works fine\")"
+    }
+   ],
+   "lastGood": "Test 16",
+   "retest": true,
+   "retestBuild": "Test 16"
+  },
+  {
+   "keys": [
+    "steam:1092790",
+    "title:inscryption"
+   ],
+   "title": "Inscryption",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "Nov 7 tester build",
+     "summary": "Works once you add env.MADEIRA_NO_GL = 1 to its own config by hand (tester confirmed)",
+     "source": "INDEX-wave19.md:212"
+    },
+    {
+     "device": "iPhone",
+     "tier": "runsWithProblems",
+     "build": "Wave 13",
+     "summary": "Runs for a short time, then stops",
+     "source": "Regression Timeline (Nov 21): log 1aca38e2"
+    }
+   ],
+   "lastGood": "Nov 7 tester build",
+   "handLines": [
+    "env.MADEIRA_NO_GL = 1"
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:8190"
+   ],
+   "title": "Just Cause 2",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "0.2.23",
+     "summary": "Works with its recommended settings",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "lastGood": "0.2.23",
+   "retest": true,
+   "retestBuild": "0.2.23"
+  },
+  {
+   "keys": [
+    "steam:2552450"
+   ],
+   "title": "Kingdom Hearts III",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "0.2.0",
+     "summary": "Works once the Steam library .vdf file was fixed (tester)",
+     "source": "Regression Timeline (Nov 21): his report (tester, after fixed library vdf)"
+    }
+   ],
+   "lastGood": "0.2.0",
+   "retest": true,
+   "retestBuild": "0.2.0"
+  },
+  {
+   "keys": [
+    "steam:32440",
+    "title:lego star wars: the complete saga"
+   ],
+   "title": "LEGO Star Wars: The Complete Saga",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "0.2.55",
+     "summary": "Works",
+     "source": "Regression Timeline (Nov 21): his report (log confirms)"
+    }
+   ],
+   "lastGood": "0.2.55",
+   "retest": true,
+   "retestBuild": "0.2.55"
+  },
+  {
+   "keys": [
+    "steam:1966720"
+   ],
+   "title": "Lethal Company",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWithProblems",
+     "build": "Test 11",
+     "summary": "Runs for a short time, then stops",
+     "source": "Regression Timeline (Nov 21): log 63ac99f0"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 11"
+  },
+  {
+   "keys": [
+    "steam:860510"
+   ],
+   "title": "Little Nightmares II",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWell",
+     "build": "Test 8",
+     "summary": "Runs",
+     "source": "Regression Timeline (Nov 21): log b9587c8a"
+    }
+   ],
+   "lastGood": "Test 8",
+   "retest": true,
+   "retestBuild": "Test 8"
+  },
+  {
+   "keys": [
+    "steam:2357570",
+    "title:overwatch"
+   ],
+   "title": "Overwatch 2",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "0.2.70",
+     "summary": "Dies about 20 s in",
+     "source": "Regression Timeline (Nov 21): his report"
+    },
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "0.2.84",
+     "summary": "Old hang gone; stops about 64 s in (exit C00000E5)",
+     "source": "log ow2-0.2.84-ipad-2026-11-22-61524411 (NtTerminateProcess 0xC00000E5)"
+    },
+    {
+     "device": "iPad",
+     "tier": "doesntRun",
+     "build": "0.2.88",
+     "summary": "Closes during start-up (loader self-check)",
+     "source": "log ow2-0.2.88-ipad-2026-11-22-1271b689 (same assert at loader+0x441960)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "0.2.88"
+  },
+  {
+   "keys": [
+    "steam:1113000",
+    "title:persona 4 golden"
+   ],
+   "title": "Persona 4 Golden",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "doesntRun",
+     "build": "old build",
+     "summary": "Broken, no settings fix",
+     "source": "INDEX-wave19.md:208"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "old build"
+  },
+  {
+   "keys": [
+    "exe:plantsvszombiesrh.exe"
+   ],
+   "title": "Plants vs. Zombies Fusion",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "startsOnly",
+     "build": "Test 12",
+     "summary": "Starts, then gets stuck",
+     "source": "Regression Timeline (Nov 21): log 9e556cd0"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 12"
+  },
+  {
+   "keys": [
+    "steam:108600",
+    "title:project zomboid"
+   ],
+   "title": "Project Zomboid",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "build 60",
+     "summary": "Works; the menu takes about 2.5 minutes",
+     "source": "INDEX-wave19.md:192"
+    },
+    {
+     "device": "unknown",
+     "tier": "runsWithProblems",
+     "build": "0.2.70",
+     "summary": "No crash with the new Java line; iOS memory is still a problem",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "lastGood": "build 60",
+   "retest": true,
+   "retestBuild": "0.2.70"
+  },
+  {
+   "keys": [
+    "steam:1196590"
+   ],
+   "title": "Resident Evil Village",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWithFixes",
+     "build": "0.2.68",
+     "summary": "The prologue video shows; add env.MADEIRA_WG_64BIT = 1 to its own config by hand",
+     "source": "his report (project memory): prologue video shows, keep env.MADEIRA_WG_64BIT=1"
+    }
+   ],
+   "lastGood": "0.2.68",
+   "handLines": [
+    "env.MADEIRA_WG_64BIT = 1"
+   ],
+   "retest": true,
+   "retestBuild": "0.2.68"
+  },
+  {
+   "keys": [
+    "steam:294100"
+   ],
+   "title": "RimWorld",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWell",
+     "build": "0.2.23",
+     "summary": "Works after changing the resolution to 1920",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "lastGood": "0.2.23",
+   "retest": true,
+   "retestBuild": "0.2.23"
+  },
+  {
+   "keys": [
+    "steam:632360"
+   ],
+   "title": "Risk of Rain 2",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWithProblems",
+     "build": "Wave 18",
+     "summary": "Runs for a short time, then stops",
+     "source": "Regression Timeline (Nov 21): log d1ee3851"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 18"
+  },
+  {
+   "keys": [
+    "title:satisfactory"
+   ],
+   "title": "Satisfactory (Epic)",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "Wave 5",
+     "summary": "Epic copy: works and runs fine with its 5-line game config (added by hand)",
+     "source": "INDEX-wave19.md:139"
+    }
+   ],
+   "lastGood": "Wave 5",
+   "handLines": [
+    "pool-split = 1",
+    "env.MADEIRA_X64_IMAGE_NOCOPY = 1",
+    "env.MADEIRA_EC_HOOK_TRACE = 0",
+    "rp-carry = 1",
+    "rp-discard = 1"
+   ],
+   "retest": true,
+   "retestBuild": "Wave 5"
+  },
+  {
+   "keys": [
+    "steam:1295660"
+   ],
+   "title": "Sid Meier's Civilization VII",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "Test 18",
+     "summary": "Its program needs a fixed load address and cannot load",
+     "source": "Regression Timeline (Nov 21): log (fixed-base exe cannot load)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 18"
+  },
+  {
+   "keys": [
+    "steam:2868840",
+    "title:slay the spire 2"
+   ],
+   "title": "Slay the Spire 2",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "0.2.70",
+     "summary": "Works with its recommended settings",
+     "source": "Regression Timeline (Nov 21): his report (\"slay the spire works\")"
+    }
+   ],
+   "lastGood": "0.2.70",
+   "retest": true,
+   "retestBuild": "0.2.70"
+  },
+  {
+   "keys": [
+    "steam:413150",
+    "title:stardew valley"
+   ],
+   "title": "Stardew Valley",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "Wave 5",
+     "summary": "Works (64-bit) with its own config",
+     "source": "INDEX-wave19.md:138"
+    },
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "Wave 19",
+     "summary": "Works with its recommended settings",
+     "source": "Regression Timeline (Nov 21): his report"
+    }
+   ],
+   "lastGood": "Wave 19",
+   "retest": true,
+   "retestBuild": "Wave 19"
+  },
+  {
+   "keys": [
+    "steam:1962700"
+   ],
+   "title": "Subnautica 2",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "runsWithFixes",
+     "build": "Test 12",
+     "summary": "Runs with its recommended settings",
+     "source": "Regression Timeline (Nov 21): log a892d342"
+    }
+   ],
+   "lastGood": "Test 12",
+   "retest": true,
+   "retestBuild": "Test 12"
+  },
+  {
+   "keys": [
+    "steam:440"
+   ],
+   "title": "Team Fortress 2",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "Test 16",
+     "summary": "Works",
+     "source": "Regression Timeline (Nov 21): his report (\"Free game works\")"
+    }
+   ],
+   "lastGood": "Test 16",
+   "retest": true,
+   "retestBuild": "Test 16"
+  },
+  {
+   "keys": [
+    "steam:1167630",
+    "title:teardown"
+   ],
+   "title": "Teardown",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "startsOnly",
+     "build": "Test 8",
+     "summary": "Starts, then gets stuck",
+     "source": "Regression Timeline (Nov 21): log 1249a92b"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Test 8"
+  },
+  {
+   "keys": [
+    "steam:105600",
+    "title:terraria"
+   ],
+   "title": "Terraria",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "build 34",
+     "summary": "Works",
+     "source": "INDEX-wave19.md:194"
+    }
+   ],
+   "lastGood": "build 34",
+   "retest": true,
+   "retestBuild": "build 34"
+  },
+  {
+   "keys": [
+    "steam:641990",
+    "title:the escapists 2"
+   ],
+   "title": "The Escapists 2",
+   "results": [
+    {
+     "device": "iPad",
+     "tier": "runsWithFixes",
+     "build": "Wave 17",
+     "summary": "Runs with its recommended settings",
+     "source": "Regression Timeline (Nov 21): log ec53c9fa"
+    },
+    {
+     "device": "iPhone",
+     "tier": "runsWithFixes",
+     "build": "0.2.84",
+     "summary": "Runs with its recommended settings (SMC hot page off): about 60 fps and a clean quit",
+     "source": "log from 01:16 MT Nov 22 on iPhone, 0.2.84 (SWP traps 4.65M to 19, median 60 fps, clean quit)"
+    },
+    {
+     "device": "unknown",
+     "tier": "runsWithFixes",
+     "build": "0.2.84",
+     "summary": "Works with its recommended settings (0.2.86 and later add env.MADEIRA_SMC_HOT_PAGE = 0)",
+     "source": "memory escapists2-mono-patch-loop-0.2.76 (log 640c1b1b: 60 fps, quit exit 0)"
+    }
+   ],
+   "lastGood": "0.2.84",
+   "retest": true,
+   "retestBuild": "0.2.84"
+  },
+  {
+   "keys": [
+    "title:the planet crafter"
+   ],
+   "title": "The Planet Crafter",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "startsOnly",
+     "build": "build 67",
+     "summary": "Gets in game, then stops about 3 s in",
+     "source": "INDEX-wave19.md:199"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "build 67"
+  },
+  {
+   "keys": [
+    "steam:391540"
+   ],
+   "title": "Undertale",
+   "results": [
+    {
+     "device": "unknown",
+     "tier": "runsWell",
+     "build": "Wave 13",
+     "summary": "Works",
+     "source": "Regression Timeline (Nov 21): log (cameron wave13)"
+    }
+   ],
+   "lastGood": "Wave 13",
+   "retest": true,
+   "retestBuild": "Wave 13"
+  },
+  {
+   "keys": [
+    "steam:1574820",
+    "title:until then"
+   ],
+   "title": "Until Then",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "public 0.2.0",
+     "summary": "No frame, exits with 255 (player report)",
+     "source": "INDEX-wave19.md:197"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "public 0.2.0"
+  },
+  {
+   "keys": [
+    "title:vintage story"
+   ],
+   "title": "Vintage Story",
+   "results": [
+    {
+     "device": "iPhone",
+     "tier": "doesntRun",
+     "build": "Wave 13",
+     "summary": "Black screen",
+     "source": "Regression Timeline (Nov 21): his report (black screen)"
+    }
+   ],
+   "retest": true,
+   "retestBuild": "Wave 13"
+  }
+ ]
+}

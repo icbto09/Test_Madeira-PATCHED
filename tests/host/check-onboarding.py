@@ -81,7 +81,8 @@ opener = block(model, 'private func open(reason: String, since: Int)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
         'setup never opens over a running session, or with nothing to set up')
 require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN,\n'
-        '                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since)' in model,
+        '                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since,\n'
+        '                              merged: MadeiraConfig.flag("MADEIRA_GET_GAME_PARTS"))' in model,
         'the pages follow the sign-in and Dock switches, whether LocalDevVPN, Wine Mono and the VC++ runtime are here, and the revision seen')
 require(block(model, 'private static func vcRedistOffered()').count('VCRedistModel.enabled') == 1
         and 'offerVCRedist = Self.vcRedistOffered()' in opener,
@@ -108,7 +109,7 @@ require('if onboarding.available {' in jit_settings_section and 'onboarding.reru
 
 # ------------------------------------------------------------------ static: skippable steps
 view = block(onboarding, 'struct OnboardingView: View')
-for page in ['private var signInPage', 'private var dockClientPage', 'private var wineMonoPage', 'private var vcRedistPage']:
+for page in ['private var signInPage', 'private var dockClientPage', 'private var wineMonoPage', 'private var vcRedistPage', 'private var gamePartsPage']:
     require('secondary("Set up later") { model.next() }' in block(view, page), f'{page.split()[-1]}: Set up later')
 require('secondary("Skip setup") { model.skip() }' in block(view, 'private var welcome'), 'welcome: visible Skip setup')
 jit_page = block(view, 'private var jitPage')

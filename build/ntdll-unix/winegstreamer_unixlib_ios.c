@@ -1604,6 +1604,10 @@ static void report_failures( struct wma_transform *transform )
     transform->short_tail_dropped = 0;
 }
 
+/* MADEIRA avc-transform: H.264 / AAC on VideoToolbox / AudioToolbox
+ * (MADEIRA_WG_AVC_TRANSFORM=0 turns it off). */
+#include "wg_transform_avc_ios.c"
+
 /***********************************************************************
  *           wg_transform_create
  */
@@ -1619,6 +1623,8 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     int err;
 
     params->transform = 0;
+
+    if (avc_wants( params )) return avc_transform_create( params );
 
     if (!in || !out)
     {
@@ -1791,7 +1797,9 @@ fail:
 static NTSTATUS transform_destroy( wg_transform_t handle )
 {
     struct wma_transform *transform = get_transform( handle );
+    struct avc_transform *avc = avc_get( handle );
 
+    if (avc) return avc_transform_destroy( avc );
     if (!transform) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock( &transform->lock );
@@ -1828,8 +1836,10 @@ static NTSTATUS transform_push_data( wg_transform_t handle, struct wg_sample *sa
                                      const void *data, HRESULT *result )
 {
     struct wma_transform *transform = get_transform( handle );
+    struct avc_transform *avc = avc_get( handle );
     NTSTATUS status;
 
+    if (avc && sample) return avc_transform_push( avc, sample, data, result );
     if (!transform || !sample) return STATUS_INVALID_HANDLE;
     /* No fake success: bytes with nowhere to read
      * them from is a caller bug, and quietly accepting them would look like a
@@ -1899,8 +1909,10 @@ static NTSTATUS transform_read_data( wg_transform_t handle, struct wg_sample *sa
                                      void *data, HRESULT *result )
 {
     struct wma_transform *transform = get_transform( handle );
+    struct avc_transform *avc = avc_get( handle );
     size_t avail, copy, frames;
 
+    if (avc && sample) return avc_transform_read( avc, sample, data, result );
     if (!transform || !sample) return STATUS_INVALID_HANDLE;
     /* Consuming PCM into a buffer that does not exist would lose it silently. */
     if (sample->max_size && !data) return STATUS_INVALID_PARAMETER;
@@ -1965,8 +1977,10 @@ static NTSTATUS transform_read_data( wg_transform_t handle, struct wg_sample *sa
 static NTSTATUS transform_get_output_type( wg_transform_t handle, struct wg_media_type *type )
 {
     struct wma_transform *transform = get_transform( handle );
+    struct avc_transform *avc = avc_get( handle );
     UINT32 size;
 
+    if (avc) return avc_transform_get_output_type( avc, type );
     if (!transform) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock( &transform->lock );
@@ -1996,6 +2010,7 @@ static NTSTATUS transform_set_output_type( wg_transform_t handle, const struct w
     BYTE *copy;
     UINT tag;
 
+    if (avc_get( handle )) return avc_transform_set_output_type( avc_get( handle ), type );
     if (!transform) return STATUS_INVALID_HANDLE;
     if (!out) return STATUS_NOT_SUPPORTED;
 
@@ -2100,6 +2115,8 @@ static NTSTATUS wma_transform_get_status( void *args )
     struct wg_transform_get_status_params *params = args;
     struct wma_transform *transform = get_transform( params->transform );
 
+    if (avc_get( params->transform ))
+        return avc_transform_get_status( avc_get( params->transform ), &params->accepts_input );
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
     params->accepts_input = (transform->pcm_len == transform->pcm_pos);
@@ -2112,6 +2129,7 @@ static NTSTATUS wma_transform_drain( void *args )
     struct wma_transform *transform = get_transform( *(wg_transform_t *)args );
     NTSTATUS status;
 
+    if (avc_get( *(wg_transform_t *)args )) return avc_transform_drain( avc_get( *(wg_transform_t *)args ) );
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
     WMA_LOG( "drain: transform=%p after %u packets\n", transform, transform->packet_count );
@@ -2141,6 +2159,7 @@ static NTSTATUS wma_transform_flush( void *args )
 {
     struct wma_transform *transform = get_transform( *(wg_transform_t *)args );
 
+    if (avc_get( *(wg_transform_t *)args )) return avc_transform_flush( avc_get( *(wg_transform_t *)args ) );
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
     report_failures( transform );
@@ -2341,7 +2360,7 @@ static NTSTATUS wgp_create( void *args )
     pthread_once( &wma_av_log_once, wma_install_av_log );
     pthread_once( &wgp_config_once, wgp_configure );
     if (!(parser = calloc( 1, sizeof(*parser) ))) return E_OUTOFMEMORY;
-    if (!(parser->core = mav_create( params->output_compressed )))
+    if (!(parser->core = mav_create( !!(params->flags & WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED) )))
     {
         free( parser );
         return E_OUTOFMEMORY;
@@ -2980,7 +2999,7 @@ struct wg_parser_stream_get_tag_params32
     PTR32 size;
 };
 
-C_ASSERT( sizeof(struct wg_format) == 120 );
+C_ASSERT( sizeof(struct wg_format) == 196 );   /* 11.22: video codec_data grew from 64 to 140 bytes */
 C_ASSERT( sizeof(struct wg_parser_buffer) == 32 );
 C_ASSERT( offsetof(struct wg_parser_stream_seek_params, stop_flags) == 36 );
 C_ASSERT( offsetof(struct wg_parser_stream_notify_qos_params, timestamp) == 32 );

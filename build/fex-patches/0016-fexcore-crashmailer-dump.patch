@@ -1,0 +1,229 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 36efeaa..e589b97 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -645,6 +645,11 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
+     if (RingOn < 0) {
+       const char* E = getenv("MADEIRA_BLOCK_RING");
+       RingOn = (E && *E && *E != '0') ? 1 : 0;
++#if defined(ARCHITECTURE_arm64ec)
++      if (FEXCore::Core::IosBlockRingForce) {
++        RingOn = 1; /* madeira [crashmailer-dump]: Overwatch.exe, see ARM64EC Module.cpp */
++      }
++#endif
+     }
+     if (RingOn) {
+       const size_t Bytes = (FEXCore::Core::IosBlockRingEntries + 1) * sizeof(uint64_t);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 18c42a7..dd23485 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -934,6 +934,11 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+     if (RingOn < 0) {
+       const char* E = getenv("MADEIRA_BLOCK_RING");
+       RingOn = (E && *E && *E != '0') ? 1 : 0;
++#if defined(ARCHITECTURE_arm64ec)
++      if (FEXCore::Core::IosBlockRingForce) {
++        RingOn = 1; /* madeira [crashmailer-dump]: Overwatch.exe, see ARM64EC Module.cpp */
++      }
++#endif
+     }
+     /* ml1207 [ring-first] (env MADEIRA_BLOCK_RING_FIRST = 1, log-only, needs MADEIRA_BLOCK_RING):
+      * record a translated block only the first time it runs in the process, so the 4096-entry
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index c9c4176..b665ad1 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -555,6 +555,7 @@ struct CpuStateFrame {
+ 
+ #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+ extern uint32_t IosGuestBranchTraceEnabled;
++extern uint32_t IosBlockRingForce; /* madeira [crashmailer-dump]: ARM64EC Module.cpp */
+ static_assert(sizeof(CpuStateFrame::IosGuestBranchHistoryType) == 272);
+ static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) % 8 == 0);
+ static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) + 272 <= 32760);
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 4205989..7a4b728 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1026,6 +1026,21 @@ static bool IosAssertDumpOn() {
+   return V != 0;
+ }
+ 
++// madeira [crashmailer-dump] (env MADEIRA_EC_CRASHMAILER_DUMP = 0 turns it off). rev=crashmailer-dump-1. LOG ONLY.
++// FEX does no logging for it: it keeps the ring below filled (also when MADEIRA_EC_ASSERT_DUMP=0) and hands it, with
++// this thread's emulator state, to ntdll through BTCpu64IosCrashMailerData; ntdll prints it when the process starts
++// CrashMailer. ntdll reads the same switch and does not call in when it is off.
++static bool IosCrashMailerOn() {
++  static std::atomic<int8_t> On {-1};
++  int8_t V = On.load(std::memory_order_relaxed);
++  if (V < 0) {
++    const char* E = getenv("MADEIRA_EC_CRASHMAILER_DUMP");
++    V = (E && E[0] == '0') ? 0 : 1;
++    On.store(V, std::memory_order_relaxed);
++  }
++  return V != 0;
++}
++
+ // assert-dump-2: a ring of the last 64 exception contexts as DELIVERED to the guest (all threads), so the dump can show
+ // what the loader's int3/single-step handlers were handed just before its check failed. Entries are written without a
+ // lock; a torn entry is possible if two threads raise at the same instant (it is only logged, never used).
+@@ -1041,7 +1056,7 @@ static IosAssertRingEntry IosAssertRing[64];
+ static std::atomic<uint64_t> IosAssertRingSeq {0};
+ 
+ static void IosAssertRecord(uint32_t Code, uint32_t EFlags, uint32_t LiveTF, const ARM64_NT_CONTEXT& Ctx) {
+-  if (!IosAssertDumpOn()) {
++  if (!IosAssertDumpOn() && !IosCrashMailerOn()) { // crashmailer-dump reads the ring too
+     return;
+   }
+   const uint64_t Seq = IosAssertRingSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+@@ -1564,6 +1579,9 @@ static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM6
+ /* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
+ /* Keep a word-sized global, matching the module's iOS relocation guards. */
+ namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
++/* madeira [crashmailer-dump]: set by ProcessInit (Overwatch.exe only, see there); read once by the ml1205 block ring
++ * (Core.cpp allocation, JIT.cpp emission) as if MADEIRA_BLOCK_RING=1 were set. */
++namespace FEXCore::Core { uint32_t IosBlockRingForce = 0; }
+ extern "C" const uint64_t IosGuestBranchTraceLayout[3] = {
+   0x314744454742444dULL,
+   offsetof(FEXCore::Core::CpuStateFrame, IosGuestBranchHistory) |
+@@ -1633,6 +1651,20 @@ NTSTATUS ProcessInit() {
+     (_stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0'));
+   LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
+                    FEXCore::Core::IosGuestBranchTraceEnabled != 0, AppConfigName);
++  /* madeira [crashmailer-dump] rev=crashmailer-dump-1: branch-history-v1 keeps only 8 exit edges per thread, so it
++   * cannot give the last 4096 blocks. The ml1205 block ring can (4096 entries per thread, ~10 instructions per block
++   * entry, 32 KB per thread). Turn it on for Overwatch.exe only, unless MADEIRA_EC_CRASHMAILER_DUMP=0 or
++   * MADEIRA_BLOCK_RING=0; every other game is unchanged. Must run before the first thread and the first block. */
++  {
++    const char* CmOpt = getenv("MADEIRA_EC_CRASHMAILER_DUMP");
++    const char* RingOpt = getenv("MADEIRA_BLOCK_RING");
++    FEXCore::Core::IosBlockRingForce = _stricmp(HistoryName.c_str(), "Overwatch.exe") == 0 && !(CmOpt && CmOpt[0] == '0') &&
++                                       !(RingOpt && RingOpt[0] == '0');
++    if (FEXCore::Core::IosBlockRingForce) {
++      LogMan::Msg::IFmt("[crashmailer-dump] rev=crashmailer-dump-1 fex: block ring on for {} (MADEIRA_BLOCK_RING=0 turns it off)",
++                        AppConfigName);
++    }
++  }
+ #endif
+ 
+ 
+@@ -2855,6 +2887,106 @@ extern "C" uint32_t BTCpu64IosDebugRegs(uint32_t Op, uint64_t* Regs) {
+   State.Dr7 = NewDr7;
+   return 1;
+ }
++
++/* madeira [crashmailer-dump] rev=crashmailer-dump-1. Data only: no logging, no locks, no allocation. ntdll calls it
++ * once, from NtCreateUserProcess on the thread that starts CrashMailer. The layouts are mirrored in
++ * signal_arm64ec.c (struct ios_cmd_fex_thread / ios_cmd_fex_exc); keep them in step.
++ * Op 0: this thread's emulator state as FEX last stored it (State is written back at JIT exits, so for a thread
++ *       that is in native ARM64EC code it is the state at its last exit, not a live view). Returns 1, or 0 when
++ *       the thread has no emulator state.
++ * Op 1: the assert-dump-2 ring of delivered exception contexts (all threads), newest first, as many as fit in
++ *       Size. Returns the number copied. */
++struct IosCmFexThread {
++  uint64_t Version; // 1
++  uint64_t Rip;
++  uint64_t Gregs[16];
++  uint64_t EFlags, Fcw, Ftw, Mxcsr;
++  uint64_t Dr[6];
++  uint64_t Xmm[16][2];
++  uint64_t RingSeq;
++  uint64_t BlockRing;
++};
++struct IosCmFexExc {
++  uint64_t Seq;
++  uint32_t Tid, Code, EFlags, LiveTF;
++  uint64_t X[31];
++  uint64_t Sp, Pc;
++  uint32_t Cpsr, Fpcr, Fpsr, ContextFlags;
++  uint64_t V[32][2];
++};
++static_assert(sizeof(IosCmFexThread) == 8 * 62 && sizeof(IosCmFexExc) == 816, "mirrored in signal_arm64ec.c");
++
++extern "C" uint32_t BTCpu64IosCrashMailerData(uint32_t Op, void* Buf, uint32_t Size) {
++  if (!Buf || !Exception::IosCrashMailerOn()) {
++    return 0;
++  }
++  if (Op == 0) {
++    auto* Thread = GetCPUArea().ThreadState();
++    if (!Thread || Size < sizeof(IosCmFexThread)) {
++      return 0;
++    }
++    const auto& State = Thread->CurrentFrame->State;
++    auto* T = static_cast<IosCmFexThread*>(Buf);
++    memset(T, 0, sizeof(*T));
++    T->Version = 1;
++    T->Rip = State.rip;
++    for (int i = 0; i < 16; i++) {
++      T->Gregs[i] = State.gregs[i];
++      T->Xmm[i][0] = State.xmm.sse.data[i][0];
++      T->Xmm[i][1] = State.xmm.sse.data[i][1];
++    }
++    T->EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++    T->Fcw = State.FCW;
++    T->Ftw = State.AbridgedFTW;
++    T->Mxcsr = State.mxcsr;
++    for (int i = 0; i < 4; i++) {
++      T->Dr[i] = State.Dr[i];
++    }
++    T->Dr[4] = State.Dr6;
++    T->Dr[5] = State.Dr7;
++    T->RingSeq = Exception::IosAssertRingSeq.load(std::memory_order_relaxed);
++    T->BlockRing = reinterpret_cast<uint64_t>(Thread->CurrentFrame->IosBlockRing);
++    return 1;
++  }
++  if (Op == 1) {
++    const uint32_t Max = Size / sizeof(IosCmFexExc);
++    auto* Out = static_cast<IosCmFexExc*>(Buf);
++    const uint64_t Now = Exception::IosAssertRingSeq.load(std::memory_order_relaxed);
++    uint32_t N = 0;
++    for (uint64_t k = 0; k < 64 && k < Now && N < Max; k++) {
++      const auto& E = Exception::IosAssertRing[(Now - k) % 64];
++      std::atomic_thread_fence(std::memory_order_acquire);
++      if (E.Seq != Now - k) {
++        continue; // being rewritten
++      }
++      auto& O = Out[N];
++      O.Seq = E.Seq;
++      O.Tid = E.Tid;
++      O.Code = E.Code;
++      O.EFlags = E.EFlags;
++      O.LiveTF = E.LiveTF;
++      for (int i = 0; i < 31; i++) {
++        O.X[i] = E.Ctx.X[i];
++      }
++      O.Sp = E.Ctx.Sp;
++      O.Pc = E.Ctx.Pc;
++      O.Cpsr = E.Ctx.Cpsr;
++      O.Fpcr = E.Ctx.Fpcr;
++      O.Fpsr = E.Ctx.Fpsr;
++      O.ContextFlags = E.Ctx.ContextFlags;
++      for (int i = 0; i < 32; i++) {
++        O.V[i][0] = E.Ctx.V[i].Low;
++        O.V[i][1] = static_cast<uint64_t>(E.Ctx.V[i].High);
++      }
++      if (E.Seq != Now - k) {
++        continue; // torn while copying: drop it
++      }
++      N++;
++    }
++    return N;
++  }
++  return 0;
++}
+ #endif
+ 
+ /* ml618: TEB is passed EXPLICITLY rather than read from x18.
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+index 4d82327..9b46ff7 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+@@ -6,6 +6,7 @@ LIBRARY libarm64ecfex.dll
+ EXPORTS
+   BTCpu64FlushInstructionCache
+   BTCpu64IosAddAliasMapping
++  BTCpu64IosCrashMailerData
+   BTCpu64IosDebugRegs
+   BTCpu64IosRipFromHostPC
+   BTCpu64IosSetMonoBridge

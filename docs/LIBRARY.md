@@ -638,6 +638,7 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_RUNTIME_SETTINGS` | on | no Display and Memory & sync sections in Settings |
 | `MADEIRA_GRAPHICS_SETTINGS` | on | no Graphics section in Settings; `d3d9`, `d3d12`, `vulkan` and `windowed` are back in All settings |
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling (a session does not save it) and no Diagnostics in the in-game menu |
+| `MADEIRA_SESSION_TABS` | on | the in-game menu has Controls, Display and Power tabs with their settings in place; `0` brings back the one page with three sub-pages |
 | `MADEIRA_SESSION_DIAGNOSTICS` | off | `1` shows the in-game menu's Diagnostics: frame capture (render-target pixels to `Documents/capture`) and GPU sync, for Direct3D 12 games |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
 | `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |

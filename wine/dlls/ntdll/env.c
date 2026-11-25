@@ -78,6 +78,20 @@ static void set_wow64_environment( WCHAR **env )
     if (!is_win64 && NtCurrentTeb()->WowTebOffset)
     {
         RtlWow64GetProcessMachines( GetCurrentProcess(), NULL, &machine );
+        /* madeira [guest-machine-x64]: a 32-bit x86 program on this ARM64 host is told
+         * it runs on an x64 PC (see IsWow64Process2 in kernelbase).
+         * Only with MADEIRA_GUEST_MACHINE_X64 = 1; off by default. */
+        if (machine == IMAGE_FILE_MACHINE_ARM64 &&
+            RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress )->FileHeader.Machine == IMAGE_FILE_MACHINE_I386)
+        {
+            WCHAR off_buf[4];
+            UNICODE_STRING off_nameW = RTL_CONSTANT_STRING( L"MADEIRA_GUEST_MACHINE_X64" );
+            UNICODE_STRING off_valW = { 0, sizeof(off_buf), off_buf };
+
+            if (!RtlQueryEnvironmentVariable_U( *env, &off_nameW, &off_valW ) &&
+                off_valW.Length == sizeof(WCHAR) && off_buf[0] == '1')
+                machine = IMAGE_FILE_MACHINE_AMD64;
+        }
         RtlSetEnvironmentVariable( env, &arch6432_strW, get_machine_name( machine, &nameW ));
     }
     else RtlSetEnvironmentVariable( env, &arch6432_strW, NULL );
@@ -682,7 +696,7 @@ void init_user_process_params(void)
     WCHAR *env;
     SIZE_T size = 0, env_size;
     RTL_USER_PROCESS_PARAMETERS *new_params, *params = NtCurrentTeb()->Peb->ProcessParameters;
-    UNICODE_STRING curdir;
+    UNICODE_STRING curdir = { 0 };
 
     /* environment needs to be a separate memory block */
     env_size = params->EnvironmentSize;
@@ -692,13 +706,15 @@ void init_user_process_params(void)
         else env[0] = 0;
     }
 
+    curdir.MaximumLength = params->CurrentDirectory.DosPath.MaximumLength;
     if (!(new_params = alloc_process_params( 1, &params->ImagePathName, &params->DllPath,
-                                             &params->CurrentDirectory.DosPath, &params->CommandLine,
+                                             &curdir, &params->CommandLine,
                                              NULL, &params->WindowTitle, &params->Desktop,
                                              &params->ShellInfo, &params->RuntimeInfo )))
         return;
 
     new_params->Environment     = env;
+    new_params->Flags           = params->Flags;
     new_params->DebugFlags      = params->DebugFlags;
     new_params->ConsoleHandle   = params->ConsoleHandle;
     new_params->ConsoleFlags    = params->ConsoleFlags;
@@ -717,15 +733,14 @@ void init_user_process_params(void)
     new_params->ProcessGroupId  = params->ProcessGroupId;
 
     NtCurrentTeb()->Peb->ProcessParameters = new_params;
-    NtFreeVirtualMemory( GetCurrentProcess(), (void **)&params, &size, MEM_RELEASE );
-
-    if (RtlSetCurrentDirectory_U( &new_params->CurrentDirectory.DosPath ))
+    if (RtlSetCurrentDirectory_U( &params->CurrentDirectory.DosPath ))
     {
         MESSAGE("wine: could not open working directory %s, starting in the Windows directory.\n",
-                debugstr_w( new_params->CurrentDirectory.DosPath.Buffer ));
+                debugstr_w( params->CurrentDirectory.DosPath.Buffer ));
         RtlInitUnicodeString( &curdir, windows_dir );
         RtlSetCurrentDirectory_U( &curdir );
     }
+    NtFreeVirtualMemory( GetCurrentProcess(), (void **)&params, &size, MEM_RELEASE );
     set_wow64_environment( &new_params->Environment );
     new_params->EnvironmentSize = RtlSizeHeap( GetProcessHeap(), 0, new_params->Environment );
 }

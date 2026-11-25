@@ -198,8 +198,22 @@ LogLines.forEach(in: log, fromByte: 10) { fromMiddle.append($0) }
 assert(fromMiddle.first == lines[1], "starts at the next whole line")
 assert(LogLines.contains(in: log) { $0.contains("unimplemented function") })
 assert(!LogLines.contains(in: log) { $0.contains("no such line") })
+var crashLines = ["[14:10:00.000] [INFO] [build] v0.2.0 (5)", "wine: Unhandled page fault on read access to 00000000 at address 00B57AA9"]
+for i in 0..<100 { crashLines.append("[crash-report] stack \(String(0x19F8A0 + i * 4, radix: 16)): \(String(0xB57AA9 + i, radix: 16)) 0019F900") }
+crashLines.append("[WineProc] Wine exited with code 0 (caught by longjmp)")
+let crashLog = dir.appendingPathComponent("crash-log.txt")
+try! crashLines.joined(separator: "\n").write(to: crashLog, atomically: true, encoding: .utf8)
+let crashPart = HelpReport.read(crashLog)
+assert(crashPart.crash.count == HelpReport.maxCrashLines && Set(crashPart.crash).count == crashPart.crash.count)
+assert(crashPart.crashDropped == 20)
+assert(!crashPart.key.contains { $0.contains("[crash-report]") } && !crashPart.tail.contains { $0.contains("[crash-report]") })
+assert(HelpReport.text(build: "b", device: "d", log: crashPart, game: nil, cfg: nil).contains("## Crash report"))
 print("PASS: Swift: PrivacyScrub, LogLines and HelpReport behave as the Python copy does")
 '''
+# (crash-capture) the Wine crash block is kept verbatim, with its own caps and off switch.
+check('lower.contains("[crash-report]")' in src and 'maxCrashLines' in src
+      and 'MadeiraConfig.flag("MADEIRA_REPORT_CRASH_BLOCK")' in src,
+      'HelpReport keeps [crash-report] lines outside normalization, capped, with an off switch')
 SWIFTC = os.environ.get('SWIFTC') or shutil.which('swiftc') or str(Path.home() / '.local/share/swiftly/bin/swiftc')
 if not Path(SWIFTC).exists():
     if '--require-swift' in sys.argv:
@@ -213,7 +227,7 @@ else:
     with tempfile.TemporaryDirectory(prefix='madeira-help-report-') as directory:
         main = Path(directory) / 'main.swift'
         binary = Path(directory) / 'check'
-        main.write_text('import Foundation\nenum MadeiraDock {\n' + report + '\n}\n'
+        main.write_text('import Foundation\nenum MadeiraConfig { static func flag(_ name: String, fallback: Bool = true) -> Bool { fallback } }\nenum MadeiraDock {\n' + report + '\n}\n'
                         + summary.replace('import Foundation\n', '', 1) + '\n'
                         + scrub.replace('import Foundation\n', '', 1) + '\n'
                         + src.replace('import Foundation\n', '', 1) + '\n' + swift_checks)

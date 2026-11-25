@@ -40,6 +40,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(heap);
 WINE_DECLARE_DEBUG_CHANNEL(virtual);
 WINE_DECLARE_DEBUG_CHANNEL(globalmem);
 
+static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
 
 static CRITICAL_SECTION memstatus_section;
 static CRITICAL_SECTION_DEBUG critsect_debug =
@@ -122,7 +123,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH DiscardVirtualMemory( void *addr, SIZE_T size )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH FlushViewOfFile( const void *base, SIZE_T size )
 {
-    NTSTATUS status = NtFlushVirtualMemory( GetCurrentProcess(), &base, &size, 0 );
+    NTSTATUS status = NtFlushVirtualMemory( GetCurrentProcess(), &base, &size, NULL );
 
     if (status == STATUS_NOT_MAPPED_DATA) status = STATUS_SUCCESS;
     return set_ntstatus( status );
@@ -150,7 +151,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID add
  */
 SIZE_T WINAPI GetLargePageMinimum(void)
 {
-    return 2 * 1024 * 1024;
+    return user_shared_data->LargePageMinimum;
 }
 
 
@@ -563,10 +564,41 @@ BOOL WINAPI DECLSPEC_HOTPATCH VirtualProtectEx( HANDLE process, void *addr, SIZE
                                                 DWORD new_prot, DWORD *old_prot )
 {
     DWORD prot;
+    /* madeira [term-hooks] vp-trace: with env MADEIRA_TERM_TRACE=1 (and MADEIRA_TERM_HOOKS
+     * not 0) log each VirtualProtect(Ex) before and after the ntdll call, so a call
+     * that never reaches the unix NtProtectVirtualMemory still shows its arguments,
+     * its result and its old protection. MESSAGE, so a muted err channel cannot hide it.
+     * Logging only; nothing is changed (last error is restored after the env lookup). */
+    static LONG vp_trace = -1, vp_lines;
+    NTSTATUS status;
+    void *req_addr = addr;
+    SIZE_T req_size = size;
+    DWORD *req_old = old_prot;
+    int trace;
+
+    if (vp_trace < 0)
+    {
+        /* GetEnvironmentVariableW would set last error when a variable is missing; keep it as it was */
+        DWORD saved_error = GetLastError();
+        WCHAR tt[4] = {0}, th[4] = {0};
+        DWORD n = GetEnvironmentVariableW( L"MADEIRA_TERM_TRACE", tt, ARRAY_SIZE(tt) );
+        DWORD m = GetEnvironmentVariableW( L"MADEIRA_TERM_HOOKS", th, ARRAY_SIZE(th) );
+        vp_trace = (n && n < ARRAY_SIZE(tt) && tt[0] == '1' && !(m && m < ARRAY_SIZE(th) && th[0] == '0')) ? 1 : 0;
+        SetLastError( saved_error );
+    }
+    trace = vp_trace == 1 && InterlockedIncrement( &vp_lines ) <= 20000;
+    if (trace)
+        MESSAGE( "[vp-trace] tid=%04lx VirtualProtectEx(proc=%p addr=%p size=%#Ix new=%#lx oldptr=%p) enter\n",
+             GetCurrentThreadId(), process, req_addr, req_size, new_prot, req_old );
 
     /* Win9x allows passing NULL as old_prot while this fails on NT */
     if (!old_prot && (GetVersion() & 0x80000000)) old_prot = &prot;
-    return set_ntstatus( NtProtectVirtualMemory( process, &addr, &size, new_prot, old_prot ));
+    status = NtProtectVirtualMemory( process, &addr, &size, new_prot, old_prot );
+    if (trace)
+        MESSAGE( "[vp-trace] tid=%04lx VirtualProtectEx(addr=%p size=%#Ix new=%#lx) -> status=%08lx old=%#lx out=%p+%#Ix\n",
+             GetCurrentThreadId(), req_addr, req_size, new_prot, status,
+             (!status && old_prot) ? *old_prot : 0, addr, size );
+    return set_ntstatus( status );
 }
 
 /***********************************************************************
@@ -1579,9 +1611,9 @@ BOOL WINAPI SetProcessDefaultCpuSets(HANDLE process, const ULONG *cpu_set_ids, U
  */
 BOOL WINAPI DECLSPEC_HOTPATCH GetNumaHighestNodeNumber( ULONG *node )
 {
-    FIXME( "semi-stub: %p\n", node );
-    *node = 0;
-    return TRUE;
+    TRACE( "node %p.\n", node );
+
+    return set_ntstatus( NtQuerySystemInformation( SystemNumaProcessorMap, node, sizeof(*node), NULL ));
 }
 
 
@@ -1590,9 +1622,21 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetNumaHighestNodeNumber( ULONG *node )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH GetNumaNodeProcessorMaskEx( USHORT node, GROUP_AFFINITY *mask )
 {
-    FIXME( "stub: %hu %p\n", node, mask );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    SYSTEM_NUMA_INFORMATION info;
+    NTSTATUS status;
+
+    TRACE( "node %u, mask %p.\n", node, mask );
+
+    if ((status = NtQuerySystemInformation( SystemNumaProcessorMap, &info, sizeof(info), NULL )))
+        return set_ntstatus( status );
+
+    if (node > info.HighestNodeNumber)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    *mask = info.ActiveProcessorsGroupAffinity[node];
+    return TRUE;
 }
 
 
@@ -1601,6 +1645,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetNumaNodeProcessorMaskEx( USHORT node, GROUP_AFF
  */
 BOOL WINAPI DECLSPEC_HOTPATCH GetNumaProximityNodeEx( ULONG proximity_id, USHORT *node )
 {
+    FIXME( "proximity_id %lu, node %p stub.\n", proximity_id, node );
+
     SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
     return FALSE;
 }

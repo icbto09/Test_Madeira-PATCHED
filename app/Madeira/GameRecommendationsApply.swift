@@ -42,9 +42,31 @@ extension GameRecommendations {
     /// The recommendation for a game in drive_c: a program, or a Steam game's install folder.
     /// A game Madeira has no list for gets the standard one; a path that names nothing, none.
     static func recommendation(windowsPath: String, steamAppID: Int?) -> GameRecommendation? {
-        if let rec = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists) { return rec }
-        let parts = windowsPath.replacingOccurrences(of: "/", with: "\\").split(separator: "\\")
-        return parts.count > 1 ? standard : nil
+        var base = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists)
+        if base == nil {
+            let parts = windowsPath.replacingOccurrences(of: "/", with: "\\").split(separator: "\\")
+            // [engine-presets] a game with no list of its own gets its engine's preset when its folder shows one, else the standard list.
+            if parts.count > 1 { base = enginePreset(windowsPath: windowsPath, fileExists: driveFileExists) ?? standard }
+        }
+        // (remote-recs) A newer list for the game from the signed file the Get Help server serves (RemoteRecs.swift).
+        return RemoteRecs.replacement(base: base, steamAppID: steamAppID) ?? base
+    }
+
+    /// [engine-presets] The preset of the engine a game's folder shows, for a game with no list of its own that
+    /// Madeira has not written anything for yet (no mark) or wrote an engine preset for before. A game that has a
+    /// mark of its own (the standard list, a game's list, "" for a config of its own) never gets one, so a game
+    /// already in the library keeps what it runs with. Off switches (madeira.cfg): env.MADEIRA_ENGINE_PRESETS = 0
+    /// for all, env.MADEIRA_ENGINE_PRESET_<UNITY|MONO|DOTNET|JVM> = 0 for one; with a switch off the preset is not
+    /// offered and a config still exactly as an engine preset wrote it goes back to the standard list.
+    static func enginePreset(windowsPath: String, fileExists: (String) -> Bool) -> GameRecommendation? {
+        let mark = marks[windowsPath.lowercased()]
+        guard mark == nil || mark?.hasPrefix("engine-") == true else { return nil }
+        guard MadeiraConfig.flag("MADEIRA_ENGINE_PRESETS") else { return nil }
+        // Written before: the same engine, without looking at the folder again.
+        let written = mark.flatMap { m in Engine(rawValue: String(m.dropFirst("engine-".count).prefix { $0 != "#" })) }
+        guard let engine = written ?? self.engine(windowsPath: windowsPath, fileExists: fileExists),
+              MadeiraConfig.flag(engine.switchName) else { return nil }
+        return enginePreset(engine)
     }
 
     /// A library entry's recommendation: the Desktop's is the standard list.
@@ -53,7 +75,8 @@ extension GameRecommendations {
         let rec = recommendation(windowsPath: entry.windowsPath, steamAppID: entry.steamAppID)
         // (shared-configs) A game with only the standard list takes the settings other players
         // said work for it, once approved (SharedConfigs.swift). A list of its own always wins.
-        if rec?.id == standard.id, let shared = SharedConfigs.recommendation(title: entry.title) { return shared }
+        if rec?.id == standard.id || rec?.id.hasPrefix("engine-") == true,
+           let shared = SharedConfigs.recommendation(title: entry.title) { return shared }
         return rec
     }
 
@@ -89,6 +112,7 @@ extension GameRecommendations {
     @discardableResult
     static func reset(_ entry: inout LibraryEntry) -> GameRecommendation? {
         entry.config = nil
+        RecommendedMerge.forget(windowsPath: entry.windowsPath)   // (recommended-merge) the list itself is written now
         guard let rec = recommendation(for: entry) else { clear(entry.windowsPath, title: entry.title); return nil }
         put(rec, to: entry.windowsPath, .reset, title: entry.title)
         takeEntryFields(rec, &entry)
@@ -167,21 +191,32 @@ extension GameRecommendations {
             // player emptied has no additions and stays empty.
             guard base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  (ownLines ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                  (ownLines ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                // (recommended-merge) Its own config: the lines of the list it lacks are added once per list version.
+                RecommendedMerge.merge(rec, windowsPath: windowsPath, title: title, ownLines: ownLines, alreadyAtThisVersion: false)
+                return nil
+            }
             LogStore.shared.log("[recommended] \(title): only Get Help's or Madeira's own lines in the config; \(rec.id) v\(rec.version) goes in above them")
             return (rec: rec, kind: .firstSight)
         }
         if let mark {
             // Written before: a newer list replaces it while the file above the additions is exactly what was written.
-            guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(base)) else { return nil }
+            guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(base)) else {
+                // (recommended-merge) The player changed the file (or it is this list version already): missing lines only.
+                RecommendedMerge.merge(rec, windowsPath: windowsPath, title: title, ownLines: ownLines,
+                                       alreadyAtThisVersion: mark == stamp(rec))
+                return nil
+            }
             // The standard list gives way to the game's own list as on first sight, switches too.
-            let fromStandard = mark.hasPrefix(standard.id + "#") && rec.id != standard.id
+            let fromStandard = (mark.hasPrefix(standard.id + "#") || mark.hasPrefix("engine-"))
+                && rec.id != standard.id && !rec.id.hasPrefix("engine-")
             return (rec: rec, kind: fromStandard ? Write.firstSight : Write.updated)
         }
         if !(base + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // First seen with a config of its own: it stays, now and later.
             setMark("", windowsPath)
             LogStore.shared.log("[recommended] \(title): keeps its own config; \(rec.id) v\(rec.version) is one Reset to Recommended away")
+            RecommendedMerge.merge(rec, windowsPath: windowsPath, title: title, ownLines: ownLines, alreadyAtThisVersion: false)   // (recommended-merge)
             return nil
         }
         return (rec: rec, kind: .firstSight)

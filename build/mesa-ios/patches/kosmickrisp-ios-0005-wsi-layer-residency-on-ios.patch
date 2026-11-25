@@ -1,0 +1,59 @@
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 1b1a16cfcfc..812ccddffb8 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -10,6 +10,30 @@
+ 
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <Metal/Metal.h>
++
++/* Madeira: Mesa only enables the CAMetalLayer residency-set code for macOS
++ * 26+. iOS 26 has the same Metal 4 API (MTL4CommandQueue, layer.residencySet),
++ * and without it the presenting queue never makes the drawable resident.
++ * Patch kosmickrisp-ios-0004 used to do this inside KosmicKrisp on 26.2.4. */
++#include <Availability.h>
++#include <TargetConditionals.h>
++#if defined(MAC_OS_VERSION_26_0) && __MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_VERSION_26_0
++#define MADEIRA_WSI_HAS_METAL4 1
++static inline bool madeira_layer_residency_enabled(void) { return true; }
++#elif TARGET_OS_IPHONE && defined(__IPHONE_26_0) && \
++   __IPHONE_OS_VERSION_MIN_REQUIRED >= __IPHONE_26_0
++#define MADEIRA_WSI_HAS_METAL4 1
++#include <stdlib.h>
++#include <string.h>
++static inline bool
++madeira_layer_residency_enabled(void)
++{
++   const char *e = getenv("MADEIRA_KK_LAYER_RESIDENCY");
++   return !(e && !strcmp(e, "0"));
++}
++#else
++#define MADEIRA_WSI_HAS_METAL4 0
++#endif
+ #include <TargetConditionals.h>
+ 
+ void
+@@ -384,7 +408,11 @@ wsi_metal_layer_make_queue_resident(const CAMetalLayer *metal_layer,
+    void *mtl4_command_queue)
+ {
+ /* Metal4 was introduced in macOS26 */
+-#if defined(MAC_OS_VERSION_26_0) && __MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_VERSION_26_0
++#if MADEIRA_WSI_HAS_METAL4
++   /* Madeira: MADEIRA_KK_LAYER_RESIDENCY=0 skips this on iOS (old behaviour,
++    * the drawable may then not be resident and the window can stay black). */
++   if (!madeira_layer_residency_enabled())
++      return;
+    @autoreleasepool {
+       id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)mtl4_command_queue;
+       [queue addResidencySet:metal_layer.residencySet];
+@@ -398,7 +426,9 @@ wsi_metal_layer_remove_queue_resident(const CAMetalLayer *metal_layer,
+    void *mtl4_command_queue)
+ {
+ /* Metal4 was introduced in macOS26 */
+-#if defined(MAC_OS_VERSION_26_0) && __MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_VERSION_26_0
++#if MADEIRA_WSI_HAS_METAL4
++   if (!madeira_layer_residency_enabled())
++      return;
+    @autoreleasepool {
+       id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)mtl4_command_queue;
+       [queue removeResidencySet:metal_layer.residencySet];

@@ -138,21 +138,37 @@ enum SettingsPages {
 struct SettingsPageView: View {
     let page: SettingsPages.Page
     var startDock: (DockGame, Bool) -> Void
+    /// The page is the stage beside the console look's rail of pages (FluxScreens.swift), not a pushed page.
+    var embedded = false
     @State private var sheet: SettingsSheet?
     @State private var refresh = 0
     @ObservedObject private var input = InputSettings.shared
     @AppStorage(NewLook.zoomHapticsKey) private var zoomHaptics = true
+    /// Appearance › Console look (FluxLook.swift).
+    @AppStorage(FluxLook.key) private var consoleLook = true
     @AppStorage(NewLook.coverWidthKey) private var coverWidth: Double = 104
+    @AppStorage(StockApple.artKey) private var artBehind = true
     @AppStorage(TouchControlStyle.key) private var controlStyle = "glass"
     @AppStorage(GameOrientation.key) private var landscapeOnStart = false
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
+    /// Advanced › Logs and Test Run, opened by A on their rows (settings-pad-rows).
+    @State private var padLogs = false
+    @State private var padTestRun = false
+    /// A log opened by A on Logs, and on Advanced › Logs (LogsSection.padOpen).
+    @State private var padLog: LogFiles.Item?
+    @State private var padDeepLog: LogFiles.Item?
 
     var body: some View {
         Form { content }
+            // A controller walks the rows with Madeira's highlight, which the page follows (settings-pad-rows).
+            .modifier(PadSettingsForm())
             .navigationTitle(page.title).navigationBarTitleDisplayMode(.inline)
             // B goes back.
-            .modifier(NewLookSettingsChrome())
+            .modifier(NewLookSettingsChrome(embedded: embedded))
+            .navigationDestination(isPresented: $padLogs) { deepLogs }
+            .navigationDestination(item: $padLog) { LogViewer(item: $0).padSettingsSubpage() }
+            .navigationDestination(isPresented: $padTestRun) { AutoTestSettingsView().padSettingsSubpage() }
             .alert("Restart Madeira", isPresented: $restartNotice) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -197,7 +213,8 @@ struct SettingsPageView: View {
             Picker("Touch control buttons", selection: $controlStyle) {
                 ForEach(TouchControlStyle.styles, id: \.id) { Text($0.name).tag($0.id) }
             }
-            if GameOrientation.enabled { Toggle("Landscape when a game starts", isOn: $landscapeOnStart) }
+            .padPicker("dg-touch-style", $controlStyle, TouchControlStyle.styles.map { $0.id })
+            if GameOrientation.enabled { Toggle("Landscape when a game starts", isOn: $landscapeOnStart).padToggle("dg-landscape", $landscapeOnStart) }
         } header: { Text("In games") } footer: {
             Text("Glass is the system's Liquid Glass. Solid draws each button as a plain opaque disc; a game's Opacity slider still fades them. Landscape turns the phone sideways when a game starts, even with the rotation lock on, and back to free rotation when it ends; a game's Display settings can override it.")
         }
@@ -210,26 +227,51 @@ struct SettingsPageView: View {
         case .appearance: appearance
         case .advanced:
             Section {
-                Toggle("Extended logging", isOn: $input.diagnostics)
+                Toggle("Extended logging", isOn: $input.diagnostics).padToggle("adv-diagnostics", $input.diagnostics)
                 // GetHelpView.swift: the scrubbed report as one .txt for the Madeira Discord (Cameron, Nov 8).
                 DiscordLogButton(entry: nil, row: true)
-                NavigationLink { Form { LogsSection() }.navigationTitle("Logs") } label: {
+                NavigationLink { deepLogs } label: {
                     Label("Logs", systemImage: "doc.text.magnifyingglass")      // LogsView.swift
+                }
+                .padRow("adv-logs") { padLogs = true }
+                // (auto-test) Hidden unless env.MADEIRA_AUTO_TEST = 1 (AutoTest.swift).
+                if AutoTest.enabled {
+                    NavigationLink { AutoTestSettingsView().padSettingsSubpage() } label: { Label("Test Run", systemImage: "checklist") }
+                        .padRow("adv-test-run") { padTestRun = true }
                 }
             } header: { Text("Diagnostics") } footer: {
                 Text("Save copy for Discord makes one text file (up to 5 MB) with the last game's log and your settings, with personal details taken out. Post it in the Madeira Discord.")
             }
+            BulkGameActionsSection()      // BulkGameActions.swift (bulk-actions)
             Section {
-                Button("All settings") { sheet = .allSettings }
+                Button("All settings") { sheet = .allSettings }.padRow("adv-all-settings") { sheet = .allSettings }
             } footer: {
                 Text("Every option Madeira reads from madeira.cfg, by subsystem.")
             }
-        case .logs: LogsSection()
+        case .logs: LogsSection(padOpen: PadSettingsRows.on ? $padLog : nil)
         case .credits: SettingsCreditsSection()
         }
     }
 
+    /// Advanced › Logs: the Logs page's rows, one page deeper.
+    private var deepLogs: some View {
+        Form { LogsSection(padOpen: PadSettingsRows.on ? $padDeepLog : nil) }
+            .navigationTitle("Logs")
+            .navigationDestination(item: $padDeepLog) { LogViewer(item: $0).padSettingsSubpage() }
+            .padSettingsSubpage()
+    }
+
     @ViewBuilder private var appearance: some View {
+        // The Library as a rail of covers and the picked game over the whole page (FluxLook.swift).
+        // env.MADEIRA_FLUX_LOOK = 0 takes the look and this row away.
+        if FluxLook.allowed {
+            Section {
+                Toggle("Console look", isOn: $consoleLook)
+                    .padItem("ap-console-look", cornerRadius: 12) { consoleLook.toggle() }
+            } footer: {
+                Text("The Library shows a rail of covers, and the game you pick fills the screen. On a wide screen, Stores, Downloads and Settings show a rail beside the page, and a game's page shows its art behind it. Turn it off for the pages as they were.")
+            }
+        }
         Section {
             // The Library's covers; a pinch on them changes it too. A on it steps to the next size.
             Picker("Cover size", selection: Binding(get: { NewLook.coverStep(coverWidth) },
@@ -239,14 +281,27 @@ struct SettingsPageView: View {
                 Text("Large").tag(2)
             }
             .padItem("ap-cover-size", cornerRadius: 12) { coverWidth = NewLook.coverWidths[(NewLook.coverStep(coverWidth) + 1) % 3] }
-            Toggle("Zoom haptics", isOn: $zoomHaptics)
-        } header: { Text("Library") } footer: {
-            Text("Pinch the Library's covers to change how many fit across. Zoom haptics click as the pinch crosses a size.")
+            // (run-badge-grid) Games per row, Run marks on covers, Run mark size (RunStatus.swift).
+            RunGridAppearanceRows()
+            // (stock-apple-stage3) The game's Steam art behind the Library and its page (RunStatus.swift StockArtBackdrop).
+            if StockApple.artHeader {
+                Toggle(L("Game art behind pages"), isOn: $artBehind).padToggle("ap-art-behind", $artBehind)
+            }
+            Toggle("Zoom haptics", isOn: $zoomHaptics).padToggle("ap-zoom-haptics", $zoomHaptics)
+        } header: { Text(StockApple.stage3 ? L("Library and Store") : L("Library")) } footer: {
+            if GridLibrary.enabled, FluxLook.allowed, consoleLook {
+                Text(PressToPlay.enabled
+                     ? "Pressing a game starts it. Hold it (or press Y) to edit. With Games per row on Automatic, Cover size picks how many fit across."
+                     : "With Games per row on Automatic, Cover size picks how many fit across.")
+            } else {
+                Text("Pinch the Library's covers to change how many fit across. Zoom haptics click as the pinch crosses a size.")
+            }
         }
         Section {
             Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
                 developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
             }))
+            .padRow("ap-developer-ui") { developerUI.toggle(); FrontendChoice.choose(new: !developerUI); restartNotice = true }
         } header: { Text("Interface") } footer: {
             Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
         }
@@ -273,6 +328,11 @@ struct DefaultResolutionSection: View {
                     Section(group.title) { ForEach(group.choices, id: \.value) { Text($0.label).tag($0.value) } }
                 }
                 if let custom { Text(custom.label).tag(current) }
+            }
+            .padRow("dg-resolution", when: !groups.isEmpty) {
+                let values = groups.flatMap { $0.choices.map(\.value) }
+                _ = MadeiraConfig.set("desktop-size", padNext(values, after: current))
+                tick += 1
             }
         } footer: {
             Text("Used by every game that has not been given its own Resolution in its Display settings. Applies at the next launch.")

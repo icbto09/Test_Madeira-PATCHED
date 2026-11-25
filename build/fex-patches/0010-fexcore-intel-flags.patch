@@ -1,0 +1,361 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index 7d553cd..ee9e746 100755
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -12,7 +12,17 @@ $end_info$
+ #include "Interface/Core/JIT/Relocations.h"
+ #include "Interface/IR/Passes/RegisterAllocationPass.h"
+ 
++#include <cstdlib> // madeira [intel-flags]: getenv
++
+ namespace FEXCore::CPU {
++// madeira [intel-flags]: same switch as OpDispatchBuilder::MadeiraIntelFlags(), read once per process.
++static bool MadeiraIntelFlagsJIT() {
++  static const bool On = [] {
++    const char* E = getenv("MADEIRA_FEX_INTEL_FLAGS");
++    return E && E[0] == '1' && E[1] == '\0';
++  }();
++  return On;
++}
+ 
+ #define DEF_BINOP_WITH_CONSTANT(FEXOp, VarOp, ConstOp)                                    \
+   DEF_OP(FEXOp) {                                                                         \
+@@ -636,16 +646,35 @@ DEF_OP(ShiftFlags) {
+       lsrv(EmitSize, CFWord, Src1, CFWord);
+     }
+ 
+-    if (Op->InvertCF) {
+-      mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
+-      CFWord = TMP1;
+-    }
+-
+     bool SetOF = Op->Shift != IR::ShiftType::ASR;
+-    if (SetOF) {
+-      // Only defined when Shift is 1 else undefined
+-      // OF flag is set if a sign change occurred
+-      eor(EmitSize, TMP3, Src1, Dst);
++    // madeira [intel-flags] (BOR1NG, MetalSharp FEX 0031; env MADEIRA_FEX_INTEL_FLAGS = 1): for a left shift by a
++    // variable count, OF = MSB(result) ^ CF as Intel hardware and Rosetta 2 give for any count (the same as the
++    // sign-change rule for a count of 1). Computed before CF is inverted. Right shifts keep the sign-change rule.
++    if (SetOF && Op->Shift == IR::ShiftType::LSL && MadeiraIntelFlagsJIT()) {
++      const unsigned TopBit = IR::OpSizeToSize(OpSize) * 8 - 1;
++      if (CFBit != 0) {
++        // CF is Dst[TopBit + 1].
++        eor(ARMEmitter::Size::i64Bit, TMP3, Dst.X(), Dst.X(), ARMEmitter::ShiftType::LSR, 1);
++      } else {
++        // CF is CFWord[0].
++        eor(EmitSize, TMP3, Dst, CFWord, ARMEmitter::ShiftType::LSL, TopBit);
++      }
++      if (Op->InvertCF) {
++        mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
++        CFWord = TMP1;
++      }
++    } else {
++      // Switch off (or not a left shift): the original order.
++      if (Op->InvertCF) {
++        mvn(ARMEmitter::Size::i64Bit, TMP1, CFWord);
++        CFWord = TMP1;
++      }
++
++      if (SetOF) {
++        // Only defined when Shift is 1 else undefined
++        // OF flag is set if a sign change occurred
++        eor(EmitSize, TMP3, Src1, Dst);
++      }
+     }
+ 
+     if (CTX->HostFeatures.SupportsFlagM) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 03b416c..6e70300 100755
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1031,7 +1031,7 @@ void OpDispatchBuilder::TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
+     CalculatePF(_AndWithFlags(Size, Dest, Src));
+   }
+ 
+-  InvalidateAF();
++  ZeroAF(); // madeira [intel-flags]
+   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+ }
+ 
+@@ -1778,7 +1778,7 @@ void OpDispatchBuilder::BEXTRBMIOp(OpcodeArgs) {
+   // ZF is set properly. CF and OF are defined as being set to zero. SF, PF, and
+   // AF are undefined.
+   SetNZ_ZeroCV(GetOpSize(Dest), Dest);
+-  InvalidatePF_AF();
++  UndefPF_ZeroAF(Dest); // madeira [intel-flags]
+ 
+   AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
+ }
+@@ -1800,7 +1800,7 @@ void OpDispatchBuilder::BLSIBMIOp(OpcodeArgs) {
+   //
+   // ZF/SF/OF set as usual.
+   SetNZ_ZeroCV(Size, Result);
+-  InvalidatePF_AF();
++  UndefPF_ZeroAF(Result); // madeira [intel-flags]
+   SetCFInverted(GetRFLAG(X86State::RFLAG_ZF_RAW_LOC));
+ 
+   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
+@@ -1815,7 +1815,7 @@ void OpDispatchBuilder::BLSMSKBMIOp(OpcodeArgs) {
+   auto Result = _Xor(Size, Sub(Size, Src, 1), Src);
+ 
+   StoreResultGPR(Op, Result);
+-  InvalidatePF_AF();
++  UndefPF_ZeroAF(Result); // madeira [intel-flags]
+ 
+   // CF set according to the Src
+   auto CFInv = To01(Size, Src);
+@@ -1842,7 +1842,7 @@ void OpDispatchBuilder::BLSRBMIOp(OpcodeArgs) {
+ 
+   SetNZ_ZeroCV(Size, Result);
+   SetCFInverted(CFInv);
+-  InvalidatePF_AF();
++  UndefPF_ZeroAF(Result); // madeira [intel-flags]
+ 
+   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
+ }
+@@ -1901,7 +1901,7 @@ void OpDispatchBuilder::BZHI(OpcodeArgs) {
+ 
+   auto CFInv = _NZCVSelect01(CondClass::EQ);
+ 
+-  InvalidatePF_AF();
++  UndefPF_ZeroAF(Result); // madeira [intel-flags]
+   SetNZ_ZeroCV(Size, Result);
+   SetCFInverted(CFInv);
+ 
+@@ -3994,6 +3994,12 @@ void OpDispatchBuilder::BSFOp(OpcodeArgs) {
+   // ZF is set to 1 if the source was zero
+   SetZ_InvalidateNCV(OpSizeFromSrc(Op), Src);
+ 
++  // madeira [intel-flags]: Intel hardware and Rosetta 2 give the source's parity and a clear AF.
++  if (MadeiraIntelFlags()) {
++    CalculatePF(Src);
++    ZeroAF();
++  }
++
+   // If Src was zero then the destination doesn't get modified.
+   //
+   // Although Intel does not guarantee that semantic, AMD does and Intel
+@@ -4019,6 +4025,12 @@ void OpDispatchBuilder::BSROp(OpcodeArgs) {
+   // ZF is set to 1 if the source was zero
+   SetZ_InvalidateNCV(OpSizeFromSrc(Op), Src);
+ 
++  // madeira [intel-flags]: Intel hardware and Rosetta 2 give the source's parity and a clear AF.
++  if (MadeiraIntelFlags()) {
++    CalculatePF(Src);
++    ZeroAF();
++  }
++
+   // If Src was zero then the destination doesn't get modified
+   auto SelectOp = NZCVSelect(GPRSize, CondClass::EQ, Dest, Result);
+   StoreResultGPR_WithOpSize(Op, Op->Dest, SelectOp, DstSize);
+@@ -4907,8 +4919,13 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     // encodable. This is optimal and works regardless of the opsize.
+     auto Zero = LoadGPR(Op->Dest.Data.GPR.GPR);
+     HandleNZ00Write();
+-    InvalidateAF();
++    if (!MadeiraIntelFlags()) {
++      InvalidateAF();
++    }
+     CalculatePF(SubWithFlags(OpSize::i32Bit, Zero, Zero));
++    if (MadeiraIntelFlags()) {
++      ZeroAF(); // madeira [intel-flags]: after PF
++    }
+     CFInverted = true;
+     FlushRegisterCache();
+ 
+@@ -4992,7 +5009,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+   case FEXCore::IR::IROps::OP_ANDWITHFLAGS: {
+     HandleNZ00Write();
+     CalculatePF(Result);
+-    InvalidateAF();
++    ZeroAF(); // madeira [intel-flags]
+     AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+     break;
+   }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 46e6f35..193d414 100755
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1950,6 +1950,40 @@ private:
+ 
+   void ZeroPF_AF();
+ 
++  // madeira [intel-flags] (env MADEIRA_FEX_INTEL_FLAGS = 1 turns it on; off by default).
++  // Ported, with credit, from BOR1NG's (Avery Felts, https://github.com/aaf2tbz) MetalSharp-Wine FEX patch 0031
++  // "FEXCore: Match x86 results for flags left undefined by the ISA", https://github.com/metalsharp/MetalSharp-Wine
++  // (AGPL-3.0; a build carrying this must post its source). Where x86 leaves a flag undefined, Intel hardware and
++  // Rosetta 2 still leave it in a fixed state, and protected code that hashes pushfq results depends on that.
++  // Read once per process.
++  static bool MadeiraIntelFlags() {
++    static const bool On = [] {
++      const char* E = getenv("MADEIRA_FEX_INTEL_FLAGS");
++      return E && E[0] == '1' && E[1] == '\0';
++    }();
++    return On;
++  }
++
++  // [intel-flags] AF where x86 leaves it undefined: cleared, as on Intel hardware. AF reads as AF[4] ^ PF[4],
++  // so copying PF's raw value zeroes it. Call after PF is set. With the switch off: undefined, as before.
++  void ZeroAF() {
++    if (MadeiraIntelFlags()) {
++      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(GetRFLAG(FEXCore::X86State::RFLAG_PF_RAW_LOC));
++    } else {
++      InvalidateAF();
++    }
++  }
++
++  // [intel-flags] PF and AF where x86 leaves them undefined: PF of Value and a clear AF, as on Intel hardware.
++  void UndefPF_ZeroAF(Ref Value) {
++    if (MadeiraIntelFlags()) {
++      CalculatePF(Value);
++      ZeroAF();
++    } else {
++      InvalidatePF_AF();
++    }
++  }
++
+   void InvalidateAF() {
+     _InvalidateFlags((1u << X86State::RFLAG_AF_RAW_LOC));
+     InvalidateReg(Core::CPUState::AF_AS_GREG);
+@@ -2375,8 +2409,27 @@ private:
+ 
+     auto OldPF = GetRFLAG(X86State::RFLAG_PF_RAW_LOC);
+ 
++    if (!MadeiraIntelFlags()) {
++      HandleNZCV_RMW();
++      CalculatePF(_ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted));
++      StoreResultGPR(Op, Result);
++      return;
++    }
++
++    // madeira [intel-flags] (BOR1NG, MetalSharp FEX 0031): AF is cleared as on Intel unless the masked count is
++    // zero, which leaves every flag alone. Without a compare, as NZCV is live: bit 4 of (count + 63) >> 2 is set
++    // exactly when count (<= 63) is nonzero, and AF reads as AF[4] ^ PF[4], so AF = OldAF ^ ((OldAF ^ NewPF) & that).
++    auto OldAF = GetRFLAG(X86State::RFLAG_AF_RAW_LOC);
+     HandleNZCV_RMW();
+-    CalculatePF(_ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted));
++    auto NewPF = _ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted);
++    CalculatePF(NewPF);
++    {
++      const auto Size = OpSizeFromSrc(Op);
++      auto Count = _And(OpSize::i32Bit, Src, Constant(Size == OpSize::i64Bit ? 0x3f : 0x1f));
++      auto NonZero4 = _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Add(OpSize::i32Bit, Count, 63), Constant(2)), Constant(0x10));
++      auto Diff = _Xor(OpSize::i64Bit, OldAF, NewPF);
++      SetRFLAG<X86State::RFLAG_AF_RAW_LOC>(_Xor(OpSize::i64Bit, OldAF, _And(OpSize::i64Bit, Diff, NonZero4)));
++    }
+     StoreResultGPR(Op, Result);
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+index 858e7a4..ae2ebc1 100755
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+@@ -396,7 +396,12 @@ Ref OpDispatchBuilder::CalculateFlags_ADD(IR::OpSize SrcSize, Ref Src1, Ref Src2
+ 
+ void OpDispatchBuilder::CalculateFlags_MUL(IR::OpSize SrcSize, Ref Res, Ref High) {
+   HandleNZCVWrite();
+-  InvalidatePF_AF();
++  // madeira [intel-flags]: SF, ZF, AF and PF are undefined; Intel hardware and Rosetta 2 clear them.
++  if (MadeiraIntelFlags()) {
++    ZeroPF_AF();
++  } else {
++    InvalidatePF_AF();
++  }
+ 
+   // CF and OF are set if the result of the operation can't be fit in to the destination register
+   // If the value can fit then the top bits will be zero
+@@ -408,11 +413,19 @@ void OpDispatchBuilder::CalculateFlags_MUL(IR::OpSize SrcSize, Ref Res, Ref High
+   auto Zero = _InlineConstant(0);
+   _CondSubNZCV(OpSize::i64Bit, Zero, Zero, CondClass::EQ, 0x1 /* nzcV */);
+   CFInverted = true;
++  if (MadeiraIntelFlags()) {
++    SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0)); // madeira [intel-flags]
++  }
+ }
+ 
+ void OpDispatchBuilder::CalculateFlags_UMUL(Ref High) {
+   HandleNZCVWrite();
+-  InvalidatePF_AF();
++  // madeira [intel-flags]: as CalculateFlags_MUL.
++  if (MadeiraIntelFlags()) {
++    ZeroPF_AF();
++  } else {
++    InvalidatePF_AF();
++  }
+ 
+   auto Zero = _InlineConstant(0);
+   const auto Size = GetOpSize(High);
+@@ -425,11 +438,19 @@ void OpDispatchBuilder::CalculateFlags_UMUL(Ref High) {
+   // this does what we need.
+   _CondSubNZCV(Size, Zero, Zero, CondClass::EQ, 0x1 /* nzcV */);
+   CFInverted = true;
++  if (MadeiraIntelFlags()) {
++    SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(Constant(0)); // madeira [intel-flags]
++  }
+ }
+ 
+ void OpDispatchBuilder::CalculateFlags_Logical(IR::OpSize SrcSize, Ref Res) {
+-  InvalidateAF();
++  if (!MadeiraIntelFlags()) {
++    InvalidateAF();
++  }
+   SetNZP_ZeroCV(SrcSize, Res);
++  if (MadeiraIntelFlags()) {
++    ZeroAF(); // madeira [intel-flags]: after PF
++  }
+ }
+ 
+ void OpDispatchBuilder::CalculateFlags_ShiftLeftImmediate(IR::OpSize SrcSize, Ref UnmaskedRes, Ref Src1, uint64_t Shift, bool DoubleWide) {
+@@ -458,13 +479,18 @@ void OpDispatchBuilder::CalculateFlags_ShiftLeftImmediate(IR::OpSize SrcSize, Re
+   }
+ 
+   CalculatePF(UnmaskedRes);
+-  InvalidateAF();
++  ZeroAF(); // madeira [intel-flags]
+ 
+   // OF
+   // In the case of left shift. OF is only set from the result of <Top Source Bit> XOR <Top Result Bit>
+   if (Shift == 1) {
+     auto Xor = _Xor(OpSize, UnmaskedRes, Src1);
+     SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(Xor, IR::OpSizeAsBits(SrcSize) - 1, true);
++  } else if (MadeiraIntelFlags() && !DoubleWide) {
++    // madeira [intel-flags]: undefined. Intel hardware and Rosetta 2 give MSB(result) ^ CF, which is the count-1
++    // rule applied to the last step: CF is the bit that the (Shift - 1)-bit shift of the source has at the top.
++    auto Xor = _Xor(OpSize, UnmaskedRes, _Lshl(OpSize, Src1, Constant(Shift - 1)));
++    SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(Xor, IR::OpSizeAsBits(SrcSize) - 1, true);
+   } else {
+     // Undefined, we choose to zero as part of SetNZ_ZeroCV
+   }
+@@ -482,7 +508,7 @@ void OpDispatchBuilder::CalculateFlags_SignShiftRightImmediate(IR::OpSize SrcSiz
+   SetCFDirect(Src1, Shift - 1, true);
+ 
+   CalculatePF(Res);
+-  InvalidateAF();
++  ZeroAF(); // madeira [intel-flags]
+ 
+   // OF
+   // Only defined when Shift is 1 else undefined. Only is set if the top bit was set to 1 when
+@@ -499,7 +525,7 @@ void OpDispatchBuilder::CalculateFlags_ShiftRightImmediateCommon(IR::OpSize SrcS
+   SetCFDirect(Src1, Shift - 1, true);
+ 
+   CalculatePF(Res);
+-  InvalidateAF();
++  ZeroAF(); // madeira [intel-flags]
+ }
+ 
+ void OpDispatchBuilder::CalculateFlags_ShiftRightImmediate(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift) {
+@@ -551,6 +577,13 @@ void OpDispatchBuilder::CalculateFlags_ZCNT(IR::OpSize SrcSize, Ref Result) {
+   // bit is set. No masking is needed because no higher bits could be set.
+   unsigned CarryBit = FEXCore::ilog2(IR::OpSizeAsBits(SrcSize));
+   SetCFDirect(Result, CarryBit);
++
++  // madeira [intel-flags]: PF and AF are undefined; Intel hardware and Rosetta 2 give the result's parity and a
++  // clear AF. With the switch off nothing changes (they were left as they were, as before).
++  if (MadeiraIntelFlags()) {
++    CalculatePF(Result);
++    ZeroAF();
++  }
+ }
+ 
+ } // namespace FEXCore::IR

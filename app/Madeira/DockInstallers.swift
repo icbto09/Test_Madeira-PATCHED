@@ -842,24 +842,42 @@ enum DockInstallers {
     /// The install scripts' programs of a game: its own folder (one level down) and the
     /// shared redistributables Steam keeps next to it, and how many scripts were read.
     nonisolated static func found(_ game: DockGame, drive: URL,
-                                  defaultKey: Bool = DockInstallers.flag("MADEIRA_INSTALL_DEFAULT_KEY")) -> (processes: [SteamInstallProcess], scripts: Int) {
+                                  defaultKey: Bool = DockInstallers.flag("MADEIRA_INSTALL_DEFAULT_KEY"),
+                                  otherLibraries: Bool = DockInstallers.flag("MADEIRA_INSTALL_ALL_LIBRARIES"),
+                                  extraLibraries: [String]? = nil) -> (processes: [SteamInstallProcess], scripts: Int) {
         let common = game.library + "/common"
         let shared = common + "/Steamworks Shared"
         func windows(_ relative: String) -> String { "C:\\" + relative.replacingOccurrences(of: "/", with: "\\") }
-        let roots: [(URL, Int, String, Int?)] = [
+        var roots: [(URL, Int, String, Int?)] = [
             (drive.appendingPathComponent(common + "/" + game.installDir, isDirectory: true), 1, game.windowsInstallPath,
              defaultKey ? game.id : nil),
             (drive.appendingPathComponent(shared + "/_CommonRedist", isDirectory: true), 3, windows(shared), nil),
         ]
+        // The shared redistributables (PhysX legacy, DirectX, VC++) are downloaded once, into
+        // whichever Steam library got them first: a game copied to a drive from a PC often has
+        // no Steamworks Shared folder beside it (Batman: Arkham Asylum, 35140: PhysXLoader.dll
+        // missing -> "General protection fault"). The other libraries' copies are read too.
+        if otherLibraries {   // MADEIRA_INSTALL_ALL_LIBRARIES=0: only the game's own library
+            var seen: Set<String> = [game.library.lowercased()]
+            for library in extraLibraries ?? (MadeiraDock.steamLibraries(drive: drive) + ExternalDrives.steamLibraries) {
+                guard seen.insert(library.lowercased()).inserted else { continue }
+                let other = library + "/common/Steamworks Shared"
+                roots.append((drive.appendingPathComponent(other + "/_CommonRedist", isDirectory: true), 3, windows(other), nil))
+            }
+        }
         var result: [SteamInstallProcess] = []
         var scripts = 0
-        for (root, depth, installDir, owner) in roots {
+        for (index, (root, depth, installDir, owner)) in roots.enumerated() {
             guard inside(root, drive: drive) else { continue }
+            let earlier = Set(result.map(\.run))   // runs an earlier folder already gave
             for file in SteamInstallScripts.scripts(folder: root, depth: depth) {
                 guard let contents = try? Data(contentsOf: file) else { continue }
                 scripts += 1
                 for process in DockInstallScripts.processes(script: contents, installDir: installDir, appID: owner)
                 where !result.contains(process) {
+                    // Another library's copy of a run an earlier folder gave: the first copy is used.
+                    // (Only earlier folders: one entry's process 1 and process 2 share a run and both stay.)
+                    if index >= 2, earlier.contains(process.run) { continue }
                     result.append(process)
                 }
             }
@@ -895,7 +913,20 @@ enum DockInstallers {
     }
 
     nonisolated static func inside(_ url: URL, drive: URL) -> Bool {
-        url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(drive.resolvingSymlinksInPath().standardizedFileURL.path + "/")
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        if path.hasPrefix(drive.resolvingSymlinksInPath().standardizedFileURL.path + "/") { return true }
+        // Drive libraries: C:\External\<name> is a link to a connected drive's folder, so
+        // every path through it resolves outside drive_c and the game's install scripts were
+        // never read (log: "[dock-installers] app=35140 scripts=0"). Such a path is inside
+        // when it resolves inside that drive's opened folder.
+        // MADEIRA_INSTALL_DRIVE_LINKS=0: drive_c only, as before.
+        guard flag("MADEIRA_INSTALL_DRIVE_LINKS") else { return false }
+        let base = drive.standardizedFileURL.path + "/"
+        let raw = url.standardizedFileURL.path
+        guard raw.hasPrefix(base + "External/") else { return false }
+        guard let root = (try? ExternalDrives.externalRoot(for: String(raw.dropFirst(base.count))))?.root else { return false }
+        let real = root.resolvingSymlinksInPath().standardizedFileURL.path
+        return path == real || path.hasPrefix(real + "/")
     }
 
     /// A C:\ path resolved on disk the way Wine resolves it (case-insensitive), staying

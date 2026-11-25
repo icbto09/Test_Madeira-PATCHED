@@ -26,8 +26,17 @@ if [ "${1:-}" = --revert ]; then
     done
     exit 0
 fi
-for p in "${patches[@]}"; do
-    if git -C "$S" apply --reverse --check "$p" 2>/dev/null; then
+# A later patch can change lines an earlier one touched (0006 is written against the tree with 0001-0005
+# applied), so one earlier patch cannot be tested on its own once a later one is in. Find the last patch
+# that is applied (the highest whose reverse applies cleanly: the patches are a stack, applied in order),
+# report the ones up to it as applied, and apply the rest in order.
+last=-1
+for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
+    if git -C "$S" apply --reverse --check "${patches[$i]}" 2>/dev/null; then last=$i; break; fi
+done
+for ((i = 0; i < ${#patches[@]}; i++)); do
+    p="${patches[$i]}"
+    if [ $i -le $last ]; then
         echo "dock-patches: $(basename "$p") already applied"
     elif git -C "$S" apply --check "$p" 2>/dev/null; then
         git -C "$S" apply "$p"

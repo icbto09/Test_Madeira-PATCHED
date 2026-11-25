@@ -1,0 +1,254 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 2b00d83..bb3113d 100755
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -888,6 +888,10 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   return ECContext;
+ }
+ 
++#ifdef FEX_IOS_HOST
++static void IosAssertRecord(uint32_t Code, uint32_t EFlags, uint32_t LiveTF, const ARM64_NT_CONTEXT& Ctx); // madeira [assert-dump-2]
++#endif
++
+ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+ 
+@@ -913,6 +917,7 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
+   // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++  [[maybe_unused]] const uint32_t RaiseLiveTF = (EFlags >> FEXCore::X86State::RFLAG_TF_RAW_LOC) & 1U; // madeira [assert-dump-2]
+   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+ 
+@@ -925,6 +930,9 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+     GuestContext.Pc -= 1;
+   }
+ 
++#ifdef FEX_IOS_HOST
++  IosAssertRecord(static_cast<uint32_t>(GuestRec.ExceptionCode), EFlags, RaiseLiveTF, GuestContext); // madeira [assert-dump-2]
++#endif
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+ }
+ 
+@@ -936,12 +944,32 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+  * reads as "??" instead of faulting inside the exception path. MADEIRA_EC_ASSERT_DUMP=0 turns it off. */
+ extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+ 
+-static void IosAssertHex(const char* What, uint64_t Base, size_t Len) {
++// assert-dump-2: Wine's NtReadVirtualMemory on our own process is a memmove under __TRY; touching a PAGE_GUARD page
++// there would silently clear the guest's guard bit. So only read ranges whose every page is committed, readable and
++// not guarded. Returns the blocking protection (or 0 when the range is safe).
++static uint32_t IosAssertUnsafe(uint64_t Base, size_t Len) {
++  for (uint64_t Page = Base & ~0xfffULL; Page < Base + Len; Page += 0x1000) {
++    MEMORY_BASIC_INFORMATION Mbi {};
++    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Page), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) != 0) {
++      return 0xffffffff;
++    }
++    if (Mbi.State != MEM_COMMIT || (Mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || Mbi.Protect == 0) {
++      return Mbi.State != MEM_COMMIT ? 0xfffffffe : static_cast<uint32_t>(Mbi.Protect);
++    }
++  }
++  return 0;
++}
++
++static void IosAssertHex(const char* What, uint64_t Base, size_t Len, const char* Sub = "") {
+   uint8_t Buf[64] {};
+   SIZE_T Got = 0;
+   if (Len > sizeof(Buf)) {
+     Len = sizeof(Buf);
+   }
++  if (const uint32_t Bad = IosAssertUnsafe(Base, Len)) {
++    LogMan::Msg::EFmt("[assert-dump]   {}{} {:#x} skipped (protect/state {:#x})", What, Sub, Base, Bad);
++    return;
++  }
+   const NTSTATUS Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Base), Buf, Len, &Got);
+   char Hex[sizeof(Buf) * 3 + 1] {};
+   size_t o = 0;
+@@ -957,10 +985,10 @@ static void IosAssertHex(const char* What, uint64_t Base, size_t Len) {
+     Hex[o++] = (i % 8 == 7) ? '|' : ' ';
+   }
+   Hex[o] = 0;
+-  LogMan::Msg::EFmt("[assert-dump]   {} {:#x} (status {:#x}): {}", What, Base, static_cast<uint32_t>(Status), Hex);
++  LogMan::Msg::EFmt("[assert-dump]   {}{} {:#x} (status {:#x}): {}", What, Sub, Base, static_cast<uint32_t>(Status), Hex);
+ }
+ 
+-static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t Rip, uint32_t EFlags) {
++static bool IosAssertDumpOn() {
+   static std::atomic<int8_t> On {-1};
+   int8_t V = On.load(std::memory_order_relaxed);
+   if (V < 0) {
+@@ -968,14 +996,71 @@ static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t R
+     V = (E && E[0] == '0') ? 0 : 1;
+     On.store(V, std::memory_order_relaxed);
+   }
++  return V != 0;
++}
++
++// assert-dump-2: a ring of the last 64 exception contexts as DELIVERED to the guest (all threads), so the dump can show
++// what the loader's int3/single-step handlers were handed just before its check failed. Entries are written without a
++// lock; a torn entry is possible if two threads raise at the same instant (it is only logged, never used).
++struct IosAssertRingEntry {
++  uint64_t Seq;
++  uint32_t Tid;
++  uint32_t Code;
++  uint32_t EFlags; // x86 EFlags as reconstructed by FEX (TF already cleared)
++  uint32_t LiveTF;
++  ARM64_NT_CONTEXT Ctx;
++};
++static IosAssertRingEntry IosAssertRing[64];
++static std::atomic<uint64_t> IosAssertRingSeq {0};
++
++static void IosAssertRecord(uint32_t Code, uint32_t EFlags, uint32_t LiveTF, const ARM64_NT_CONTEXT& Ctx) {
++  if (!IosAssertDumpOn()) {
++    return;
++  }
++  const uint64_t Seq = IosAssertRingSeq.fetch_add(1, std::memory_order_relaxed) + 1;
++  auto& E = IosAssertRing[Seq % 64];
++  E.Seq = 0; // mark as being written
++  E.Tid = GetCurrentThreadId();
++  E.Code = Code;
++  E.EFlags = EFlags;
++  E.LiveTF = LiveTF;
++  memcpy(&E.Ctx, &Ctx, sizeof(Ctx));
++  std::atomic_thread_fence(std::memory_order_release);
++  E.Seq = Seq;
++}
++
++static void IosAssertCtx(const char* What, const ARM64_NT_CONTEXT& C) {
++  // ARM64EC register mapping: rax=x8 rcx=x0 rdx=x1 rbx=x27 rsp=sp rbp=fp rsi=x25 rdi=x26 r8-r11=x2-x5 r12-r15=x19-x22.
++  LogMan::Msg::EFmt("[assert-dump]   {} pc(rip)={:#x} sp={:#x} cpsr={:#x} fpcr={:#x} fpsr={:#x} flags={:#x}", What, C.Pc, C.Sp, C.Cpsr,
++                    C.Fpcr, C.Fpsr, C.ContextFlags);
++  LogMan::Msg::EFmt("[assert-dump]   {} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rbp={:#x} rsi={:#x} rdi={:#x}", What, C.X[8], C.X[0],
++                    C.X[1], C.X[27], C.X[29], C.X[25], C.X[26]);
++  LogMan::Msg::EFmt("[assert-dump]   {} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}", What, C.X[2],
++                    C.X[3], C.X[4], C.X[5], C.X[19], C.X[20], C.X[21], C.X[22]);
++  LogMan::Msg::EFmt("[assert-dump]   {} other x6={:#x} x7={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x15={:#x} x16={:#x} x17={:#x} "
++                    "x23={:#x} x24={:#x} x28={:#x} lr={:#x}",
++                    What, C.X[6], C.X[7], C.X[9], C.X[10], C.X[11], C.X[12], C.X[15], C.X[16], C.X[17], C.X[23], C.X[24], C.X[28], C.X[30]);
++  for (int i = 0; i < 16; i += 4) {
++    LogMan::Msg::EFmt("[assert-dump]   {} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x}", What, i,
++                      static_cast<uint64_t>(C.V[i].High), C.V[i].Low, i + 1, static_cast<uint64_t>(C.V[i + 1].High), C.V[i + 1].Low, i + 2,
++                      static_cast<uint64_t>(C.V[i + 2].High), C.V[i + 2].Low, i + 3, static_cast<uint64_t>(C.V[i + 3].High),
++                      C.V[i + 3].Low);
++  }
++}
++
++static bool IosAssertPlausiblePtr(uint64_t V) {
++  return V >= 0x10000 && V < 0x800000000000ULL;
++}
++
++static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t Rip, uint32_t EFlags, const ARM64_NT_CONTEXT& Delivered) {
+   static std::atomic<uint32_t> Count {0};
+-  if (!V || Count.fetch_add(1, std::memory_order_relaxed) >= 8) {
++  if (!IosAssertDumpOn() || Count.fetch_add(1, std::memory_order_relaxed) >= 8) {
+     return;
+   }
+   const auto& R = Thread->CurrentFrame->State.gregs;
+   using namespace FEXCore::X86State;
+-  LogMan::Msg::EFmt("[assert-dump] rev=assert-dump-1 STATUS_ASSERTION_FAILURE rip={:#x} eflags={:#x} tid={:x}", Rip, EFlags,
+-                    GetCurrentThreadId());
++  const uint32_t Tid = GetCurrentThreadId();
++  LogMan::Msg::EFmt("[assert-dump] rev=assert-dump-2 STATUS_ASSERTION_FAILURE rip={:#x} eflags={:#x} tid={:x}", Rip, EFlags, Tid);
+   LogMan::Msg::EFmt("[assert-dump]   rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}", R[REG_RAX],
+                     R[REG_RBX], R[REG_RCX], R[REG_RDX], R[REG_RSI], R[REG_RDI], R[REG_RBP], R[REG_RSP]);
+   LogMan::Msg::EFmt("[assert-dump]   r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}", R[REG_R8],
+@@ -983,9 +1068,79 @@ static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t R
+   LogMan::Msg::EFmt("[assert-dump]   dr0={:#x} dr1={:#x} dr2={:#x} dr3={:#x} dr6={:#x} dr7={:#x}", Thread->CurrentFrame->State.Dr[0],
+                     Thread->CurrentFrame->State.Dr[1], Thread->CurrentFrame->State.Dr[2], Thread->CurrentFrame->State.Dr[3],
+                     Thread->CurrentFrame->State.Dr6, Thread->CurrentFrame->State.Dr7);
+-  IosAssertHex("code rip-32", Rip - 32, 64);
+-  IosAssertHex("stack rsp", R[REG_RSP], 64);
+-  IosAssertHex("stack rsp+64", R[REG_RSP] + 64, 64);
++  IosAssertCtx("delivered", Delivered);
++
++  // Code around RIP.
++  IosAssertHex("code rip-64", Rip - 64, 64);
++  IosAssertHex("code rip", Rip, 64);
++
++  // Memory behind every register that looks like a pointer (128 bytes from reg-32).
++  static const char* const RegNames[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
++                                           "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
++  static const int RegIdx[16] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP,
++                                 REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
++  for (int i = 0; i < 16; i++) {
++    const uint64_t V = R[RegIdx[i]];
++    if (!IosAssertPlausiblePtr(V) || RegIdx[i] == REG_RSP) {
++      continue;
++    }
++    IosAssertHex("mem -32 of ", V - 32, 64, RegNames[i]);
++    IosAssertHex("mem +32 of ", V + 32, 64, RegNames[i]);
++  }
++
++  // 2 KB of guest stack, read in 64-byte chunks; stop at the first chunk that cannot be read.
++  const uint64_t Rsp = R[REG_RSP];
++  uint64_t Slots[256] {};
++  size_t SlotCount = 0;
++  for (int i = 0; i < 32; i++) {
++    IosAssertHex("stack", Rsp + i * 64, 64);
++    SIZE_T Got = 0;
++    if (IosAssertUnsafe(Rsp + i * 64, 64) ||
++        NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Rsp + i * 64), &Slots[i * 8], 64, &Got) != 0 || Got != 64) {
++      break;
++    }
++    SlotCount = (i + 1) * 8;
++  }
++
++  // Callers: up to 8 stack values that point into committed executable memory, with 320 bytes of code around each.
++  int Callers = 0;
++  for (size_t i = 0; i < SlotCount && Callers < 8; i++) {
++    const uint64_t Val = Slots[i];
++    if (!IosAssertPlausiblePtr(Val) || (Val >= Rsp - 0x100000 && Val < Rsp + 0x100000)) {
++      continue;
++    }
++    MEMORY_BASIC_INFORMATION Mbi {};
++    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Val), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) != 0 ||
++        Mbi.State != MEM_COMMIT ||
++        !(Mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
++      continue;
++    }
++    LogMan::Msg::EFmt("[assert-dump]   caller #{} at stack slot rsp+{:#x} = {:#x} (alloc base {:#x} protect {:#x} pe {:#x})", Callers, i * 8,
++                      Val, reinterpret_cast<uint64_t>(Mbi.AllocationBase), static_cast<uint32_t>(Mbi.Protect), IosJitReverseTranslate(Val));
++    IosAssertHex("  code ret-256", Val - 256, 64);
++    IosAssertHex("  code ret-192", Val - 192, 64);
++    IosAssertHex("  code ret-128", Val - 128, 64);
++    IosAssertHex("  code ret-64", Val - 64, 64);
++    IosAssertHex("  code ret", Val, 64);
++    Callers++;
++  }
++
++  // The last 12 exceptions this thread was handed before this one (newest first), from the ring.
++  const uint64_t Now = IosAssertRingSeq.load(std::memory_order_relaxed);
++  int Shown = 0;
++  for (uint64_t k = 0; k < 64 && Shown < 12 && k < Now; k++) {
++    const auto& E = IosAssertRing[(Now - k) % 64];
++    std::atomic_thread_fence(std::memory_order_acquire);
++    if (E.Seq != Now - k || E.Tid != Tid) {
++      continue;
++    }
++    LogMan::Msg::EFmt("[assert-dump]   prev-{} seq={} code={:#x} x86eflags={:#x} liveTF={}", Shown, E.Seq, E.Code, E.EFlags, E.LiveTF);
++    static const char* const PrevNames[12] = {"prev-0", "prev-1", "prev-2", "prev-3", "prev-4",  "prev-5",
++                                              "prev-6", "prev-7", "prev-8", "prev-9", "prev-10", "prev-11"};
++    IosAssertCtx(PrevNames[Shown], E.Ctx);
++    Shown++;
++  }
++  LogMan::Msg::EFmt("[assert-dump]   end: {} callers, {} earlier exceptions of this thread shown (ring seq {})", Callers, Shown, Now);
+ }
+ #endif // FEX_IOS_HOST (assert-dump)
+ 
+@@ -1026,13 +1181,14 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
+   BOOL FirstChance = TRUE; // KiUserExceptionDispatcher takes no second-chance input
+   Args->Rec = FEX::Windows::HandleGuestException(Fault, Rec, Args->Context.Pc, Args->Context.X8, Args->Context.X0, FirstChance);
+   if (Args->Rec.ExceptionCode == STATUS_ASSERTION_FAILURE) {
+-    IosAssertDump(Thread, Args->Context.Pc, EFlags); // madeira [assert-dump]
++    IosAssertDump(Thread, Args->Context.Pc, EFlags, Args->Context); // madeira [assert-dump]
+   }
+   if (Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     Args->Context.Cpsr &= ~(1 << 21); // PSTATE.SS
+   } else if (Args->Rec.ExceptionCode == EXCEPTION_BREAKPOINT) {
+     Args->Context.Pc -= 1;
+   }
++  IosAssertRecord(static_cast<uint32_t>(Args->Rec.ExceptionCode), EFlags, TfDiagLiveTF, Args->Context); // madeira [assert-dump-2]
+   // tf-diag: ctxTF = Cpsr bit 21 as reconstructed, ctxSS = the same bit as finally delivered
+   // (after the single-step clear). Only TF/step related raises are logged.
+   if (TfDiagLiveTF || TfDiagCtxTF || Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP || Args->Rec.ExceptionCode == EXCEPTION_PRIV_INSTRUCTION) {

@@ -1,0 +1,312 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 3b26350..bc451b8 100755
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -147,6 +147,15 @@ static inline uint64_t IosNowNs() {
+   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
+ 
++/* MADEIRA section-views: 1 = place the per-instruction code-changed block right after the
++ * current block (MetalSharp patches/fex/0026, AGPL-3.0, Avery Felts); 0 = the old placement at
++ * the end of the block list, found by walking every block (quadratic in a fully checked block).
++ * Starts off; only the ARM64EC frontend turns it on (ProcessInit, unless MADEIRA_EC_SECTION_VIEWS=0),
++ * so the WOW64 module keeps the old placement. */
++extern "C" {
++uint32_t FEX_MadeiraSectionViews = 0;
++}
++
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+ /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+  * frontend (Module.cpp) which owns the thread registry. extern "C" so the
+@@ -1295,7 +1304,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
+ 
+           auto CurrentBlock = Thread->OpDispatcher->GetCurrentBlock();
+-          auto CodeWasChangedBlock = Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
++          auto CodeWasChangedBlock = FEX_MadeiraSectionViews ? Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock) :
++                                                               Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
+           Thread->OpDispatcher->SetTrueJumpTarget(InvalidateCodeCond, CodeWasChangedBlock);
+ 
+           Thread->OpDispatcher->SetCurrentCodeBlock(CodeWasChangedBlock);
+@@ -1307,7 +1317,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           // Invalidate and exit the function
+           Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP);
+ 
+-          auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
++          auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(FEX_MadeiraSectionViews ? CodeWasChangedBlock : CurrentBlock);
+ 
+           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
+           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 29aed3e..e69c916 100755
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -71,6 +71,7 @@ $end_info$
+ extern "C" char ios_va_log[];
+ extern "C" int ios_va_log_len;
+ 
++extern "C" uint32_t FEX_MadeiraSectionViews; // madeira [section-views], Core.cpp
+ #ifdef FEX_IOS_HOST
+ /* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
+  * TU because ARM64EC class-method access to the static table directly from
+@@ -1153,8 +1154,16 @@ public:
+     if (OrigAddr != Address && InvalidationTracker->IsHotSMCPage(OrigAddr)) {
+       return true;
+     }
++    if (OrigAddr != Address && FEX_MadeiraSectionViews && InvalidationTracker->IsSharedSectionPage(OrigAddr)) {
++      return true; // madeira [section-views]
++    }
+ #endif
+-    return InvalidationTracker->IsHotSMCPage(Address);
++    if (InvalidationTracker->IsHotSMCPage(Address)) {
++      return true;
++    }
++    // madeira [section-views]: code in a data-section view whose section has another view mapped
++    // can be rewritten through that view without a fault; check it per instruction.
++    return FEX_MadeiraSectionViews && InvalidationTracker->IsSharedSectionPage(Address);
+   }
+ 
+   void PreCompile() override {
+@@ -1392,6 +1401,9 @@ NTSTATUS ProcessInit() {
+       Exception::IosPfAfKeep = 0;
+     }
+     LogMan::Msg::EFmt("[pfaf-keep] rev=pfaf-keep-2 xtajit64 {}", Exception::IosPfAfKeep ? "on" : "off (MADEIRA_EC_PFAF_KEEP=0)");
++    const char* SectionViews = getenv("MADEIRA_EC_SECTION_VIEWS"); // madeira [section-views]
++    FEX_MadeiraSectionViews = (SectionViews && SectionViews[0] == '0') ? 0 : 1;
++    LogMan::Msg::EFmt("[section-views] rev=section-views-1 xtajit64 {}", FEX_MadeiraSectionViews ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)");
+     LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
+                       "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
+                       IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0",
+@@ -2176,6 +2188,40 @@ extern "C" void NotifyImageMap(void* Address) {
+ }
+ 
+ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Size, ULONG AllocType, ULONG Prot) {
++  /* madeira [section-views] (MetalSharp patches/fex/0025, AGPL-3.0): Wine passes a section handle
++   * (Unk1) and view offset (Unk2) only for a DATA-section view; image maps keep Unk1 == NULL and
++   * take the unchanged path below. A data view is never queued or treated as an image. */
++  if (Unk1) {
++    if (!FEX_MadeiraSectionViews || !InvalidationTracker || !ImageTracker || ProcessTerminating.load(std::memory_order_relaxed)) {
++      return STATUS_SUCCESS;
++    }
++    bool SelfShared = false;
++    if (CTX) {
++      uint64_t Teb = 0;
++      __asm__ volatile("mov %0, x18" : "=r"(Teb));
++      const uint64_t Stamp = CTX->GetCodeInvalidationMutex().IosStampAddress();
++      auto Held = [Stamp](uint64_t T) {
++        return T && *reinterpret_cast<const uint32_t*>(T + 0x16f0) != 0 && *reinterpret_cast<const uint64_t*>(T + 0x16f8) == Stamp;
++      };
++#ifdef FEX_IOS_HOST
++      const uint64_t TebTsd = reinterpret_cast<uint64_t>(IOSLoadTEB());
++#else
++      const uint64_t TebTsd = 0;
++#endif
++      SelfShared = Held(Teb) || (TebTsd != Teb && Held(TebTsd));
++    }
++    if (SelfShared) {
++      // Same reason as the madeira-bcd case below: no ThreadCreationMutex, no invalidation.
++      InvalidationTracker->HandleDataSectionMap(Unk1, reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size),
++                                                reinterpret_cast<uint64_t>(Unk2), true);
++    } else {
++      std::scoped_lock Lock(ThreadCreationMutex);
++      InvalidationTracker->HandleDataSectionMap(Unk1, reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size),
++                                                reinterpret_cast<uint64_t>(Unk2), false);
++    }
++    return STATUS_SUCCESS;
++  }
++
+   /* iOS-Madeira ml183: do NOT require GetCPUArea().ThreadState() here.
+    *
+    * HandleImageMap() only needs InvalidationTracker + ImageTracker — it never touches
+@@ -2252,6 +2298,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+     if (Size) {
+       HandleImageUnmap(Start, Size);
+     }
++    InvalidationTracker->HandleDataSectionUnmap(reinterpret_cast<uint64_t>(Address)); // madeira [section-views]
+   } else {
+     ThreadCreationMutex.unlock();
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index e4484c5..fc7da6a 100755
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -13,6 +13,9 @@
+ #include <windef.h>
+ #include <winternl.h>
+ 
++// madeira [section-views]: not declared by the mingw headers (as in MetalSharp fex/0025); ntdll.def exports it.
++extern "C" NTSTATUS WINAPI NtCompareObjects(HANDLE, HANDLE);
++
+ /* ml623: targeted IR capture target (defined in FEXCore PassManager.cpp). File scope on
+  * purpose -- an extern "C" at block scope is a compile error and cost a build earlier. */
+ extern "C" uint64_t FEX_MadeiraIRCapTarget;
+@@ -731,6 +734,119 @@ void InvalidationTracker::EnableHotSMCPages(uint32_t Threshold) {
+   HotPageThreshold = Threshold;
+ }
+ 
++// MADEIRA section-views: see InvalidationTracker.h. Ported from MetalSharp patches/fex/0025
++// (MetalSharp-Wine, AGPL-3.0, Avery Felts); idea also in GameNative's FEX patch 0001 (Dmage22).
++void InvalidationTracker::RecountSharedSectionViewsLocked() {
++  uint32_t Count = 0;
++  for (auto& View : SectionViews) {
++    View.Shared = false;
++    for (const auto& Other : SectionViews) {
++      if (&Other != &View && Other.Group == View.Group) {
++        View.Shared = true;
++        break;
++      }
++    }
++    Count += View.Shared;
++  }
++  SharedSectionViewCount.store(Count, std::memory_order_release);
++}
++
++void InvalidationTracker::HandleDataSectionMap(HANDLE Section, uint64_t Address, uint64_t Size, uint64_t Offset, bool NoInvalidate) {
++  if (!Section || !Address || !Size || IntervalsLock.HeldByThisThread()) {
++    return;
++  }
++  HANDLE Dup {};
++  if (NtDuplicateObject(NtCurrentProcess(), Section, NtCurrentProcess(), &Dup, 0, 0, DUPLICATE_SAME_ACCESS)) {
++    return;
++  }
++  const auto Base = Address & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto AlignedSize = (Address - Base + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
++
++  std::vector<HANDLE> Stale;
++  std::vector<std::pair<uint64_t, uint64_t>> Recheck;
++  uint64_t Group = 0;
++  bool Joined = false;
++  {
++    std::unique_lock Lock(IntervalsLock);
++    // A view whose unmap was not seen cannot overlap a new one.
++    for (auto It = SectionViews.begin(); It != SectionViews.end();) {
++      if (It->Base < Base + AlignedSize && Base < It->Base + It->Size) {
++        Stale.push_back(It->Section);
++        It = SectionViews.erase(It);
++      } else {
++        ++It;
++      }
++    }
++    for (const auto& View : SectionViews) {
++      if (NtCompareObjects(View.Section, Dup) == 0) {
++        Group = View.Group;
++        break;
++      }
++    }
++    if (Group) {
++      Joined = true;
++      // Code already translated from the other views ran unchecked: translate it again with the checks.
++      for (const auto& View : SectionViews) {
++        if (View.Group == Group) {
++          Recheck.emplace_back(View.Base, View.Size);
++        }
++      }
++    } else {
++      Group = NextSectionGroup++;
++    }
++    SectionViews.push_back({Base, AlignedSize, Dup, Group, false});
++    RecountSharedSectionViewsLocked();
++  }
++  for (auto Handle : Stale) {
++    NtClose(Handle);
++  }
++  static std::atomic<uint32_t> LogCount {0};
++  if (LogCount.fetch_add(1, std::memory_order_relaxed) < 32) {
++    LogMan::Msg::EFmt("[section-views] view {:#x}+{:#x} offset={:#x} group={} {}{}", Base, AlignedSize, Offset, Group,
++                      Joined ? "SHARES its section with another view: its code is checked per instruction" : "first view of its section",
++                      (Joined && NoInvalidate) ? " (earlier code not dropped: compile lock held by this thread)" : "");
++  }
++  if (!NoInvalidate) {
++    for (auto [ViewBase, ViewSize] : Recheck) {
++      InvalidateIntervalInternal(ViewBase, ViewSize);
++    }
++  }
++}
++
++void InvalidationTracker::HandleDataSectionUnmap(uint64_t Address) {
++  if (IntervalsLock.HeldByThisThread()) {
++    return;
++  }
++  HANDLE Section {};
++  {
++    std::unique_lock Lock(IntervalsLock);
++    for (auto It = SectionViews.begin(); It != SectionViews.end(); ++It) {
++      if (Address >= It->Base && Address < It->Base + It->Size) {
++        Section = It->Section;
++        SectionViews.erase(It);
++        RecountSharedSectionViewsLocked();
++        break;
++      }
++    }
++  }
++  if (Section) {
++    NtClose(Section);
++  }
++}
++
++bool InvalidationTracker::IsSharedSectionPage(uint64_t Address) {
++  if (!SharedSectionViewCount.load(std::memory_order_acquire) || IntervalsLock.HeldByThisThread()) {
++    return false;
++  }
++  std::shared_lock Lock(IntervalsLock);
++  for (const auto& View : SectionViews) {
++    if (View.Shared && Address >= View.Base && Address < View.Base + View.Size) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
+   const auto Used = HotPagesUsed.load(std::memory_order_acquire);
+   if (!Used) {
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 2f015c6..f60e365 100755
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -8,6 +8,7 @@
+ #include <mutex>
+ #include <shared_mutex>
+ #include <unordered_map>
++#include <vector>
+ #include <string_view>
+ 
+ namespace FEXCore::Core {
+@@ -69,6 +70,18 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // MADEIRA section-views (ported from MetalSharp patches/fex/0025, AGPL-3.0, Avery Felts):
++  // views of one data section share their pages, so a write through one view changes code
++  // translated from another with no fault or protection change FEX sees. Wine reports every
++  // data-section view with its section handle and offset; views of the same section are
++  // grouped (NtCompareObjects), and code compiled from a view whose section has another view
++  // mapped checks its bytes before each instruction (IsSharedSectionPage feeds the same
++  // per-instruction validation as a hot SMC page). Code translated before the second view
++  // appeared is dropped once. NoInvalidate: the caller holds CodeInvalidationMutex shared.
++  void HandleDataSectionMap(HANDLE Section, uint64_t Address, uint64_t Size, uint64_t Offset, bool NoInvalidate);
++  void HandleDataSectionUnmap(uint64_t Address);
++  bool IsSharedSectionPage(uint64_t Address);
++
+ private:
+ #if !defined(ARCHITECTURE_arm64ec)
+   // Lazy DEP-off promotion under a guest window: registers [Address's committed region] as
+@@ -150,6 +163,18 @@ private:
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 
++  struct SectionView {
++    uint64_t Base;
++    uint64_t Size;
++    HANDLE Section;
++    uint64_t Group;
++    bool Shared;
++  };
++  std::vector<SectionView> SectionViews;          // Protected by IntervalsLock
++  uint64_t NextSectionGroup {1};                  // Protected by IntervalsLock
++  std::atomic<uint32_t> SharedSectionViewCount {0}; // fast path for IsSharedSectionPage
++  void RecountSharedSectionViewsLocked();
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};

@@ -172,12 +172,20 @@ enum GetHelpFiles {
 
     /// The game's folder from its program path (relative to drive_c): the Steam game's own
     /// folder under steamapps/common when it is in one, otherwise the program's folder.
-    static func gameFolder(drive: URL, relativePath: String) -> URL? {
+    /// (get-help-own-folder) A Steam entry's path ends AT the game's folder
+    /// ("Steam/steamapps/common/Grim Dawn"); that used to fall through to the parent,
+    /// steamapps/common, which is every installed game. `ownFolder` false: the old behaviour
+    /// (the caller passes env.MADEIRA_GET_HELP_OWN_FOLDER; this file stays free of the app).
+    static func gameFolder(drive: URL, relativePath: String, ownFolder: Bool = true) -> URL? {
         let parts = relativePath.replacingOccurrences(of: "\\", with: "/").split(separator: "/").map(String.init)
         guard parts.count >= 2, !parts.contains("..") else { return nil }
         if let i = parts.firstIndex(where: { $0.caseInsensitiveCompare("common") == .orderedSame }),
-           i > 0, parts[i - 1].caseInsensitiveCompare("steamapps") == .orderedSame, i + 1 < parts.count - 1 {
-            return parts[...(i + 1)].reduce(drive) { $0.appendingPathComponent($1) }
+           i > 0, parts[i - 1].caseInsensitiveCompare("steamapps") == .orderedSame {
+            if i + 1 < parts.count - 1 { return parts[...(i + 1)].reduce(drive) { $0.appendingPathComponent($1) } }
+            // The path ends at steamapps/common/<name>: the game's folder, unless <name> is a program.
+            if ownFolder, i + 1 == parts.count - 1, !parts[i + 1].lowercased().hasSuffix(".exe") {
+                return parts.reduce(drive) { $0.appendingPathComponent($1) }
+            }
         }
         return parts.dropLast().reduce(drive) { $0.appendingPathComponent($1) }
     }

@@ -3,6 +3,7 @@
 // to the already-running wineserver thread.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <os/log.h>
 #import <pthread.h>
 #import "WineProcessBridge.h"
@@ -394,6 +395,37 @@ static void madeira_note_handed_to_steam(const char *names) {
 void wine_steam_run_requested(unsigned int appid) {
     __atomic_store_n(&g_steam_run_app, appid, __ATOMIC_RELEASE);
 }
+/* A game asked Windows to open a web page (DREDGE's Epic sign-in, for one): winebrowser.exe finds no
+ * browser here, so ntdll hands the address over and the app opens it in Safari. Only http and https.
+ * A game may ask again (each Epic sign-in request has a new code), so at most 3 pages per app run and
+ * never within 15 s of the last one; a dropped request is logged. */
+void wine_open_link_requested(const char *url) {
+    @autoreleasepool {
+        if (!url) return;
+        NSString *text = [NSString stringWithUTF8String:url];
+        NSURL *target = text.length ? [NSURL URLWithString:text] : nil;
+        NSString *scheme = target.scheme.lowercaseString;
+        if (!target || target.host.length == 0 ||
+            !([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) return;
+        static int opened;
+        static CFAbsoluteTime lastAt;
+        BOOL allow;
+        @synchronized ([NSProcessInfo processInfo]) {
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            allow = opened < 3 && (opened == 0 || now - lastAt >= 15.0);
+            if (allow) { opened++; lastAt = now; }
+        }
+        if (!allow) {
+            dprintf(2, "[open-link] not opened again (3 per run, 15 s apart): %s\n", target.host.UTF8String);
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:target options:@{} completionHandler:^(BOOL ok) {
+                dprintf(2, "[open-link] Safari %s for %s\n", ok ? "opened" : "refused", target.host.UTF8String);
+            }];
+        });
+    }
+}
 int wine_steam_run_request(uint32_t *appid) {
     uint32_t value = __atomic_load_n(&g_steam_run_app, __ATOMIC_ACQUIRE);
     if (!value) return 0;
@@ -779,13 +811,35 @@ static uint16_t madeira_pe_machine(const char *unix_path)
  *    links the 64-bit farms; the first farm copy's PE header is probed. Otherwise it is looked up in the bundle's i386-windows. To
  *    launch the 32-bit build of a name both sets carry (explorer.exe, cmd.exe),
  *    give its full path, C:\windows\syswow64\<name>.
+ *  - "C:\windows\system32\<name>" (any case, no subfolder): a name one of the
+ *    64-bit farms carries is probed there, in the bare-name order. The prefix's
+ *    system32 entry is a link the farm step below rewrites only after this
+ *    probe, so it still points at the last session's farm, or nowhere after a
+ *    reinstall moved the bundle: a .bat start (cmd.exe /c) probed 0, the path
+ *    rule picked arm64ec, and the aarch64 cmd.exe failed to load kernel32.dll
+ *    (c000007b). Any other name is the prefix's own file, as below.
  *  - any other form (another drive, a relative Win32 path) is not probed. */
 static uint16_t madeira_target_machine(const char *exe, const char *prefix, NSString *bundle)
 {
     static const char * const farms64[] = { "aarch64-windows", "arm64ec-windows" };
+    static const char sys32[] = "C:\\windows\\system32\\";
     char probe[PATH_MAX];
     size_t skip;
 
+    /* env.MADEIRA_SYS32_FARM_PROBE = 0 skips this and reads the prefix's link, as before. */
+    const char *sys32_off = getenv("MADEIRA_SYS32_FARM_PROBE");
+    if (!(sys32_off && sys32_off[0] == '0' && !sys32_off[1]) &&
+        !strncasecmp(exe, sys32, sizeof(sys32) - 1) && exe[sizeof(sys32) - 1] &&
+        !strchr(exe + sizeof(sys32) - 1, '\\'))
+    {
+        for (size_t i = 0; i < sizeof(farms64) / sizeof(farms64[0]); i++)
+        {
+            if (snprintf(probe, sizeof(probe), "%s/%s/%s", bundle.fileSystemRepresentation, farms64[i],
+                         exe + sizeof(sys32) - 1) >= (int)sizeof(probe))
+                return 0;
+            if (access(probe, R_OK) == 0) return madeira_pe_machine(probe);
+        }
+    }
     if ((exe[0] == 'C' || exe[0] == 'c') && exe[1] == ':' && exe[2] == '\\')
     {
         skip = strlen(prefix) + strlen("/drive_c/");
@@ -891,6 +945,146 @@ static void madeira_overlay_xaudio2(NSFileManager *fm, NSString *prefix, BOOL x8
             linked, x86 ? "x86" : "x64", x86 ? "xaudio2-32" : "xaudio2");
 }
 
+/* [bepinex-auto] A game folder modded with BepInEx (Unity Doorstop): the Doorstop proxy
+ * (winhttp.dll; version.dll, winmm.dll or dinput8.dll in other builds) sits beside the
+ * program with a BepInEx folder or doorstop_config.ini. Wine takes its own builtin of
+ * those names before a copy in the program's folder, so without "name=n,b" the proxy
+ * is never loaded and BepInEx never starts. The scan is pure C (host-tested,
+ * tests/host/check-bepinex-auto.py). It adds "name=n,b" for each proxy found, to the end
+ * of WINEDLLOVERRIDES, only when the game's own list does not name that DLL already
+ * (the Mods page's winhttp=n,b, or a line the player wrote, wins). A folder with a
+ * MelonLoader folder is left alone (MelonLoader has its own list). Off:
+ * env.MADEIRA_BEPINEX_AUTO = 0 in madeira.cfg, or in one game's own config for that
+ * game only. NOT device-tested. */
+/* bepinex-auto begin */
+static int madeira_bi_names(const char *list, const char *dll)
+{
+    size_t n = strlen(dll);
+    const char *p = list;
+    while (p && *p) {
+        const char *end = strchr(p, ';');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        size_t nl = eq ? (size_t)(eq - p) : len, i = 0;
+        while (i <= nl) {
+            size_t j = i, a = i, z;
+            while (j < nl && p[j] != ',') j++;
+            z = j;
+            while (a < z && p[a] == ' ') a++;           /* "video64= ; winhttp=d" */
+            while (z > a && p[z - 1] == ' ') z--;
+            if (z - a == n + 4 && !strncasecmp(p + a + n, ".dll", 4)) z -= 4;   /* "winhttp.dll=d" */
+            if (z - a == n && !strncasecmp(p + a, dll, n)) return 1;
+            i = j + 1;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+/* dir: the program's folder (host path). current: WINEDLLOVERRIDES now (may be NULL).
+ * Returns how many names were added (out = the new value); 0 = nothing to do (out = current).
+ * found: the proxy names in the folder ("winhttp version"), "" when it is not a BepInEx folder. */
+static int madeira_bepinex_scan(const char *dir, const char *current, char *out, size_t outsz, char *found, size_t foundsz)
+{
+    static const char *const proxies[] = { "winhttp", "version", "winmm", "dinput8" };
+    int has[4] = { 0, 0, 0, 0 }, bep = 0, ds = 0, melon = 0, added = 0;
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    snprintf(out, outsz, "%s", current ? current : "");
+    if (foundsz) found[0] = 0;
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        if (!strcasecmp(e->d_name, "BepInEx")) bep = 1;
+        else if (!strcasecmp(e->d_name, "doorstop_config.ini")) ds = 1;
+        else if (!strcasecmp(e->d_name, "MelonLoader")) melon = 1;
+        else for (int i = 0; i < 4; i++) {
+            size_t n = strlen(proxies[i]);
+            if (strlen(e->d_name) == n + 4 && !strncasecmp(e->d_name, proxies[i], n) && !strcasecmp(e->d_name + n, ".dll")) has[i] = 1;
+        }
+    }
+    closedir(d);
+    if (!(bep || ds) || melon) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!has[i] || (i > 0 && has[0])) continue;   /* winhttp.dll present: the other names are some other mod's, left as they are */
+        size_t fl = strlen(found);
+        if (fl + strlen(proxies[i]) + 2 < foundsz) snprintf(found + fl, foundsz - fl, "%s%s", fl ? " " : "", proxies[i]);
+        if (madeira_bi_names(out, proxies[i])) continue;
+        size_t ol = strlen(out);
+        if (ol + strlen(proxies[i]) + 6 >= outsz) continue;
+        snprintf(out + ol, outsz - ol, "%s%s=n,b", ol ? ";" : "", proxies[i]);
+        added++;
+    }
+    return added;
+}
+/* bepinex-auto end */
+
+/* The value WINEDLLOVERRIDES had before this launch's addition, put back at the session's end
+ * so a later game in the same app run does not inherit winhttp=n,b. */
+static int g_bepinex_added = 0;
+static char *g_bepinex_saved = NULL;
+
+static void madeira_bepinex_restore(void)
+{
+    if (!g_bepinex_added) return;
+    if (g_bepinex_saved) setenv("WINEDLLOVERRIDES", g_bepinex_saved, 1); else unsetenv("WINEDLLOVERRIDES");
+    free(g_bepinex_saved);
+    g_bepinex_saved = NULL;
+    g_bepinex_added = 0;
+}
+
+/* One folder: when it is a BepInEx folder, add the names (unless the switch is off) and log it.
+ * Returns 1 for a BepInEx folder, whether or not anything was added. */
+static int madeira_bepinex_folder(const char *dir)
+{
+    char out[1024], found[128];
+    const char *cur = getenv("WINEDLLOVERRIDES");
+    int added = madeira_bepinex_scan(dir, cur, out, sizeof(out), found, sizeof(found));
+    if (!found[0]) return 0;
+    const char *sw = getenv("MADEIRA_BEPINEX_AUTO");   /* 0: a game folder with BepInEx (Doorstop proxy winhttp.dll, or version/winmm/dinput8.dll when there is no winhttp.dll, + a BepInEx folder or doorstop_config.ini) is not given name=n,b in WINEDLLOVERRIDES; default on; put it in one game's own config to turn it off for that game only */
+    if (madeira_cfg_off_word(sw)) {
+        dprintf(STDERR_FILENO, "[WineProc] [bepinex-auto] BepInEx folder (%s) left alone: MADEIRA_BEPINEX_AUTO=%s\n", found, sw);
+        return 1;
+    }
+    if (added) {
+        madeira_bepinex_restore();
+        g_bepinex_saved = cur ? strdup(cur) : NULL;
+        g_bepinex_added = 1;
+        setenv("WINEDLLOVERRIDES", out, 1);
+    }
+    dprintf(STDERR_FILENO, "[WineProc] [bepinex-auto] BepInEx folder (%s) in %s: WINEDLLOVERRIDES=%s (%d added; MADEIRA_BEPINEX_AUTO=0 turns it off)\n",
+            found, dir, out, added);
+    return 1;
+}
+
+static void madeira_bepinex_auto(const char *prefix, const char *exe)
+{
+    /* A Madeira Dock start: its program is explorer.exe, and Valve's client starts the game later from its own
+     * folder, so the app names the game's folders (host paths, one per line) for this one start. */
+    char dirs[2048] = "";
+    const char *given = getenv("MADEIRA_BEPINEX_DIRS");   /* set by the app for one Dock start; not a setting */
+    if (given) snprintf(dirs, sizeof(dirs), "%s", given);
+    unsetenv("MADEIRA_BEPINEX_DIRS");
+    if (!exe) return;
+    if ((exe[0] == 'C' || exe[0] == 'c') && exe[1] == ':' && exe[2] == '\\') {
+        /* A C:\ program ("C:\dir\game.exe"): its own folder. */
+        const char *last = strrchr(exe, '\\');
+        char dir[1024];
+        if (!last || last <= exe + 2) return;
+        int n = snprintf(dir, sizeof(dir), "%s/drive_c/", prefix);
+        size_t len = (size_t)(last - (exe + 3));
+        if (n < 0 || (size_t)n + len + 1 > sizeof(dir)) return;
+        memcpy(dir + n, exe + 3, len);
+        dir[n + len] = 0;
+        for (char *p = dir + n; *p; p++) if (*p == '\\') *p = '/';
+        madeira_bepinex_folder(dir);
+        return;
+    }
+    if (strcasecmp(exe, "explorer.exe")) return;   /* anything else that is not a path: left alone */
+    char *save = NULL;
+    for (char *line = strtok_r(dirs, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+        if (line[0] == '/' && madeira_bepinex_folder(line)) return;
+}
+
 /* C:\windows\<farm>: links whose bundle file is gone. Each session relinks
  * every file the bundle has by its own name, but a link whose name the bundle
  * no longer has stays behind, pointing at nothing. Wine's file lookup ignores
@@ -924,6 +1118,93 @@ static void madeira_prune_dead_farm_links(NSString *dir)
     closedir(d);
     if (pruned)
         dprintf(STDERR_FILENO, "[farm-names] removed %d dead bundle links from %s\n", pruned, dir.UTF8String);
+}
+
+/* OpenAL Soft (LGPL-2 or later), built by us as OpenAL32.dll (build/openal-soft/build.sh)
+ * and bundled as openal/arm64ec-windows (x64 programs) and openal/i386-windows (32-bit
+ * programs). Wine has no OpenAL of its own, and games that expect Creative's installer
+ * (BIT.TRIP BEAT's dep\oalinst.exe) end with c0000135 without it. A program's own
+ * OpenAL32.dll next to its exe is found first, so a game that ships one keeps using it.
+ *
+ * Rules, as madeira_link_wine_mono / madeira_link_wine_gecko:
+ *  - Any OpenAL32.dll in a farm, in any letter case, that is not our link (a real file such
+ *    as one Creative's oalinst.exe wrote, or a link pointing anywhere but this app's
+ *    openal/ folder) is the prefix's own: never removed or replaced, and no link of ours
+ *    is put next to it (the farm is case-sensitive, Wine's lookup is not).
+ *  - Only a symlink whose target is inside an app bundle's openal/ folder is ours and the
+ *    only thing ever removed.
+ *  - The EC file goes where madeira_setup_vulkan puts the Vulkan DLLs: system32 + sysx64
+ *    in an ARM64EC session, sysx64 only otherwise (x64 children of an aarch64 or i386
+ *    session, e.g. the Dock under Steam); the i386 file goes into syswow64.
+ * env.MADEIRA_OPENAL = 0: no link is made and our links from an earlier session are
+ * removed from system32, sysx64 and syswow64, so the prefix is back to stock (the old
+ * behaviour: no OpenAL32.dll unless the prefix or the game has its own). */
+static BOOL madeira_openal_link_is_ours(NSString *target)
+{
+    return target && [target rangeOfString:@".app/openal/"].location != NSNotFound;
+}
+
+static void madeira_overlay_openal(NSFileManager *fm, NSString *prefix, NSString *bundle,
+                                   BOOL has_i386_set, BOOL use_arm64ec)
+{
+    const char *e = getenv("MADEIRA_OPENAL");   /* 0: no OpenAL Soft link, and our earlier links are removed */
+    const BOOL off = (e && e[0] == '0');
+    NSString *ec = [bundle stringByAppendingPathComponent:@"openal/arm64ec-windows/OpenAL32.dll"];
+    NSString *x86 = [bundle stringByAppendingPathComponent:@"openal/i386-windows/OpenAL32.dll"];
+    NSString *farms[] = { @"system32", @"sysx64", @"syswow64" };
+    NSString *srcs[] = { ec, ec, x86 };
+    const BOOL wanted[] = { use_arm64ec, YES, has_i386_set };   /* EC: as madeira_setup_vulkan's dirs */
+
+    if (off)
+        dprintf(STDERR_FILENO, "[openal-soft] MADEIRA_OPENAL=0: off; nothing linked, earlier links of ours removed\n");
+    for (int i = 0; i < 3; i++) {
+        NSString *dir = [[prefix stringByAppendingPathComponent:@"drive_c/windows"] stringByAppendingPathComponent:farms[i]];
+        const BOOL want = !off && wanted[i] && access(srcs[i].fileSystemRepresentation, R_OK) == 0;
+        NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+        NSMutableArray<NSString *> *ours = [NSMutableArray array];
+        NSString *own = nil;   /* the prefix's own OpenAL32.dll, any case */
+
+        if (!names) continue;   /* no such farm in this prefix: nothing to link or clean */
+        for (NSString *f in names) {
+            if ([f caseInsensitiveCompare:@"OpenAL32.dll"] != NSOrderedSame) continue;
+            NSString *path = [dir stringByAppendingPathComponent:f];
+            struct stat st;
+            if (lstat(path.fileSystemRepresentation, &st) != 0) continue;
+            if (S_ISLNK(st.st_mode) && madeira_openal_link_is_ours([fm destinationOfSymbolicLinkAtPath:path error:nil]))
+                [ours addObject:f];
+            else
+                own = f;   /* real file, or a link somewhere else (Documents): not ours */
+        }
+
+        BOOL keep = NO;
+        for (NSString *f in ours) {
+            NSString *path = [dir stringByAppendingPathComponent:f];
+            if (want && !own && !keep && [f isEqualToString:@"OpenAL32.dll"] &&
+                [[fm destinationOfSymbolicLinkAtPath:path error:nil] isEqualToString:srcs[i]]) {
+                keep = YES;   /* already this bundle's link */
+                continue;
+            }
+            if (unlink(path.fileSystemRepresentation) == 0 && !(want && !own))   /* a relink below logs "linked" */
+                dprintf(STDERR_FILENO, "[openal-soft] removed old link %s\\%s\n", farms[i].UTF8String, f.UTF8String);
+        }
+
+        if (own) {
+            if (want || ours.count)
+                dprintf(STDERR_FILENO, "[openal-soft] kept real file %s\\%s (the prefix's own); OpenAL Soft not linked there\n",
+                        farms[i].UTF8String, own.UTF8String);
+            continue;
+        }
+        if (!want) continue;
+        NSString *dst = [dir stringByAppendingPathComponent:@"OpenAL32.dll"];
+        if (!keep) {
+            if (![fm createSymbolicLinkAtPath:dst withDestinationPath:srcs[i] error:nil]) {
+                dprintf(STDERR_FILENO, "[openal-soft] FAILED to link %s\\OpenAL32.dll errno=%d\n", farms[i].UTF8String, errno);
+                continue;
+            }
+        }
+        dprintf(STDERR_FILENO, "[openal-soft] linked OpenAL Soft into %s (env.MADEIRA_OPENAL = 0 leaves it out)\n",
+                farms[i].UTF8String);
+    }
 }
 
 /* C:\windows\syswow64: the i386 farm, the Windows name for this pattern. A
@@ -1216,21 +1497,6 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
     }
     setenv("MADEIRA_VULKAN_LIBRARY", lib.UTF8String, 1);   /* read by build/win32u-unix/vulkan_ios.c */
 
-    /* Fork fix (desktop sessions): with the Wine desktop the session is explorer.exe's, not
-     * ARM64EC, and only sysx64 is linked below. A vulkan-1.dll link left in system32 (the
-     * farm's stand-in, app/Madeira/arm64ec-windows/vulkan-1.dll) is then what an x64 game
-     * loads first: no winevulkan, and the game reports no Vulkan graphics card until a direct
-     * launch relinks system32. Without it the loader falls back to sysx64's, the real one. */
-    if (!use_arm64ec)
-        for (NSString *dll in vulkan_dlls) {
-            NSString *path = [[win stringByAppendingPathComponent:@"system32"] stringByAppendingPathComponent:dll];
-            NSString *dest = [fm destinationOfSymbolicLinkAtPath:path error:nil];
-            if (!dest) continue;
-            dprintf(STDERR_FILENO, "[vulkan] removed system32 %s (a link to %s) so the game loads sysx64's\n",
-                    dll.UTF8String, dest.UTF8String);
-            [fm removeItemAtPath:path error:nil];
-        }
-
     for (NSString *dir in dirs)
         for (NSString *dll in vulkan_dlls)
             linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
@@ -1371,6 +1637,37 @@ static void madeira_link_wine_gecko(NSFileManager *fm, NSString *prefix)
     }
 }
 
+/* The window classes comctl32 v6 registers (dlls/comctl32_v6/comctl32.manifest). */
+static const char *madeira_comctl32_v6_body =
+        "    <windowClass>Button</windowClass>\n"
+        "    <windowClass>ButtonListBox</windowClass>\n"
+        "    <windowClass>ComboBoxEx32</windowClass>\n"
+        "    <windowClass>ComboLBox</windowClass>\n"
+        "    <windowClass>ComboBox</windowClass>\n"
+        "    <windowClass>Edit</windowClass>\n"
+        "    <windowClass>ListBox</windowClass>\n"
+        "    <windowClass>NativeFontCtl</windowClass>\n"
+        "    <windowClass>ReBarWindow32</windowClass>\n"
+        "    <windowClass>ScrollBar</windowClass>\n"
+        "    <windowClass>Static</windowClass>\n"
+        "    <windowClass>SysAnimate32</windowClass>\n"
+        "    <windowClass>SysDateTimePick32</windowClass>\n"
+        "    <windowClass>SysHeader32</windowClass>\n"
+        "    <windowClass>SysIPAddress32</windowClass>\n"
+        "    <windowClass>SysLink</windowClass>\n"
+        "    <windowClass>SysListView32</windowClass>\n"
+        "    <windowClass>SysMonthCal32</windowClass>\n"
+        "    <windowClass>SysPager</windowClass>\n"
+        "    <windowClass>SysTabControl32</windowClass>\n"
+        "    <windowClass>SysTreeView32</windowClass>\n"
+        "    <windowClass>ToolbarWindow32</windowClass>\n"
+        "    <windowClass>msctls_hotkey32</windowClass>\n"
+        "    <windowClass>msctls_progress32</windowClass>\n"
+        "    <windowClass>msctls_statusbar32</windowClass>\n"
+        "    <windowClass>msctls_trackbar32</windowClass>\n"
+        "    <windowClass>msctls_updown32</windowClass>\n"
+        "    <windowClass>tooltips_class32</windowClass>\n";
+
 /* C:\windows\winsxs for 32-bit processes: the x86 side-by-side assemblies Wine
  * ships. Re-seeded every session, because the links name the bundle path.
  *
@@ -1401,35 +1698,6 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
 {
     struct sxs_file { const char *in_assembly; const char *in_farm; };
     struct sxs_assembly { const char *name, *lname, *key, *version; struct sxs_file files[4]; };
-    static const char *comctl32_body =
-        "    <windowClass>Button</windowClass>\n"
-        "    <windowClass>ButtonListBox</windowClass>\n"
-        "    <windowClass>ComboBoxEx32</windowClass>\n"
-        "    <windowClass>ComboLBox</windowClass>\n"
-        "    <windowClass>ComboBox</windowClass>\n"
-        "    <windowClass>Edit</windowClass>\n"
-        "    <windowClass>ListBox</windowClass>\n"
-        "    <windowClass>NativeFontCtl</windowClass>\n"
-        "    <windowClass>ReBarWindow32</windowClass>\n"
-        "    <windowClass>ScrollBar</windowClass>\n"
-        "    <windowClass>Static</windowClass>\n"
-        "    <windowClass>SysAnimate32</windowClass>\n"
-        "    <windowClass>SysDateTimePick32</windowClass>\n"
-        "    <windowClass>SysHeader32</windowClass>\n"
-        "    <windowClass>SysIPAddress32</windowClass>\n"
-        "    <windowClass>SysLink</windowClass>\n"
-        "    <windowClass>SysListView32</windowClass>\n"
-        "    <windowClass>SysMonthCal32</windowClass>\n"
-        "    <windowClass>SysPager</windowClass>\n"
-        "    <windowClass>SysTabControl32</windowClass>\n"
-        "    <windowClass>SysTreeView32</windowClass>\n"
-        "    <windowClass>ToolbarWindow32</windowClass>\n"
-        "    <windowClass>msctls_hotkey32</windowClass>\n"
-        "    <windowClass>msctls_progress32</windowClass>\n"
-        "    <windowClass>msctls_statusbar32</windowClass>\n"
-        "    <windowClass>msctls_trackbar32</windowClass>\n"
-        "    <windowClass>msctls_updown32</windowClass>\n"
-        "    <windowClass>tooltips_class32</windowClass>\n";
     /* One entry per WINE_MANIFEST resource in the Wine tree (the file the
      * values come from is named on each entry). */
     static const struct sxs_assembly asms[] = {
@@ -1473,7 +1741,7 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
     for (size_t a = 0; a < count; a++)
     {
         const struct sxs_assembly *def = &asms[a];
-        const char *body = a == 0 ? comctl32_body : NULL;
+        const char *body = a == 0 ? madeira_comctl32_v6_body : NULL;
         NSString *first = [source stringByAppendingPathComponent:
                            [NSString stringWithUTF8String:def->files[0].in_farm]];
         if (![fm fileExistsAtPath:first])
@@ -1525,6 +1793,66 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
     }
     dprintf(STDERR_FILENO, "[WineProc] winsxs: %d/%zu x86 assemblies seeded, %d skipped\n",
             seeded, count, skipped);
+}
+
+/* hoi4-comctl-v6-x64: Common-Controls 6.0 for 64-bit (x64) processes.
+ *
+ * Hearts of Iron IV, 0.2.72 (Sentry GET-HELP-LOGS-1QD): the 64-bit Paradox
+ * launcher installer logged
+ *   fixme:actctx:parse_depend_manifests Could not find dependent assembly L"Microsoft.Windows.Common-Controls" (6.0.0.0)
+ *   err:commdlg:DllMain failed to create activation context, last error 14001
+ *   Error 0x80070583: Failed to create wixstdba main window.
+ * and quit with 1411 (0x583, ERROR_CLASS_DOES_NOT_EXIST): only x86 assemblies
+ * were seeded, so no x64 process ever had comctl32 v6 and its window classes.
+ *
+ * An x64 process runs the ARM64EC ntdll, whose actctx.c looks for "arm64_"
+ * for processorArchitecture="*" and for "amd64_"/"arm64_" ("a??") for "amd64",
+ * and does not compare the architecture inside the file. So one arm64_ entry
+ * linked to the ARM64EC farm's comctl32_v6.dll serves both. Skipped (with a
+ * log line) while arm64ec-windows has no comctl32_v6.dll, so this does nothing
+ * until the build ships that DLL. Native ARM64 processes see the same arm64_
+ * entry; env.MADEIRA_WINSXS_X64_COMCTL = 0 removes the entry and turns this off. */
+static void madeira_seed_winsxs_arm64_comctl(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL use_arm64ec)
+{
+    NSString *winsxs = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
+    NSString *manifests = [winsxs stringByAppendingPathComponent:@"manifests"];
+    NSString *dirName = @"arm64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef";
+    NSString *asmDir = [winsxs stringByAppendingPathComponent:dirName];
+    NSString *manifest = [manifests stringByAppendingPathComponent:[dirName stringByAppendingString:@".manifest"]];
+    NSString *src = [[bundle stringByAppendingPathComponent:@"arm64ec-windows"] stringByAppendingPathComponent:@"comctl32_v6.dll"];
+    NSString *link = [asmDir stringByAppendingPathComponent:@"comctl32.dll"];
+    const char *e = getenv("MADEIRA_WINSXS_X64_COMCTL");   /* 0: no Common-Controls 6.0 entry for 64-bit processes (before hoi4-comctl-v6-x64) */
+
+    /* The links name the bundle path, which changes on reinstall: always rebuild. */
+    [fm removeItemAtPath:manifest error:nil];
+    [fm removeItemAtPath:link error:nil];
+    if (!use_arm64ec) return;   /* a native ARM64 target: leave no entry from an earlier x64 session */
+    if (e && e[0] == '0')
+    {
+        dprintf(STDERR_FILENO, "[WineProc] winsxs: MADEIRA_WINSXS_X64_COMCTL=0, no 64-bit Common-Controls 6.0\n");
+        return;
+    }
+    if (![fm fileExistsAtPath:src])
+    {
+        dprintf(STDERR_FILENO, "[WineProc] winsxs: 64-bit Common-Controls 6.0 skipped, arm64ec-windows has no comctl32_v6.dll\n");
+        return;
+    }
+    [fm createDirectoryAtPath:manifests withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *text = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        @"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+        @"  <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.2600.2982\" "
+        @"processorArchitecture=\"arm64\" publicKeyToken=\"6595b64144ccf1df\"/>\n"
+        @"  <file name=\"comctl32.dll\">\n%s  </file>\n</assembly>\n", madeira_comctl32_v6_body];
+    if (![fm createSymbolicLinkAtPath:link withDestinationPath:src error:nil] ||
+        ![[text dataUsingEncoding:NSUTF8StringEncoding] writeToFile:manifest atomically:YES])
+    {
+        [fm removeItemAtPath:manifest error:nil];
+        dprintf(STDERR_FILENO, "[WineProc] winsxs: 64-bit Common-Controls 6.0 FAILED\n");
+        return;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] winsxs: 64-bit Common-Controls 6.0 seeded (arm64_, ARM64EC comctl32_v6)\n");
 }
 
 /* FEX's WOW64 module cannot call sysctl, and without an answer it assumes the
@@ -2042,7 +2370,23 @@ static void *wine_process_thread(void *arg) {
                 NSString *text = nil;
                 if (madeira_cfg_present()) {
                     NSMutableString *acc = [NSMutableString string];
-                    NSString *cfg = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@MADEIRA_CFG_FILE] encoding:NSUTF8StringEncoding error:nil];
+                    /* [cfg-lossy-env] (from upstream Madeira PR 629, spenstars1): a byte that is
+                     * not UTF-8 (a comment saved as Windows-1252) made the whole file nil, so no
+                     * env line was exported though madeira_cfg.h (byte based) applied the rest.
+                     * Such a file is now read as Latin 1; env values are ASCII, so they come out
+                     * the same. Off: env.MADEIRA_CFG_LOSSY_ENV = 0 (read by the byte reader, so
+                     * it works on the very file it guards). */
+                    NSData *cfgData = [NSData dataWithContentsOfFile:[docs stringByAppendingPathComponent:@MADEIRA_CFG_FILE]];
+                    NSString *cfg = cfgData ? [[NSString alloc] initWithData:cfgData encoding:NSUTF8StringEncoding] : nil;
+                    if (!cfg && cfgData) {
+                        char lossyOff[16];
+                        if (madeira_cfg_get("env.MADEIRA_CFG_LOSSY_ENV", lossyOff, sizeof lossyOff) && madeira_cfg_off_word(lossyOff)) {
+                            fprintf(stderr, "[cfg-lossy-env] madeira.cfg is not UTF-8; off switch set, env lines not exported\n");
+                        } else {
+                            cfg = [[NSString alloc] initWithData:cfgData encoding:NSISOLatin1StringEncoding];
+                            fprintf(stderr, "[cfg-lossy-env] madeira.cfg is not UTF-8; read as Latin 1 so its env lines still apply\n");
+                        }
+                    }
                     for (NSString *raw in [cfg componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
                         NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                         NSRange eq = [line rangeOfString:@"="];
@@ -2376,7 +2720,20 @@ static void *wine_process_thread(void *arg) {
 
             NSArray *dlls = [fm contentsOfDirectoryAtPath:dllSource error:nil];
             int linked = 0;
+            // BeamNG.drive's native ARM64 exe imports d3dcompiler_47.dll; the aarch64 farm had none, so
+            // system32 kept an arm64ec link and the load failed c000007b. The aarch64 copy is linked only for a
+            // native ARM64 target (not WoW64 i386 ones). env.MADEIRA_AARCH64_D3DCOMPILER = 0 (or off/no) leaves
+            // it out and clears the system32 link so the cross-link pass below relinks the arm64ec file (old behaviour).
+            const BOOL skip_aa64_d3dc = !use_arm64ec &&
+                (is_i386_target || madeira_cfg_off_word(getenv("MADEIRA_AARCH64_D3DCOMPILER")));
             for (NSString *dll in dlls) {
+                if (skip_aa64_d3dc && [dll caseInsensitiveCompare:@"d3dcompiler_47.dll"] == NSOrderedSame) {
+                    // only our own symlink: a real file there (an installer's or a redist's) stays
+                    NSString *oldLink = [sys32Dir stringByAppendingPathComponent:dll];
+                    if ([[[fm attributesOfItemAtPath:oldLink error:nil] fileType] isEqualToString:NSFileTypeSymbolicLink])
+                        [fm removeItemAtPath:oldLink error:nil];
+                    continue;
+                }
                 NSString *src = [dllSource stringByAppendingPathComponent:dll];
                 NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
                 // Remove stale symlinks and re-create (bundle path changes on reinstall)
@@ -2468,6 +2825,8 @@ static void *wine_process_thread(void *arg) {
                 madeira_overlay_vcruntime32(fm, prefix);   /* VCRedist.swift's Microsoft x86 runtime */
                 madeira_overlay_xaudio2(fm, prefix, YES);   /* VCRedist.swift's XAudio2 2.7 */
             }
+            madeira_seed_winsxs_arm64_comctl(fm, prefix, bundlePath, use_arm64ec);   /* hoi4-comctl-v6-x64 */
+            madeira_overlay_openal(fm, prefix, bundlePath, has_i386_set, use_arm64ec);   /* OpenAL Soft, only where the prefix has none */
             madeira_ensure_wine_inf_dirs(fm, prefix, has_i386_set);
             madeira_link_wine_mono(fm, prefix, bundlePath);
             madeira_link_wine_gecko(fm, prefix);
@@ -2836,6 +3195,8 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        madeira_bepinex_auto(g_prefix_path, madeira_exe);   /* [bepinex-auto] winhttp=n,b for a BepInEx folder */
+
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();
         wine_ios_exit_initialized = 1;
@@ -2913,6 +3274,8 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        madeira_bepinex_restore();             /* [bepinex-auto] WINEDLLOVERRIDES as it was before this launch */
+        unsetenv("MADEIRA_BEPINEX_AUTO");      /* a game's own off line must not reach the next game */
         unsetenv("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
         unsetenv("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game

@@ -637,10 +637,8 @@ static BOOL ios_defer_section_abort(void)
  *
  * Send a request to the server.
  */
-static unsigned int send_request( const struct __server_request_info *req )
+static unsigned int send_request( int request_fd, const struct __server_request_info *req )
 {
-    int request_fd = ntdll_get_thread_data()->request_fd;
-
     if (!req->u.req.request_header.request_size)
     {
         data_size_t to_write = sizeof(req->u.req);
@@ -716,7 +714,7 @@ static BOOL read_reply_data( void *buffer, size_t size )
 
     for (;;)
     {
-        if ((ret = read( ntdll_get_thread_data()->reply_fd, buffer, size )) > 0)
+        if ((ret = read( get_thread_data()->reply_fd, buffer, size )) > 0)
         {
             if (!(size -= ret)) return TRUE;
             buffer = (char *)buffer + ret;
@@ -727,7 +725,7 @@ static BOOL read_reply_data( void *buffer, size_t size )
         if (errno == EPIPE) break;
 #ifdef WINE_IOS
         {
-            int bad_fd = ntdll_get_thread_data()->reply_fd;
+            int bad_fd = get_thread_data()->reply_fd;
             void *teb = NtCurrentTeb();
             uint64_t x18_val;
             __asm__ volatile("mov %0, x18" : "=r"(x18_val));
@@ -739,7 +737,7 @@ static BOOL read_reply_data( void *buffer, size_t size )
     }
 #ifdef WINE_IOS
     /* EOF flavor: the server-side write end of our reply pipe vanished */
-    ios_fdt_autopsy( "reply-read-eof", ntdll_get_thread_data()->reply_fd, ret, errno );
+    ios_fdt_autopsy( "reply-read-eof", get_thread_data()->reply_fd, ret, errno );
     if (ios_defer_section_abort()) return FALSE;
 #endif
     /* the server closed the connection; time to die... */
@@ -872,7 +870,7 @@ static BOOL ios_read_reply_guest( void *buffer, size_t size, int req, BOOL *faul
     }
     while (size)
     {
-        if ((ret = read( ntdll_get_thread_data()->reply_fd, (void *)dst, size )) > 0)
+        if ((ret = read( get_thread_data()->reply_fd, (void *)dst, size )) > 0)
         {
             dst += ret;
             size -= ret;
@@ -979,14 +977,6 @@ static uint64_t ios_ts_teb(pthread_t pt)
     ios_ts_read((uint64_t)(uintptr_t)pt + ios_ts_tsd_off + (uint64_t)ios_teb_tls_key * 8, &v, 8);
     return (v & 0xfff) ? 0 : v;
 }
-/* madeira hang-ring: the TEB of any thread of this task, for the [thread-stacks]
- * block-ring dump (signal_arm64_ios.c). A thread parked in a server call has x18 = 0
- * in its Mach state and its pthread is NOT its TEB, so the TSD slot is the only way. */
-uint64_t ios_ts_teb_export( void *pt )
-{
-    if (ios_ts_tsd_off < 0) ios_ts_calibrate();
-    return ios_ts_teb( (pthread_t)pt );
-}
 
 static struct ios_ts_map *ios_ts_map_for_teb(uint64_t teb)
 {
@@ -1036,6 +1026,116 @@ static int ios_ts_sym(uint64_t a, char *out, size_t cap)
     return 1;
 }
 
+/* madeira bnet-wowstack: WHERE A 32-BIT THREAD WAITS.
+ *
+ * Battle.net is a WoW64 (32-bit) CEF program. Its logo and page freezes
+ * (BattleNet Test 9/10 logs, iPad, 2026-11-15) leave CrBrowserMain and the
+ * renderer threads parked in system calls, where the sampler printed
+ * "NATIVE (no FEX state) sp-cand=[ ]": the native stack holds no 64-bit module
+ * addresses and the module map is the 64-bit PEB's only. This adds, for such
+ * a thread, the 32-bit view:
+ *   - the 32-bit TEB at teb + WowTebOffset (teb+0x180c, host), and the
+ *     window base B = teb32 - teb32->Tib.Self (32-bit pointers are guest
+ *     values, host = B + guest);
+ *   - the 32-bit module list from PEB32 (teb32+0x30) -> Ldr (+0x0c) ->
+ *     InLoadOrderModuleList (+0x0c), LDR_DATA_TABLE_ENTRY32 DllBase +0x18,
+ *     SizeOfImage +0x20, BaseDllName +0x2c (Length) / +0x30 (Buffer);
+ *   - Eip/Esp/Ebp from the WoW64 CPU area (TlsSlots[WOW64_TLS_CPURESERVED],
+ *     teb+0x1488; WOW64_CPURESERVED is 4 bytes, the I386_CONTEXT follows at
+ *     +4: Ebp +0xb4, Eip +0xb8, Esp +0xc4). The FEX WOW64 module flushes the
+ *     JIT state into that area before every syscall exit
+ *     (tests/host/check-wow-cpu-area.py), so it is current while the thread
+ *     waits. When Esp is outside [StackLimit, StackBase) the scan starts at
+ *     StackLimit instead and the line says esp=stale;
+ *   - up to 16 return-address candidates from the 32-bit stack (8 KB from
+ *     Esp), as module+offset. Candidates, not a walk: a value that points
+ *     into a module's code is printed whether or not it is a live frame.
+ * Log only. Every read is ios_ts_read (vm_read_overwrite: fails instead of
+ * faulting), bounded buffers, capped loops, on the sampler thread after the
+ * target thread was resumed. MADEIRA_WOW_STACK=0 turns it off. */
+struct ios_ts_map32 { uint64_t peb32; uint64_t wbase; int n; struct ios_ts_mod m[160]; };
+static struct ios_ts_map32 ios_ts_maps32[12];
+static int ios_ts_nmaps32;
+static int ios_ts_wow_off = -1;
+
+static struct ios_ts_map32 *ios_ts_map32_for(uint64_t wbase, uint32_t peb32g)
+{
+    uint64_t peb32 = wbase + peb32g, head, cur; uint32_t ldr = 0, g = 0; int i, guard = 0; struct ios_ts_map32 *mp;
+    if (!peb32g) return NULL;
+    for (i = 0; i < ios_ts_nmaps32; i++) if (ios_ts_maps32[i].peb32 == peb32) return &ios_ts_maps32[i];
+    if (ios_ts_nmaps32 >= 12 || !ios_ts_read(peb32 + 0x0c, &ldr, 4) || !ldr) return NULL;
+    mp = &ios_ts_maps32[ios_ts_nmaps32]; memset(mp, 0, sizeof(*mp)); mp->peb32 = peb32; mp->wbase = wbase;
+    head = wbase + ldr + 0x0c;
+    if (!ios_ts_read(head, &g, 4) || !g) return NULL;
+    cur = wbase + g;
+    while (cur != head && guard++ < 200 && mp->n < 160) {
+        uint32_t base = 0, size = 0, buf = 0, next = 0; uint16_t len = 0, w[40]; int k;
+        if (!ios_ts_read(cur + 0x18, &base, 4) || !ios_ts_read(cur + 0x20, &size, 4) ||
+            !ios_ts_read(cur + 0x2c, &len, 2) || !ios_ts_read(cur + 0x30, &buf, 4)) break;
+        if (base && size) {
+            struct ios_ts_mod *m = &mp->m[mp->n++];
+            m->base = base; m->size = size;       /* guest values */
+            len /= 2; if (len > 39) len = 39;
+            if (len && buf && ios_ts_read(wbase + buf, w, len * 2)) { for (k = 0; k < len; k++) m->name[k] = w[k] < 128 ? (char)w[k] : '?'; m->name[len] = 0; }
+            else strcpy(m->name, "?");
+        }
+        if (!ios_ts_read(cur, &next, 4) || !next) break;
+        cur = wbase + next;
+    }
+    ios_ts_nmaps32++;
+    wine_log_write("[wow-stack-cand] modmap32 peb32=0x%x base=0x%llx modules=%d first=%s@0x%llx", peb32g, (unsigned long long)wbase, mp->n,
+                   mp->n ? mp->m[0].name : "-", (unsigned long long)(mp->n ? mp->m[0].base : 0));
+    return mp;
+}
+
+static const char *ios_ts_mod32_for(struct ios_ts_map32 *mp, uint64_t va, uint64_t *rva)
+{
+    int i;
+    if (!mp) return NULL;
+    for (i = 0; i < mp->n; i++)
+        if (va >= mp->m[i].base && va < mp->m[i].base + mp->m[i].size) { *rva = va - mp->m[i].base; return mp->m[i].name; }
+    return NULL;
+}
+
+/* Appends " WOW ... ]" to out; returns the characters added (0 when the
+ * thread is not a 32-bit one or the feature is off). */
+static int ios_ts_wow_stack(uint64_t teb, char *out, size_t cap)
+{
+    static uint32_t stk[2048];               /* 8 KB; the sampler is one thread */
+    int32_t off = 0; uint32_t self32 = 0, sbase = 0, slimit = 0, peb32g = 0, esp = 0, eip = 0, ebp = 0, start;
+    uint64_t teb32, wbase, cpu = 0, rva; uint16_t mach = 0; struct ios_ts_map32 *mp;
+    const char *mn, *esp_note = ""; unsigned i, shown, words; int n = 0;
+    if (ios_ts_wow_off < 0) { const char *e = getenv("MADEIRA_WOW_STACK"); ios_ts_wow_off = e && e[0] == '0'; }
+    if (ios_ts_wow_off || !teb || cap < 200) return 0;
+    if (!ios_ts_read(teb + 0x180c, &off, 4) || off <= 0 || off > 0x4000000) return 0;
+    teb32 = teb + (uint32_t)off;
+    if (!ios_ts_read(teb32 + 0x18, &self32, 4) || !self32 || !ios_ts_read(teb32 + 0x04, &sbase, 4) ||
+        !ios_ts_read(teb32 + 0x08, &slimit, 4) || !ios_ts_read(teb32 + 0x30, &peb32g, 4)) return 0;
+    if (teb32 < self32) return 0;
+    wbase = teb32 - self32;
+    if (wbase & 0xffff) return 0;
+    if (ios_ts_read(teb + 0x1488, &cpu, 8) && cpu > 0x10000 && ios_ts_read(cpu + 2, &mach, 2) && mach == 0x14c) {
+        ios_ts_read(cpu + 4 + 0xc4, &esp, 4); ios_ts_read(cpu + 4 + 0xb8, &eip, 4); ios_ts_read(cpu + 4 + 0xb4, &ebp, 4);
+    }
+    mp = ios_ts_map32_for(wbase, peb32g);
+    n += snprintf(out + n, cap - n, " WOW eip=");
+    if ((mn = ios_ts_mod32_for(mp, eip, &rva))) n += snprintf(out + n, cap - n, "%s+0x%llx", mn, (unsigned long long)rva);
+    else n += snprintf(out + n, cap - n, "0x%x", eip);
+    if (esp >= slimit && esp < sbase && !(esp & 3)) start = esp;
+    else { start = slimit; esp_note = " esp=stale"; }
+    n += snprintf(out + n, cap - n, " esp=0x%x ebp=0x%x stk=[0x%x,0x%x)%s wstack-cand=[", esp, ebp, slimit, sbase, esp_note);
+    words = sbase > start ? (sbase - start) / 4 : 0;
+    if (words > 2048) words = 2048;
+    while (words && !ios_ts_read(wbase + start, stk, words * 4)) words /= 2;   /* a short tail can still be read */
+    for (i = 0, shown = 0; i < words && shown < 16 && n < (int)cap - 60; i++) {
+        mn = ios_ts_mod32_for(mp, stk[i], &rva);
+        if (!mn || rva < 0x1000) continue;
+        n += snprintf(out + n, cap - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
+    }
+    n += snprintf(out + n, cap - n, " ]");
+    return n;
+}
+
 static void ios_thread_sampler_pass(int burst)
 {
     extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
@@ -1043,7 +1143,10 @@ static void ios_thread_sampler_pass(int burst)
     thread_act_array_t tlist; mach_msg_type_number_t tcount; unsigned k, printed = 0;
     if (task_threads(mach_task_self(), &tlist, &tcount) != KERN_SUCCESS) return;
     ios_ts_nmaps = 0;                                   /* fresh maps every pass */
-    for (k = 0; k < tcount && printed < 64; k++) {
+    ios_ts_nmaps32 = 0;                                 /* bnet-wowstack: 32-bit maps too */
+    static unsigned ts_max;                             /* bnet-wowstack-cap: 64 hid every Battle.net child process */
+    if (!ts_max) { const char *e = getenv("MADEIRA_TS_MAX_THREADS"); ts_max = e && atoi(e) > 0 ? (unsigned)atoi(e) : 256; }
+    for (k = 0; k < tcount && printed < ts_max; k++) {
         thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
         arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
         char tname[40] = ""; pthread_t pt; int running, is_game;
@@ -1070,7 +1173,7 @@ static void ios_thread_sampler_pass(int burst)
         thread_resume(tlist[k]);
         if (have_bb) rip = ios_native_rip_from_hostpc(bb, pc, &why);
         {
-            char line[1400], s1[120], s2[120]; int n; unsigned i, shown; uint64_t rva; const char *mn;
+            char line[2200], s1[120], s2[120]; int n; unsigned i, shown; uint64_t rva; const char *mn;
             struct ios_ts_map *mp = ios_ts_map_for_teb(x18);
             ios_ts_sym(pc, s1, sizeof(s1)); ios_ts_sym(lr, s2, sizeof(s2));
             n = snprintf(line, sizeof(line), "[thread-sample] ml876 b%d \"%s\" teb=0x%llx cpu=%d%% %s pc=%s lr=%s sp=0x%llx",
@@ -1078,6 +1181,13 @@ static void ios_thread_sampler_pass(int burst)
                          s1, s2, (unsigned long long)sp);
             if (rip) {
                 mn = ios_ts_mod_for(mp, rip, &rva);
+                if (!mn && rip < 0x100000000ULL) {      /* bnet-wowstack: 32-bit guest code */
+                    int32_t wo = 0; uint32_t self32 = 0, peb32g = 0; uint64_t t32;
+                    if (ios_ts_wow_off <= 0 && x18 && ios_ts_read(x18 + 0x180c, &wo, 4) && wo > 0 && wo <= 0x4000000 &&
+                        ios_ts_read((t32 = x18 + (uint32_t)wo) + 0x18, &self32, 4) && self32 && t32 >= self32 &&
+                        !((t32 - self32) & 0xffff) && ios_ts_read(t32 + 0x30, &peb32g, 4))
+                        mn = ios_ts_mod32_for(ios_ts_map32_for(t32 - self32, peb32g), rip, &rva);
+                }
                 n += snprintf(line + n, sizeof(line) - n, " GUEST rip=0x%llx", (unsigned long long)rip);
                 if (mn) n += snprintf(line + n, sizeof(line) - n, "(%s+0x%llx)", mn, (unsigned long long)rva);
                 n += snprintf(line + n, sizeof(line) - n, " callret=[");
@@ -1102,13 +1212,339 @@ static void ios_thread_sampler_pass(int burst)
                     n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
                 }
                 n += snprintf(line + n, sizeof(line) - n, " ]");
+                n += ios_ts_wow_stack(x18, line + n, sizeof(line) - n);   /* bnet-wowstack */
             }
             wine_log_write("%s", line);
             printed++;
+            /* iOS-Madeira bo3-ring-sample (Nov 21 2026): Black Ops III's main thread spends 12+ minutes
+             * at 100% CPU inside its anti-tamper code with no crash, so the fatal-only [block-ring] dump
+             * never fires. env.MADEIRA_BLOCK_RING_SAMPLE = <seconds> (default unset = off; needs
+             * env.MADEIRA_BLOCK_RING = 1) dumps the last 1536 block entries of a RUNNING thread with a
+             * guest RIP, once that many seconds have passed since the first such sample (first burst ~20 s),
+             * at most twice per process, so the loop it is in can be read. Log-only: it reads the ring
+             * with checked reads and changes nothing. */
+            if (running && rip && x18 && bi.cpu_usage / 10 >= 90) {   /* the busy thread (BO3: its spinning main thread) */
+                static int rs_secs = -2, rs_done;
+                static time_t rs_t0;
+                if (rs_secs == -2) {
+                    const char *e = getenv("MADEIRA_BLOCK_RING_SAMPLE");
+                    rs_secs = (e && *e >= '0' && *e <= '9') ? atoi(e) : -1;
+                    rs_t0 = time(NULL);
+                }
+                if (rs_secs >= 0 && rs_done < 2 && time(NULL) - rs_t0 >= (time_t)rs_secs * (rs_done + 1)) {   /* dump 2 at 2N */
+                    extern void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why );
+                    rs_done++;
+                    wine_log_write("[ring-sample] dump %d of 2: teb=0x%llx guest rip=0x%llx (MADEIRA_BLOCK_RING_SAMPLE=%d)",
+                                   rs_done, (unsigned long long)x18, (unsigned long long)rip, rs_secs);
+                    ios_block_ring_dump((uintptr_t)x18, 1536, "sample");
+                }
+            }
         }
     }
     for (k = 0; k < tcount; k++) mach_port_deallocate(mach_task_self(), tlist[k]);
     vm_deallocate(mach_task_self(), (vm_address_t)tlist, tcount * sizeof(*tlist));
+}
+
+/* iOS-Madeira bo3-ring-follow (Nov 23 2026), LOG ONLY.
+ * Black Ops III's check thread reads blackops3.exe (106 MB, one NtReadFile), runs ~10-15 s on one
+ * core with no syscalls, then quits itself. The ring at the quit holds only the quit routine, so
+ * the compare itself is lost. When MADEIRA_RING_FOLLOW = <count> (unset/0 = off; needs
+ * MADEIRA_BLOCK_RING = 1), the FIRST thread to finish a single read of at least
+ * MADEIRA_RING_FOLLOW_MB (default 32) MB from a file ending in ".exe" is followed by a helper
+ * pthread: every MADEIRA_RING_FOLLOW_MS (default 500) ms it suspends that thread, copies its block
+ * ring (MADEIRA_RING_FOLLOW_N entries, default 1024), guest rip, guest rsp and 1 KB of stack,
+ * resumes it at once (the copy takes microseconds, the formatting is done after resume), then logs
+ * them as [ring-follow] lines. Stops after <count> snapshots or when the thread is gone.
+ * Checked reads throughout; it writes nothing in the game. */
+static struct {
+    volatile int armed;            /* 0 = not yet, 1 = following (only one thread per process) */
+    mach_port_t port;              /* the followed thread (send right we own) */
+    uint64_t teb;
+    struct timespec t0;
+    int count, every_ms; unsigned n;
+} ios_rf;
+
+static void ios_rf_log_hex( const char *tag, uint64_t base, const unsigned char *b, unsigned len )
+{
+    unsigned o, i; char hx[32 * 2 + 1];
+    for (o = 0; o < len; o += 32)
+    {
+        for (i = 0; i < 32 && o + i < len; i++) snprintf( hx + i * 2, 3, "%02x", b[o + i] );
+        hx[i * 2] = 0;
+        dprintf( 2, "[ring-follow] %s %llx: %s\n", tag, (unsigned long long)(base + o), hx );
+    }
+}
+
+/* ring-follow-3: log what guest registers and stack qwords point to (needles, strings), once per
+ * address while its first 96 bytes do not change. Checked reads, after the thread is resumed. */
+static void ios_rf_deref( int k, const char *tag, uint64_t v )
+{
+    static struct { uint64_t a, h; } seen[512];
+    static unsigned nseen;
+    unsigned char b[96]; unsigned i; uint64_t h = 1469598103934665603ULL;
+    if (v < 0x10000 || v >= 0x800000000000ULL) return;
+    if (!ios_ts_read( v, b, sizeof(b) )) return;
+    for (i = 0; i < sizeof(b); i++) h = (h ^ b[i]) * 1099511628211ULL;
+    for (i = 0; i < nseen; i++) if (seen[i].a == v) { if (seen[i].h == h) return; seen[i].h = h; goto emit; }
+    if (nseen < 512) { seen[nseen].a = v; seen[nseen].h = h; nseen++; }
+emit:
+    dprintf( 2, "[ring-follow] #%d deref %s=%llx\n", k, tag, (unsigned long long)v );
+    ios_rf_log_hex( "deref", v, b, sizeof(b) );
+}
+
+/* ring-follow-4: bigger dumps of the tables the check reads. Once per address (first call wins). Checked reads. */
+static int ios_rf_big( int k, const char *tag, uint64_t v, unsigned len )   /* 1 = dumped now (ring-follow-4-2) */
+{
+    static uint64_t done[64];
+    static unsigned ndone;
+    unsigned char b[1024]; unsigned i;
+    if (len > sizeof(b) || v < 0x10000 || v >= 0x800000000000ULL) return 0;
+    for (i = 0; i < ndone; i++) if (done[i] == v) return 0;
+    if (ndone >= 64) return 0;
+    if (!ios_ts_read( v, b, len )) return 0;
+    done[ndone++] = v;
+    dprintf( 2, "[ring-follow] #%d big %s=%llx len=%u\n", k, tag, (unsigned long long)v, len );
+    ios_rf_log_hex( "big", v, b, len );
+    return 1;
+}
+
+/* search-stop (ring-follow-5): between snapshots, poll the followed thread's registers every
+ * MADEIRA_RING_FOLLOW_STOP_US (default 1000, min 200) us. While it is inside one of the file
+ * searches (r10 == r14 + r15 - r11, the end bound seen in ring-follow-2..4) remember the search
+ * (r11 = length, r9 low byte = first byte) and the furthest r8. When it leaves that search, log
+ * how far r8 got: a stop well before the end means a match (the search found its bytes), a stop
+ * at the end means not found. Only thread_suspend / thread_get_state / thread_resume between
+ * suspend and resume; logging after resume. Off: MADEIRA_RING_FOLLOW_STOP_OFF = 1. */
+static struct { int on; uint64_t len, first, base, size, end, r8max, r8min; unsigned polls, out; double t0; } ios_rf_ss;
+
+static double ios_rf_now( void )
+{
+    struct timespec t; clock_gettime( CLOCK_MONOTONIC, &t );
+    return (double)(t.tv_sec - ios_rf.t0.tv_sec) + (double)(t.tv_nsec - ios_rf.t0.tv_nsec) / 1e9;
+}
+
+static void ios_rf_ss_close( const char *why )
+{
+    if (!ios_rf_ss.on) return;
+    dprintf( 2, "[search-stop] end len=0x%llx first=0x%02llx base=%llx size=0x%llx furthest-r8-off=0x%llx first-seen-r8-off=0x%llx end-off=0x%llx left=0x%llx polls=%u t=+%.3f..+%.3fs (%s)%s\n",
+             (unsigned long long)ios_rf_ss.len, (unsigned long long)ios_rf_ss.first, (unsigned long long)ios_rf_ss.base,
+             (unsigned long long)ios_rf_ss.size, (unsigned long long)(ios_rf_ss.r8max - ios_rf_ss.base),
+             (unsigned long long)(ios_rf_ss.r8min - ios_rf_ss.base), (unsigned long long)(ios_rf_ss.end - ios_rf_ss.base),
+             (unsigned long long)(ios_rf_ss.end - ios_rf_ss.r8max), ios_rf_ss.polls, ios_rf_ss.t0, ios_rf_now(), why,
+             ios_rf_ss.end - ios_rf_ss.r8max < 0x200000 ? " = reached the end (likely NOT found)" : " = stopped early (likely FOUND, or the sample missed the end)" );
+    ios_rf_ss.on = 0;
+}
+
+static void ios_rf_wait( int ms )
+{
+    static int us = -1, off = -1;
+    double until;
+    if (off < 0) { const char *o = getenv( "MADEIRA_RING_FOLLOW_STOP_OFF" ), *u = getenv( "MADEIRA_RING_FOLLOW_STOP_US" );
+                   off = o && *o == '1'; us = u && atoi( u ) >= 200 ? atoi( u ) : 1000; if (us > 100000) us = 100000;
+                   dprintf( 2, "[search-stop] rev=search-stop-1 %s, poll every %d us\n", off ? "OFF (MADEIRA_RING_FOLLOW_STOP_OFF=1)" : "on", us ); }
+    if (off) { usleep( (useconds_t)ms * 1000 ); return; }
+    until = ios_rf_now() + ms / 1000.0;
+    while (ios_rf_now() < until)
+    {
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        int got;
+        usleep( (useconds_t)us );
+        if (thread_suspend( ios_rf.port ) != KERN_SUCCESS) { ios_rf_ss_close( "thread gone" ); return; }
+        got = thread_get_state( ios_rf.port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS;
+        thread_resume( ios_rf.port );
+        if (!got) continue;
+        {   /* EC map: x2=r8 x3=r9 x4=r10 x5=r11 x21=r14 x22=r15 */
+            uint64_t r8 = st.__x[2], r9 = st.__x[3], r10 = st.__x[4], r11 = st.__x[5], r14 = st.__x[21], r15 = st.__x[22];
+            int in = r11 && r11 < 0x1000 && r15 > 0x100000 && r15 < 0x40000000 && r10 == r14 + r15 - r11 && r8 >= r14 && r8 <= r10;
+            if (in && ios_rf_ss.on && (ios_rf_ss.len != r11 || ios_rf_ss.first != (r9 & 0xff) || ios_rf_ss.base != r14)) ios_rf_ss_close( "next search" );
+            if (in && !ios_rf_ss.on)
+            {
+                ios_rf_ss.on = 1; ios_rf_ss.len = r11; ios_rf_ss.first = r9 & 0xff; ios_rf_ss.base = r14; ios_rf_ss.size = r15;
+                ios_rf_ss.end = r10; ios_rf_ss.r8max = ios_rf_ss.r8min = r8; ios_rf_ss.polls = 0; ios_rf_ss.out = 0; ios_rf_ss.t0 = ios_rf_now();
+                dprintf( 2, "[search-stop] begin len=0x%llx first=0x%02llx base=%llx size=0x%llx first-seen-r8-off=0x%llx t=+%.3fs\n",
+                         (unsigned long long)r11, (unsigned long long)(r9 & 0xff), (unsigned long long)r14, (unsigned long long)r15,
+                         (unsigned long long)(r8 - r14), ios_rf_ss.t0 );
+            }
+            if (in) { ios_rf_ss.polls++; ios_rf_ss.out = 0; if (r8 > ios_rf_ss.r8max) ios_rf_ss.r8max = r8; }
+            else if (ios_rf_ss.on && ++ios_rf_ss.out >= 50) ios_rf_ss_close( "left the search for 50 polls" ); /* short exits (byte match, hash step) do not count */
+        }
+    }
+}
+
+static void *ios_rf_main( void *arg )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    enum { RING_N = 4096, STK = 1024 };
+    uint64_t *ents = malloc( RING_N * sizeof(uint64_t) );
+    unsigned char *stk = malloc( STK );
+    int k;
+    sigset_t all;
+    (void)arg;
+    sigfillset( &all );                               /* no TEB here: never take a process signal on this thread */
+    pthread_sigmask( SIG_BLOCK, &all, NULL );
+    if (!ents || !stk) { free( ents ); free( stk ); return NULL; }
+    for (k = 1; k <= ios_rf.count; k++)
+    {
+        thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        uint64_t ring = 0, idx = 0, bb = 0, pc, rsp, rip = 0;
+        int have_ring, have_stk, have_bb, have_m8, have_m10, ri;
+        unsigned char m8[64], m10[64];                /* ring-follow-2: bytes at guest r8 and just below guest r10 */
+        struct timespec now; double secs;
+        const char *why = "";
+        unsigned n, i, start;
+
+        ios_rf_wait( ios_rf.every_ms );                /* search-stop: polls between snapshots */
+        if (thread_info( ios_rf.port, THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) != KERN_SUCCESS)
+        {
+            dprintf( 2, "[ring-follow] #%d: the followed thread is gone; stopping\n", k );
+            break;
+        }
+        if (thread_suspend( ios_rf.port ) != KERN_SUCCESS) continue;
+        if (thread_get_state( ios_rf.port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+        {
+            thread_resume( ios_rf.port );
+            continue;
+        }
+        /* copy only, while suspended: a few reads, microseconds */
+        have_ring = ios_ts_read( ios_rf.teb + 0x1710, &ring, 8 ) && ring
+                    && ios_ts_read( ring, &idx, 8 ) && ios_ts_read( ring + 8, ents, RING_N * sizeof(uint64_t) );
+        rsp = st.__x[23];
+        have_stk = !(rsp & 7) && ios_ts_read( rsp, stk, STK );
+        have_bb = ios_ts_read( st.__x[28], &bb, 8 ) && bb > 0x10000;
+        have_m8 = ios_ts_read( st.__x[2], m8, sizeof(m8) );                       /* EC map: x2 = r8 */
+        have_m10 = st.__x[4] > 64 && ios_ts_read( st.__x[4] - 64, m10, sizeof(m10) ); /* x4 = r10 */
+        pc = arm_thread_state64_get_pc( st );
+        thread_resume( ios_rf.port );
+
+        if (have_bb) rip = ios_native_rip_from_hostpc( bb, pc, &why );
+        clock_gettime( CLOCK_MONOTONIC, &now );
+        secs = (double)(now.tv_sec - ios_rf.t0.tv_sec) + (now.tv_nsec - ios_rf.t0.tv_nsec) / 1e9;
+        dprintf( 2, "[ring-follow] #%d of %d t=+%.3fs after the read: cpu=%d%% %s guest rip=0x%llx rsp=0x%llx%s%s%s\n",
+                 k, ios_rf.count, secs, bi.cpu_usage / 10, bi.run_state == TH_STATE_RUNNING ? "RUN" : "wait",
+                 (unsigned long long)rip, (unsigned long long)rsp, rip ? "" : " (no guest rip: ", rip ? "" : why, rip ? "" : ")" );
+        /* ring-follow-2: host registers. ARM64EC map (FEX EC JIT, guest rsp in x23 as the sampler uses):
+         * x8=rax x0=rcx x1=rdx x27=rbx x29=rbp x25=rsi x26=rdi x2=r8 x3=r9 x4=r10 x5=r11 x19-x22=r12-r15 */
+        if (!rip) dprintf( 2, "[ring-follow] #%d note: not in translated guest code, the guest register names below may not hold\n", k );
+        dprintf( 2, "[ring-follow] #%d regs rax=%llx rcx=%llx rdx=%llx rbx=%llx rbp=%llx rsi=%llx rdi=%llx\n", k,
+                 (unsigned long long)st.__x[8], (unsigned long long)st.__x[0], (unsigned long long)st.__x[1],
+                 (unsigned long long)st.__x[27], (unsigned long long)arm_thread_state64_get_fp( st ), (unsigned long long)st.__x[25],
+                 (unsigned long long)st.__x[26] );
+        dprintf( 2, "[ring-follow] #%d regs r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n", k,
+                 (unsigned long long)st.__x[2], (unsigned long long)st.__x[3], (unsigned long long)st.__x[4],
+                 (unsigned long long)st.__x[5], (unsigned long long)st.__x[19], (unsigned long long)st.__x[20],
+                 (unsigned long long)st.__x[21], (unsigned long long)st.__x[22] );
+        dprintf( 2, "[ring-follow] #%d host x6=%llx x7=%llx x9=%llx x10=%llx x11=%llx x12=%llx x13=%llx x14=%llx x15=%llx x16=%llx x17=%llx x24=%llx x28=%llx\n", k,
+                 (unsigned long long)st.__x[6], (unsigned long long)st.__x[7], (unsigned long long)st.__x[9],
+                 (unsigned long long)st.__x[10], (unsigned long long)st.__x[11], (unsigned long long)st.__x[12],
+                 (unsigned long long)st.__x[13], (unsigned long long)st.__x[14], (unsigned long long)st.__x[15],
+                 (unsigned long long)st.__x[16], (unsigned long long)st.__x[17], (unsigned long long)st.__x[24],
+                 (unsigned long long)st.__x[28] );
+        if (have_m8) ios_rf_log_hex( "at-r8", st.__x[2], m8, sizeof(m8) );
+        if (have_m10) ios_rf_log_hex( "below-r10", st.__x[4] - 64, m10, sizeof(m10) );
+        for (ri = 0; ri < 2; ri++)
+        {   /* the regions r8 and r10 point into */
+            mach_vm_address_t a = ri ? st.__x[4] : st.__x[2];
+            const uint64_t want = (uint64_t)a;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t vi;
+            mach_msg_type_number_t vc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            if (want > 0x10000 && mach_vm_region( mach_task_self(), &a, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &vc, &ro ) == KERN_SUCCESS)
+                dprintf( 2, "[ring-follow] #%d %s=%llx region %llx+%llx prot=%d%s\n", k, ri ? "r10" : "r8",
+                         (unsigned long long)want, (unsigned long long)a, (unsigned long long)rs, vi.protection,
+                         a > want ? " (not mapped: next region shown)" : "" );
+        }
+        if (have_stk) ios_rf_log_hex( "stack", rsp, stk, STK );
+        /* ring-follow-3: pointees of the registers and of every stack qword (needle bytes, strings) */
+        if (!getenv( "MADEIRA_RING_FOLLOW_DEREF_OFF" ))
+        {
+            static const int rr[] = { 8, 0, 1, 27, 25, 26, 3, 5, 19, 20, 21, 22 }; /* rax rcx rdx rbx rsi rdi r9 r11 r12-r15 */
+            unsigned q; char nm[16]; uint64_t v; const char *boff = getenv( "MADEIRA_RING_FOLLOW_BIG_OFF" );
+            for (q = 0; q < sizeof(rr)/sizeof(rr[0]); q++) { snprintf( nm, sizeof(nm), "x%d", rr[q] ); ios_rf_deref( k, nm, st.__x[rr[q]] ); }
+            ios_rf_deref( k, "rbp", arm_thread_state64_get_fp( st ) );
+            if (!boff || boff[0] != '1')   /* ring-follow-4-2: only "1" turns it off ("0" left it off in -1) */
+            {   /* ring-follow-4: 1 KB at rsi (the table the 7 searches read), 256 B at stack qwords pointing into the exe image */
+                unsigned nb = 0;
+                ios_rf_big( k, "rsi", st.__x[25], 1024 );
+                if (have_stk) for (q = 0; q + 8 <= STK && nb < 8; q += 8)
+                {
+                    memcpy( &v, stk + q, 8 );
+                    if (v >= 0x140000000ULL && v < 0x160000000ULL) { snprintf( nm, sizeof(nm), "rsp+%x", q ); nb += ios_rf_big( k, nm, v, 256 ); }   /* ring-follow-4-2: count only new dumps */
+                }
+            }
+            if (have_stk) for (q = 0; q + 8 <= STK; q += 8)
+            {
+                memcpy( &v, stk + q, 8 ); snprintf( nm, sizeof(nm), "rsp+%x", q );
+                ios_rf_deref( k, nm, v );
+            }
+        }
+        if (!have_ring) { dprintf( 2, "[ring-follow] #%d: no ring on this thread (MADEIRA_BLOCK_RING unset?)\n", k ); continue; }
+
+        idx &= RING_N - 1;
+        n = RING_N;
+        while (n && !ents[(idx + RING_N - n) & (RING_N - 1)]) n--;
+        if (n > ios_rf.n) n = ios_rf.n;
+        start = (idx + RING_N - n) & (RING_N - 1);
+        dprintf( 2, "[ring-follow] #%d ring: last %u block entries, oldest first:\n", k, n );
+        for (i = 0; i < n; i++)
+        {
+            const uint64_t ent = ents[(start + i) & (RING_N - 1)];
+            const uint64_t brip = ent & 0xffffffffffffULL;
+            unsigned len = (unsigned)(ent >> 48), b;
+            unsigned char xb[96]; char hx[96 * 3 + 1] = "?";
+            if (!len || len > 96) len = len ? 96 : 16;
+            if (ios_ts_read( brip, xb, len ))   /* translated code bytes do not change; safe after resume */
+                for (b = 0; b < len; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+            dprintf( 2, "[block-ring] -%-4u %llx: %s\n", n - i, (unsigned long long)brip, hx );
+        }
+    }
+    ios_rf_ss_close( "follow ended" );
+    dprintf( 2, "[ring-follow] done\n" );
+    free( ents ); free( stk );
+    return NULL;
+}
+
+/* called from NtReadFile's done: choke point (file.c, WINE_IOS) on the reading thread */
+void ios_ring_follow_note( int unix_fd, unsigned int total )
+{
+    static int count = -1, mb, every_ms, n;           /* count is stored last (release) so the others are seen set */
+    extern pthread_key_t ios_teb_tls_key;
+    char path[1024];                                  /* MAXPATHLEN, what F_GETPATH needs */
+    size_t len;
+    pthread_t th;
+    pthread_attr_t at;
+
+    if (__atomic_load_n( &count, __ATOMIC_ACQUIRE ) < 0)
+    {
+        const char *e = getenv( "MADEIRA_RING_FOLLOW" ), *b = getenv( "MADEIRA_BLOCK_RING" );
+        const char *m = getenv( "MADEIRA_RING_FOLLOW_MB" ), *s = getenv( "MADEIRA_RING_FOLLOW_MS" ), *c = getenv( "MADEIRA_RING_FOLLOW_N" );
+        int v = e && *e >= '0' && *e <= '9' ? atoi( e ) : 0;
+        mb = m && atoi( m ) > 0 ? atoi( m ) : 32;
+        if (mb < 16) mb = 16;                         /* file.c only calls us for reads >= 16 MB */
+        if (mb > 4095) mb = 4095;                     /* mb << 20 must fit 32 bits */
+        every_ms = s && atoi( s ) >= 50 ? atoi( s ) : 500;
+        n = c && atoi( c ) > 0 && atoi( c ) <= 4096 ? atoi( c ) : 1024;
+        if (v > 1000) v = 1000;
+        __atomic_store_n( &count, (b && b[0] == '1') ? v : 0, __ATOMIC_RELEASE );
+    }
+    if (!count || total < ((unsigned int)mb << 20) || ios_rf.armed) return;
+    if (unix_fd < 0 || fcntl( unix_fd, F_GETPATH, path ) == -1) return;
+    len = strlen( path );
+    if (len < 4 || path[len - 4] != '.' || (path[len - 3] | 0x20) != 'e' || (path[len - 2] | 0x20) != 'x' || (path[len - 1] | 0x20) != 'e') return;
+    if (!__sync_bool_compare_and_swap( &ios_rf.armed, 0, 1 )) return;
+
+    ios_rf.port = mach_thread_self();                 /* our own send right, kept for the helper */
+    ios_rf.teb = (uint64_t)(uintptr_t)(ios_teb_tls_key ? pthread_getspecific( ios_teb_tls_key ) : NULL);
+    ios_rf.count = count; ios_rf.every_ms = every_ms; ios_rf.n = (unsigned)n;
+    clock_gettime( CLOCK_MONOTONIC, &ios_rf.t0 );
+    dprintf( 2, "[ring-follow] rev=ring-follow-5 (4-2 + search-stop) following tid port 0x%x teb=0x%llx after a %u-byte read of %s: %d snapshots every %d ms, %d entries each\n",
+             ios_rf.port, (unsigned long long)ios_rf.teb, total, path, count, every_ms, n );
+    if (!ios_rf.teb) { dprintf( 2, "[ring-follow] no TEB for this thread; off\n" ); return; }
+    pthread_attr_init( &at );
+    pthread_attr_setdetachstate( &at, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &th, &at, ios_rf_main, NULL )) dprintf( 2, "[ring-follow] could not start the helper thread; off\n" );
+    pthread_attr_destroy( &at );
 }
 
 /* madeira-bcd ml1112b: NAME what a hot IAT call calls.
@@ -1968,7 +2404,7 @@ static void ios_spin_capture( const char *wall, int look, double rate, double sh
         wine_log_write( "[spin] ml1140   RAX=0x%llx RCX=0x%llx RDX=0x%llx RBX=0x%llx RSP=0x%llx RBP=0x%llx RSI=0x%llx RDI=0x%llx"
                         " R8=0x%llx R9=0x%llx R10=0x%llx R11=0x%llx R12=0x%llx R13=0x%llx R14=0x%llx R15=0x%llx",
                         (unsigned long long)st.__x[8], (unsigned long long)st.__x[0], (unsigned long long)st.__x[1], (unsigned long long)st.__x[27],
-                        (unsigned long long)rsp, (unsigned long long)st.__fp, (unsigned long long)st.__x[25], (unsigned long long)st.__x[26],
+                        (unsigned long long)rsp, (unsigned long long)arm_thread_state64_get_fp( st ), (unsigned long long)st.__x[25], (unsigned long long)st.__x[26],
                         (unsigned long long)st.__x[2], (unsigned long long)st.__x[3], (unsigned long long)st.__x[4], (unsigned long long)st.__x[5],
                         (unsigned long long)st.__x[19], (unsigned long long)st.__x[20], (unsigned long long)st.__x[21], (unsigned long long)st.__x[22] );
         {   /* Madeira [spin]: is this spin tied to a compare-and-swap on an anonymous alias? (signal_arm64_ios.c ios_anon_cas_note) */
@@ -3776,6 +4212,14 @@ static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int 
 /***********************************************************************
  *           server_call_unlocked
  */
+/* [io-stuck] rev 3 (LOG ONLY): the server request each thread is inside right
+ * now, read by build/wineserver/fd_ios.c ios_dump_io_stuck to name the WRITER
+ * of a request left unread in a pipe (and whether it still waits for the
+ * reply). Indexed by Wine tid / 4; tid is stored last and cleared first. */
+struct ios_inflight_entry { volatile unsigned int tid; volatile int request_fd; volatile int req; volatile unsigned long long t0_ns; };
+#define IOS_INFLIGHT_SLOTS 4096
+struct ios_inflight_entry ios_srv_inflight[IOS_INFLIGHT_SLOTS];
+
 unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
@@ -3789,8 +4233,22 @@ unsigned int server_call_unlocked( void *req_ptr )
     if (__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_RELAXED ) > 0 && ios_srv_try_direct( req, &ret ))
         return ret;   /* madeira-bcd: MADEIRA_SRV_DIRECT */
 #endif
-    if ((ret = send_request( req ))) return ret;
-    /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
+    {
+        unsigned int itid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+        struct ios_inflight_entry *inf = (itid >> 2) < IOS_INFLIGHT_SLOTS ? &ios_srv_inflight[itid >> 2] : NULL;
+        if (inf)
+        {
+            inf->request_fd = get_thread_data()->request_fd;
+            inf->req = req->u.req.request_header.req;
+            inf->t0_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+            __atomic_store_n( &inf->tid, itid, __ATOMIC_RELEASE );
+        }
+        if ((ret = send_request( get_thread_data()->request_fd, req )))
+        {
+            if (inf) __atomic_store_n( &inf->tid, 0, __ATOMIC_RELEASE );
+            return ret;
+        }
+        /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
      * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
     {
@@ -3799,7 +4257,10 @@ unsigned int server_call_unlocked( void *req_ptr )
         extern void ios_wineserver_ring( unsigned int tid );
         ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
-    return wait_reply( req );
+        ret = wait_reply( req );
+        if (inf) __atomic_store_n( &inf->tid, 0, __ATOMIC_RELEASE );
+        return ret;
+    }
 }
 
 
@@ -3883,24 +4344,25 @@ void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  *
  * Wait for a reply on the waiting pipe of the current thread.
  */
-static int wait_select_reply( void *cookie )
+static int wait_select_reply( int wait_fd[2], void *cookie )
 {
     int signaled;
     struct wake_up_reply reply;
+
     for (;;)
     {
         int ret;
-        ret = read( ntdll_get_thread_data()->wait_fd[0], &reply, sizeof(reply) );
+        ret = read( wait_fd[0], &reply, sizeof(reply) );
         if (ret == sizeof(reply))
         {
             if (!reply.cookie) abort_thread( reply.signaled );  /* thread got killed */
             if (wine_server_get_ptr(reply.cookie) == cookie) return reply.signaled;
             /* we stole another reply, wait for the real one */
-            signaled = wait_select_reply( cookie );
+            signaled = wait_select_reply( wait_fd, cookie );
             /* and now put the wrong one back in the pipe */
             for (;;)
             {
-                ret = write( ntdll_get_thread_data()->wait_fd[1], &reply, sizeof(reply) );
+                ret = write( wait_fd[1], &reply, sizeof(reply) );
                 if (ret == sizeof(reply)) break;
                 if (ret >= 0) server_protocol_error( "partial wakeup write %d\n", ret );
                 if (errno == EINTR) continue;
@@ -3911,7 +4373,7 @@ static int wait_select_reply( void *cookie )
         if (ret >= 0)
         {
 #ifdef WINE_IOS
-            ios_fdt_autopsy( "wakeup-read", ntdll_get_thread_data()->wait_fd[0], ret, 0 );
+            ios_fdt_autopsy( "wakeup-read", get_thread_data()->wait_fd[0], ret, 0 );
 #endif
             server_protocol_error( "partial wakeup read %d\n", ret );
         }
@@ -3919,7 +4381,7 @@ static int wait_select_reply( void *cookie )
 #ifdef WINE_IOS
         {
             int saved_errno = errno;
-            ios_fdt_autopsy( "wakeup-read", ntdll_get_thread_data()->wait_fd[0], ret, saved_errno );
+            ios_fdt_autopsy( "wakeup-read", get_thread_data()->wait_fd[0], ret, saved_errno );
             errno = saved_errno;
         }
 #endif
@@ -4158,7 +4620,7 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         if ((ULONG_PTR)addr == call->virtual_flush.addr && size == call->virtual_flush.size)
         {
             result->virtual_flush.status = NtFlushVirtualMemory( NtCurrentProcess(),
-                                                                 (const void **)&addr, &size, 0 );
+                                                                 (const void **)&addr, &size, NULL );
             result->virtual_flush.addr = wine_server_client_ptr( addr );
             result->virtual_flush.size = size;
         }
@@ -4334,6 +4796,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
 #endif
     unsigned int ret;
     int cookie;
+    struct thread_data *data = get_thread_data();
     obj_handle_t apc_handle = 0;
     BOOL suspend_context = !!context;
     union apc_result result;
@@ -4387,7 +4850,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         pthread_sigmask( SIG_SETMASK, &old_set, NULL );
         if (signaled) break;
 
-        ret = wait_select_reply( &cookie );
+        ret = wait_select_reply( data->wait_fd, &cookie );
     }
     while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
 
@@ -4424,7 +4887,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
  * table, fixed slots, no allocation, no locks. A slot is only ever written
  * by its owning thread; the reader tolerates torn reads by re-checking seq.
  */
-#define IOS_WAITREG_SLOTS 512
+#define IOS_WAITREG_SLOTS 4096   /* bnet-waitreg-claim: was 512 (must match queue_ios.c) */
 struct ios_wait_entry
 {
     volatile unsigned int  seq;        /* even = idle, odd = in a wait  */
@@ -4440,13 +4903,50 @@ struct ios_wait_entry
 };
 struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
 
+/* bnet-waitreg-claim: ONE OWNER PER SLOT.
+ *
+ * The old slot was (teb >> 16) % 512. Every 32-bit pseudo-process lays its
+ * TEBs out at the same offsets inside its own 4 GB window (B + 0x300000 for
+ * the main thread, B + 0x2f0000 for the next...), so the same thread index in
+ * EVERY process landed in the SAME slot: Battle.net's CrBrowserMain, the
+ * renderer's CrRendererMain and both utility CrUtilityMain shared one entry.
+ * Each wait does seq++ on entry and on exit, so with two owners the even/odd
+ * "in a wait" bit is meaningless and the handles are whoever wrote last:
+ * bnettest13 log f13d88ec (logo freeze, 2026-11-15) never reported
+ * CrBrowserMain or any IO thread, and showed a renderer tile worker
+ * "waiting" on a Section and on unresolvable handles.
+ * Now a thread claims a free slot once (compare-and-swap on an owner table,
+ * linear probe of up to 64 slots from its hash) and keeps it in TLS; a new
+ * thread on a reused TEB takes over that TEB's slot. If 64 slots near its
+ * hash are all owned it falls back to the old shared slot. 4096 slots.
+ * MADEIRA_WAITREG_CLAIM=0 restores the old hashing. Log only: the table
+ * feeds [srv-stuck] and nothing else. */
+static void *volatile ios_wait_owner[IOS_WAITREG_SLOTS];
+static __thread struct ios_wait_entry *ios_wait_mine;
+static __thread void *ios_wait_mine_teb;
+static int ios_wait_claim = -1;
+
 static struct ios_wait_entry *ios_wait_slot(void)
 {
-    /* Stable per-thread slot: TEB pointer hashed. Collisions only cost
-     * fidelity of the report, never correctness — a colliding thread
-     * overwrites the entry and the stuck one is simply not reported. */
     uintptr_t t = (uintptr_t)NtCurrentTeb();
-    return &ios_wait_reg[(t >> 16) % IOS_WAITREG_SLOTS];
+    unsigned int h, i;
+    if (ios_wait_mine && ios_wait_mine_teb == (void *)t) return ios_wait_mine;
+    if (ios_wait_claim < 0) { const char *e = getenv( "MADEIRA_WAITREG_CLAIM" ); ios_wait_claim = !(e && e[0] == '0'); }
+    if (!ios_wait_claim) return &ios_wait_reg[(t >> 16) % IOS_WAITREG_SLOTS];
+    h = (unsigned int)((t >> 16) ^ ((t >> 32) * 0x9e37u));
+    for (i = 0; i < 64; i++)
+    {
+        unsigned int s = (h + i) % IOS_WAITREG_SLOTS;
+        void *o = ios_wait_owner[s];
+        if (o == (void *)t || (!o && __sync_bool_compare_and_swap( &ios_wait_owner[s], NULL, (void *)t )))
+        {
+            struct ios_wait_entry *e = &ios_wait_reg[s];
+            if (e->seq & 1) { e->seq++; __sync_synchronize(); }   /* a dead owner left it "in a wait" */
+            ios_wait_mine = e; ios_wait_mine_teb = (void *)t;
+            return e;
+        }
+    }
+    return &ios_wait_reg[h % IOS_WAITREG_SLOTS];   /* neighbourhood full: old shared behaviour */
 }
 
 static void ios_wait_enter( const union select_op *op, data_size_t size,
@@ -5347,22 +5847,22 @@ static const char *init_server_dir( dev_t dev, ino_t ino )
  */
 static int setup_config_dir(void)
 {
-    char *p;
+    char *p, *dir;
     struct stat st;
     int fd_cwd = open( ".", O_RDONLY );
 
     if (chdir( config_dir ) == -1)
     {
         if (errno != ENOENT) fatal_perror( "cannot use directory %s", config_dir );
-        if ((p = strrchr( config_dir, '/' )) && p != config_dir)
+        dir = strdup( config_dir );
+        if ((p = strrchr( dir, '/' )) && p != dir)
         {
-            while (p > config_dir + 1 && p[-1] == '/') p--;
+            while (p > dir + 1 && p[-1] == '/') p--;
             *p = 0;
-            if (!stat( config_dir, &st ) && st.st_uid != getuid())
-                fatal_error( "'%s' is not owned by you, refusing to create a configuration directory there\n",
-                             config_dir );
-            *p = '/';
+            if (!stat( dir, &st ) && st.st_uid != getuid())
+                fatal_error( "'%s' is not owned by you, refusing to create a configuration directory there\n", dir );
         }
+        free( dir );
         mkdir( config_dir, 0777 );
         if (chdir( config_dir ) == -1) fatal_perror( "chdir to %s", config_dir );
         MESSAGE( "wine: created the configuration directory '%s'\n", config_dir );
@@ -5530,6 +6030,8 @@ static int server_connect(void)
 #include <mach/mach.h>
 #include <mach/mach_error.h>
 #include <servers/bootstrap.h>
+
+extern NTSTATUS apple_spawn_main_thread(void);
 
 /* send our task port to the server */
 static void send_server_task_port(void)
@@ -5709,6 +6211,154 @@ static void ios_init_fault_disarm( void )
     sigaction( SIGBUS, &ios_init_old_bus, NULL );
     wine_log_write( "[init-fault] disarmed: the first process start got past init_first_thread" );
 }
+
+/* [init-hang] (LOG ONLY). 0.2.37 (Wine 11.22), Resident Evil Village: the first process sent
+ * init_first_thread ("[Wine init_process] reply_pipe=46, sending init_first_thread...") and
+ * nothing came back for 290 s, with no server line at all after it: not the "[srv-own]
+ * receive_fd" lines 11.4 prints at once for that request, not a protocol error, not a kill.
+ * So the in-process server either stopped running its loop or never saw the request. This
+ * watchdog runs only while the first process waits for that one answer. At 3, 9, 21, 45 and
+ * 93 s without an answer it logs how many loop passes the server has made and how long ago
+ * the last one was (fd_ios.c ios_srv_pass_*), the server thread's run state and suspend
+ * count, and its pc, lr and a frame-pointer walk of up to 16 frames (inside the server
+ * thread's own stack only) with image + symbol names. It reads and logs; it never touches
+ * the server thread. Off: env MADEIRA_INIT_HANG_DIAG = 0. */
+static volatile int ios_init_hang_state;   /* 1 while init_first_thread waits, 2 after */
+
+static void ios_init_hang_where( const char *what, unsigned long long addr )
+{
+    Dl_info di;
+    char buf[512];
+    int n;
+
+    if (!addr) return;
+    if (!dladdr( (void *)(uintptr_t)addr, &di ))
+        n = snprintf( buf, sizeof(buf), "[init-hang]   %s %#llx (no image)\n", what, addr );
+    else
+        n = snprintf( buf, sizeof(buf), "[init-hang]   %s %#llx = %s+%#llx (%s, image offset %#llx)\n", what, addr,
+                      di.dli_sname ? di.dli_sname : "?",
+                      di.dli_saddr ? addr - (unsigned long long)(uintptr_t)di.dli_saddr : 0ULL,
+                      di.dli_fname ? (strrchr( di.dli_fname, '/' ) ? strrchr( di.dli_fname, '/' ) + 1 : di.dli_fname) : "?",
+                      di.dli_fbase ? addr - (unsigned long long)(uintptr_t)di.dli_fbase : 0ULL );
+    if (n > 0) write( 2, buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1 );
+}
+
+static void *ios_init_hang_watch( void *arg )
+{
+    extern mach_port_t ios_srv_mach_thread;                                   /* fd_ios.c */
+    extern volatile unsigned long long ios_srv_pass_total, ios_srv_pass_ns;  /* fd_ios.c */
+    extern unsigned long long ios_srv_stack_lo, ios_srv_stack_hi;            /* fd_ios.c */
+    unsigned int waited = 0, i;
+    sigset_t all;
+
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, NULL );   /* no Wine signal handler runs on this thread */
+    pthread_setname_np( "madeira-init-hang" );
+
+    for (i = 0; i < 5; i++)
+    {
+        unsigned int step = 3u << i;   /* 3, 6, 12, 24, 48: logs at 3, 9, 21, 45, 93 s */
+        unsigned long long now, last, passes;
+        char buf[512];
+        int n;
+
+        sleep( step );
+        waited += step;
+        if (__atomic_load_n( &ios_init_hang_state, __ATOMIC_ACQUIRE ) != 1) return NULL;
+
+        now    = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+        last   = __atomic_load_n( &ios_srv_pass_ns, __ATOMIC_RELAXED );
+        passes = __atomic_load_n( &ios_srv_pass_total, __ATOMIC_RELAXED );
+        n = snprintf( buf, sizeof(buf), "[init-hang] init_first_thread unanswered after %u s: server loop passes=%llu, "
+                      "last pass %lld ms ago, srv-direct=%d (off: env.MADEIRA_INIT_HANG_DIAG = 0)\n", waited, passes,
+                      last ? (long long)((now - last) / 1000000ull) : -1LL,
+                      (int)__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_RELAXED ) );
+        if (n > 0) write( 2, buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1 );
+
+        if (ios_srv_mach_thread)
+        {
+            struct thread_basic_info bi;
+            mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+#ifdef __aarch64__
+            arm_thread_state64_t st;
+            mach_msg_type_number_t sn = ARM_THREAD_STATE64_COUNT;
+#endif
+            kern_return_t kr = thread_info( ios_srv_mach_thread, THREAD_BASIC_INFO, (thread_info_t)&bi, &bn );
+
+            if (kr == KERN_SUCCESS)
+                n = snprintf( buf, sizeof(buf), "[init-hang]   server thread run_state=%d (1 running, 2 stopped, 3 waiting) "
+                              "suspend_count=%d flags=%#x user=%d.%06ds\n", bi.run_state, bi.suspend_count, bi.flags,
+                              bi.user_time.seconds, bi.user_time.microseconds );
+            else
+                n = snprintf( buf, sizeof(buf), "[init-hang]   server thread info failed kr=%d (thread gone?)\n", kr );
+            if (n > 0) write( 2, buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1 );
+#ifdef __aarch64__
+            if (kr == KERN_SUCCESS &&
+                thread_get_state( ios_srv_mach_thread, ARM_THREAD_STATE64, (thread_state_t)&st, &sn ) == KERN_SUCCESS)
+            {
+                unsigned long long fp = (unsigned long long)arm_thread_state64_get_fp( st );
+
+                unsigned long long addr[18];
+                unsigned int na = 0, f;
+                char raw[512];
+                int rn, k;
+
+                addr[na++] = (unsigned long long)arm_thread_state64_get_pc( st );
+                addr[na++] = (unsigned long long)arm_thread_state64_get_lr( st );
+                /* frame records: [fp] = caller fp, [fp+8] = return address. Stay inside the
+                 * server thread's own stack, require each record to be above the last, and
+                 * read through the kernel so a thread that dies meanwhile gives an error,
+                 * not a fault on this all-signals-blocked thread. */
+                for (f = 0; f < 16; f++)
+                {
+                    unsigned long long rec[2];
+                    mach_vm_size_t got = 0;
+
+                    if ((fp & 15) || fp < ios_srv_stack_lo || fp + 16 > ios_srv_stack_hi) break;
+                    if (mach_vm_read_overwrite( mach_task_self(), fp, sizeof(rec), (mach_vm_address_t)(uintptr_t)rec,
+                                                &got ) != KERN_SUCCESS || got != sizeof(rec)) break;
+                    addr[na++] = rec[1] & 0x0000ffffffffffffull;
+                    if (rec[0] <= fp) break;
+                    fp = rec[0];
+                }
+                /* raw addresses first: dladdr takes dyld's lock, which the server thread may hold */
+                rn = snprintf( raw, sizeof(raw), "[init-hang]   pc lr frames:" );
+                for (k = 0; k < (int)na && rn > 0 && rn < (int)sizeof(raw) - 20; k++)
+                    rn += snprintf( raw + rn, sizeof(raw) - rn, " %#llx", addr[k] );
+                if (rn > 0 && rn < (int)sizeof(raw) - 1) raw[rn++] = '\n';
+                if (rn > 0) write( 2, raw, rn < (int)sizeof(raw) ? rn : (int)sizeof(raw) - 1 );
+                for (k = 0; k < (int)na; k++)
+                {
+                    char what[16];
+                    snprintf( what, sizeof(what), k == 0 ? "pc" : k == 1 ? "lr" : "frame %d", k - 2 );
+                    ios_init_hang_where( what, addr[k] );
+                }
+            }
+#endif
+        }
+    }
+    return NULL;
+}
+
+static void ios_init_hang_start( void )
+{
+    const char *e = getenv( "MADEIRA_INIT_HANG_DIAG" );
+    pthread_attr_t attr;
+    pthread_t th;
+
+    if (e && e[0] == '0' && !e[1]) return;
+    __atomic_store_n( &ios_init_hang_state, 1, __ATOMIC_RELEASE );
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &th, &attr, ios_init_hang_watch, NULL ))
+        __atomic_store_n( &ios_init_hang_state, 0, __ATOMIC_RELEASE );
+    pthread_attr_destroy( &attr );
+}
+
+static void ios_init_hang_stop( void )
+{
+    __atomic_store_n( &ios_init_hang_state, 2, __ATOMIC_RELEASE );
+}
 #endif
 
 /***********************************************************************
@@ -5716,12 +6366,12 @@ static void ios_init_fault_disarm( void )
  *
  * Create the server->client communication pipe.
  */
-static int init_thread_pipe(void)
+static int init_thread_pipe( struct thread_data *data )
 {
     int reply_pipe[2];
     stack_t ss;
 
-    ss.ss_sp    = get_signal_stack();
+    ss.ss_sp    = data->signal_stack;   /* Wine 11.22: in the thread data block, not beside the TEB */
     ss.ss_size  = signal_stack_size;
     ss.ss_flags = 0;
 #ifdef WINE_IOS
@@ -5738,26 +6388,40 @@ static int init_thread_pipe(void)
 #ifdef WINE_IOS
     ios_init_set_step( 5, "wait pipe (into the TEB's thread data)" );
 #endif
-    if (server_pipe( ntdll_get_thread_data()->wait_fd ) == -1) server_protocol_perror( "pipe" );
+    if (server_pipe( data->wait_fd ) == -1) server_protocol_perror( "pipe" );
 #ifdef WINE_IOS
     ios_init_set_step( 6, "fd ledger (ios_jit_current_peb)" );
     {
         void *peb = ios_jit_current_peb();
         ios_fdt_reg( reply_pipe[0], FDT_REPLY_RD, peb );
         ios_fdt_reg( reply_pipe[1], FDT_REPLY_WR, peb );
-        ios_fdt_reg( ntdll_get_thread_data()->wait_fd[0], FDT_WAIT_RD, peb );
-        ios_fdt_reg( ntdll_get_thread_data()->wait_fd[1], FDT_WAIT_WR, peb );
+        ios_fdt_reg( data->wait_fd[0], FDT_WAIT_RD, peb );
+        ios_fdt_reg( data->wait_fd[1], FDT_WAIT_WR, peb );
         wine_log_write("[fdtrace] pipes tid=%04x peb=%p master=%d reply=%d/%d wait=%d/%d rev=ml586",
                        (unsigned int)GetCurrentThreadId(), peb, ios_current_fd_socket(),
                        reply_pipe[0], reply_pipe[1],
-                       ntdll_get_thread_data()->wait_fd[0], ntdll_get_thread_data()->wait_fd[1]);
+                       data->wait_fd[0], data->wait_fd[1]);
     }
     ios_init_set_step( 7, "send pipe fds to the wineserver" );
 #endif
     wine_server_send_fd( reply_pipe[1] );
-    wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
-    ntdll_get_thread_data()->reply_fd = reply_pipe[0];
+    wine_server_send_fd( data->wait_fd[1] );
+    data->reply_fd = reply_pipe[0];
     return reply_pipe[1];
+}
+
+
+extern void ios_set_thread_id( TEB *teb, DWORD pid, DWORD tid );   /* virtual_ios.c: 11.4 set_thread_id */
+
+/***********************************************************************
+ *           init_teb_data
+ */
+static void init_teb_data( struct thread_data *data )
+{
+    struct teb_data *teb_data = get_teb_data( data );
+
+    teb_data->syscall_table = KeServiceDescriptorTable;
+    teb_data->syscall_trace = TRACE_ON(syscall);
 }
 
 
@@ -6204,6 +6868,12 @@ void ios_hw_registry_publish(void)
     OBJECT_ATTRIBUTES attr;
     HANDLE key;
     int mode;
+    /* [cpu-identity] (hw_registry_ios.h): the FEX side reads the same three variables */
+    const unsigned int identity = hwreg_identity_parts( getenv( "MADEIRA_CPU_IDENTITY" ),
+                                                        getenv( "MADEIRA_CPU_IDENTITY_BRAND" ),
+                                                        getenv( "MADEIRA_FEX_CPU_COUNT" ),
+                                                        getenv( "MADEIRA_CPU_X64_IDENTITY" ) );
+    unsigned long processors;
 
     /* Default 1: wineboot's volatile HKLM\HARDWARE\DESCRIPTION\System keys. 0: none
      * (no session had them before). 2: also the Session Manager\Environment values. */
@@ -6214,12 +6884,20 @@ void ios_hw_registry_publish(void)
         return;
     }
 
-    count = hwreg_cpu_count( peb->NumberOfProcessors );
+    processors = hwreg_processors( peb->NumberOfProcessors, madeira_reported_cpu_count(), identity );
+    count = hwreg_cpu_count( processors );
+    wine_log_write( "[cpu-identity] rev=cpu-identity-2 registry x64=%s brand=%s count=%s: %u CentralProcessor key(s), "
+                    "the CPUID count (processors told to Windows code: %lu)",
+                    (identity & HWREG_IDENTITY_X64) ? "on" : "off",
+                    (identity & HWREG_IDENTITY_BRAND) ? "on" : "off", (identity & HWREG_IDENTITY_COUNT) ? "on" : "off",
+                    count, (unsigned long)madeira_reported_cpu_count() );
     /* AVX exists only in FEX's ARM64EC module; a 32-bit main image runs the WOW64
      * module, which has no AVX. */
     /* as FEX reads it: "1..." AVX and AVX2; exactly "2" AVX without AVX2 */
     hwreg_fex_cpu( &cpu, (!avx || ios_main_image_i386) ? 0 : avx[0] == '1' ? 1 :
                          (avx[0] == '2' && !avx[1]) ? 2 : 0, ios_hw_cntfrq() );
+    if (identity & HWREG_IDENTITY_X64) hwreg_x64_identity( &cpu );   /* [cpu-x64-identity]: FEX's Intel name */
+    else if (identity & HWREG_IDENTITY_BRAND) hwreg_brand_ghz( &cpu, ios_hw_cntfrq() );   /* [cpu-identity]: CPUID's brand string */
     if (!cpu.mhz) cpu.mhz = ios_hw_power_mhz();
     smbios = ios_hw_smbios( &smbios_len );
     hwreg_bios_values( &bios, smbios, smbios_len, PACKAGE_VERSION );
@@ -6284,7 +6962,7 @@ void ios_hw_registry_publish(void)
         InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
         if (!NtOpenKey( &key, KEY_QUERY_VALUE | KEY_SET_VALUE, &attr ))
         {
-            hwreg_environment( env, &cpu, peb->NumberOfProcessors );
+            hwreg_environment( env, &cpu, processors );
             for (i = 0; i < HWREG_ENV_VALUES; i++) rewritten += ios_hw_env_value( key, env[i].name, env[i].value );
             NtClose( key );
             snprintf( extra, sizeof(extra), "; Session Manager\\Environment: %u of %u processor values rewritten",
@@ -6562,17 +7240,15 @@ void ios_vcrt_arm64_key_publish(void)
  *
  * Start the server and create the initial socket pair.
  */
-size_t server_init_process(void)
+void server_init_process( struct thread_data *data )
 {
     const char *arch = getenv( "WINEARCH" );
     const char *env_socket = getenv( "WINESERVERSOCKET" );
-    struct ntdll_thread_data *data = ntdll_get_thread_data();
     obj_handle_t version;
     unsigned int i;
     int ret, reply_pipe;
     struct sigaction sig_act;
-    size_t info_size;
-    DWORD pid, tid;
+    DWORD tid = 0;   /* `pid` is the process-global of Wine 11.22 (env_ios.c): the first process's id */
 
     server_pid = -1;
     if (env_socket)
@@ -6663,10 +7339,11 @@ size_t server_init_process(void)
     sigemptyset( &sig_act.sa_mask );
     sigaction( SIGPIPE, &sig_act, NULL );
 
-    reply_pipe = init_thread_pipe();
+    reply_pipe = init_thread_pipe( data );
 #ifdef WINE_IOS
     ios_init_set_step( 8, "init_first_thread request" );
     wine_log_write("[Wine init_process] reply_pipe=%d, sending init_first_thread...", reply_pipe);
+    ios_init_hang_start();   /* [init-hang], log only */
 #endif
 
     SERVER_START_REQ( init_first_thread )
@@ -6676,14 +7353,20 @@ size_t server_init_process(void)
         req->reply_fd    = reply_pipe;
         req->wait_fd     = data->wait_fd[1];
         req->debug_level = (TRACE_ON(server) != 0);
+        req->page_size   = get_host_page_size();   /* Wine 11.22: the server checks view addresses against it */
         wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
         if (!(ret = wine_server_call( req )))
         {
             obj_handle_t handle;
             pid               = reply->pid;
             tid               = reply->tid;
+            data->tid         = reply->tid;
+            /* Wine 11.22 parks these in globals because its first PEB does not exist yet.
+             * Madeira's does, so the PEB is still filled here; the globals are set too
+             * for the code that reads them (env_ios.c). */
+            session_id        = reply->session_id;
             peb->SessionId    = reply->session_id;
-            info_size         = reply->info_size;
+            startup_info_size = reply->info_size;
             server_start_time = reply->server_start;
             supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
             if (reply->inproc_device)
@@ -6701,7 +7384,8 @@ size_t server_init_process(void)
     close( reply_pipe );
 
 #ifdef WINE_IOS
-    wine_log_write("[Wine init_process] init_first_thread ret=%d, pid=%d, tid=%d", ret, pid, tid);
+    wine_log_write("[Wine init_process] init_first_thread ret=%d, pid=%d, tid=%d", ret, (int)pid, (int)tid);
+    ios_init_hang_stop();
     ios_init_fault_disarm();
 #endif
     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
@@ -6729,7 +7413,9 @@ size_t server_init_process(void)
             fatal_error( "WINEARCH set to %s but '%s' is a 32-bit installation.\n", arch, config_dir );
     }
 
-    set_thread_id( NtCurrentTeb(), pid, tid );
+    /* Madeira: the first TEB already exists (Wine 11.22 would create it later, ids
+     * included), so its ids are written now that the server has answered. */
+    ios_set_thread_id( data->teb, pid, tid );
 
 #ifdef WINE_IOS
     /* First process only (children use server_init_process_child), so the DOS
@@ -6740,7 +7426,7 @@ size_t server_init_process(void)
 #endif
 
     for (i = 0; i < supported_machines_count; i++)
-        if (supported_machines[i] == current_machine) return info_size;
+        if (supported_machines[i] == current_machine) return;
 
     fatal_error( "wineserver doesn't support the %04x architecture\n", current_machine );
 }
@@ -6756,7 +7442,7 @@ size_t server_init_process(void)
  */
 size_t server_init_process_child( int child_fd_socket )
 {
-    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct thread_data *data = get_thread_data();
     obj_handle_t version;
     int ret, reply_pipe;
     size_t info_size;
@@ -6789,7 +7475,7 @@ size_t server_init_process_child( int child_fd_socket )
     if (version != SERVER_PROTOCOL_VERSION)
         server_protocol_error( "version mismatch %d/%d\n", version, SERVER_PROTOCOL_VERSION );
 
-    reply_pipe = init_thread_pipe();
+    reply_pipe = init_thread_pipe( data );
 
     SERVER_START_REQ( init_first_thread )
     {
@@ -6798,12 +7484,14 @@ size_t server_init_process_child( int child_fd_socket )
         req->reply_fd    = reply_pipe;
         req->wait_fd     = data->wait_fd[1];
         req->debug_level = (TRACE_ON(server) != 0);
+        req->page_size   = get_host_page_size();   /* Wine 11.22: per-process on the server */
         wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
         if (!(ret = wine_server_call( req )))
         {
             obj_handle_t handle;
             pid       = reply->pid;
             tid       = reply->tid;
+            data->tid = reply->tid;
             info_size = reply->info_size;
             if (reply->inproc_device)
             {
@@ -6823,7 +7511,8 @@ size_t server_init_process_child( int child_fd_socket )
 
     if (ret) server_protocol_error( "init_first_thread (child) failed: %x\n", ret );
 
-    set_thread_id( NtCurrentTeb(), pid, tid );
+    /* the child's TEB was created before its ids were known (see ios_set_thread_id) */
+    ios_set_thread_id( data->teb, pid, tid );
 
     return info_size;
 }
@@ -6835,11 +7524,11 @@ size_t server_init_process_child( int child_fd_socket )
  */
 void server_init_process_done(void)
 {
-    void *teb;
     unsigned int status;
     int suspend;
     FILE_FS_DEVICE_INFORMATION info;
-    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+    struct thread_data *data = get_thread_data();
+    TEB64 *teb64 = get_teb64( data->teb );
 
     /* iOS-Madeira: this runs on the main (game) thread exactly once —
      * capture its TEB for the server_wait frame-anatomy accounting. */
@@ -6872,18 +7561,15 @@ void server_init_process_done(void)
     /* Install signal handlers; this cannot be done earlier, since we cannot
      * send exceptions to the debugger before the create process event that
      * is sent by init_process_done */
-    signal_init_process();
-    thread_data->syscall_table = KeServiceDescriptorTable;
-    thread_data->syscall_trace = TRACE_ON(syscall);
-
-    /* always send the native TEB */
-    if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();
+    signal_init_process( data->teb );
+    init_teb_data( data );
 
     /* Signal the parent process to continue */
     SERVER_START_REQ( init_process_done )
     {
-        req->teb = wine_server_client_ptr( teb );
-        req->peb = NtCurrentTeb64() ? NtCurrentTeb64()->Peb : wine_server_client_ptr( peb );
+        /* always send the native TEB */
+        req->teb = wine_server_client_ptr( teb64 ? (void *)teb64 : (void *)data->teb );
+        req->peb = teb64 ? teb64->Peb : wine_server_client_ptr( peb );
         status = wine_server_call( req );
         suspend = reply->suspend;
     }
@@ -7293,9 +7979,10 @@ void server_init_process_done(void)
         extern void *ios_subfloor_low_entry( void *entry, ULONG image_charact );
         extern void ios_child_boot_unlock( void );
         ios_child_boot_unlock();   /* ml1213: the child's unix boot is done */
+        data->suspend = suspend;   /* Wine 11.22: signal_start_thread reads it from the thread data */
         signal_start_thread( ios_subfloor_low_entry( ios_cur_image_info()->TransferAddress,
                                                      ios_cur_image_info()->ImageCharacteristics ),
-                             peb, suspend, NtCurrentTeb() );
+                             peb, data->teb );
     }
 }
 
@@ -7305,29 +7992,82 @@ void server_init_process_done(void)
  *
  * Send an init thread request.
  */
-void server_init_thread( void *entry_point, BOOL *suspend )
+void server_init_thread( struct thread_data *data )
 {
-    void *teb;
-    int reply_pipe = init_thread_pipe();
+    int reply_pipe;
+    TEB *teb = data->teb;
+    TEB64 *teb64 = get_teb64( teb );
 
-    /* always send the native TEB */
-    if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();
+    /* Wine 11.22: this is the pthread entry of every new thread (start_thread() in
+     * thread.c is gone). Madeira's additions to the old start_thread() live here. */
+
+    /* iOS-Madeira 2026-07-04 perf: promote guest threads to USER_INTERACTIVE
+     * QoS. Default-QoS pthreads on iOS are E-core-eligible and get heavy
+     * kernel timer coalescing (tens of ms of wakeup leeway on
+     * select/nanosleep). USER_INTERACTIVE = P-core scheduling + minimal timer
+     * leeway. ml1133: through ios_eco_apply_self (sync.c), which picks the eco
+     * class instead while the ECO switch is on. */
+    {
+        extern void ios_eco_apply_self(void);
+        ios_eco_apply_self();
+    }
+
+    data->pthread_id = pthread_self();
+    pthread_setspecific( thread_data_key, data );
+    if (teb)
+    {
+        /* iOS: publish the TEB through our own pthread key so the x18
+         * trampolines (mrs TPIDRRO_EL0; ldr TEB) work on this newly-created
+         * thread. Without this, worker threads (DXMT command buffers,
+         * NtCreateThreadEx threads) read TEB=0 and fault on the first guest x18
+         * reference. Only the slot backing ios_teb_tls_key is ours to write.
+         * A system thread (Wine 11.22, PsCreateSystemThread) has no TEB and
+         * never runs guest code, so it publishes nothing. */
+        extern pthread_key_t ios_teb_tls_key;
+        extern int ios_teb_tls_slot_offset;
+        extern void ios_thread_qos_start( unsigned int tid );
+        uintptr_t tsd_base;
+        void *raw;
+        pthread_setspecific( ios_teb_tls_key, teb );
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        raw = ios_teb_tls_slot_offset ? *(void **)(tsd_base + ios_teb_tls_slot_offset) : NULL;
+        dprintf(2, "[teb-tsd] thread tid=%04x raw=%p pthread=%p %s\n",
+                (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread, raw, (void *)teb,
+                raw == teb ? "MATCH" : "MISMATCH");
+        ios_thread_qos_start( (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread );   /* MADEIRA_THREAD_QOS */
+    }
+
+    reply_pipe = init_thread_pipe( data );
 
     SERVER_START_REQ( init_thread )
     {
         req->unix_tid  = get_unix_tid();
-        req->teb       = wine_server_client_ptr( teb );
-        req->entry     = wine_server_client_ptr( entry_point );
+        /* always send the native TEB */
+        req->teb       = wine_server_client_ptr( teb64 ? (void *)teb64 : (void *)teb );
         req->reply_fd  = reply_pipe;
-        req->wait_fd   = ntdll_get_thread_data()->wait_fd[1];
+        req->wait_fd   = data->wait_fd[1];
+        if (teb) req->entry = wine_server_client_ptr( data->start );
         wine_server_call( req );
-        *suspend = reply->suspend;
+        data->suspend = reply->suspend;
     }
     SERVER_END_REQ;
 #ifdef WINE_IOS
     ios_fdt_mark_closed( reply_pipe );   /* expected handoff close (server holds a dup) */
 #endif
     close( reply_pipe );
+
+    if (teb)
+    {
+        init_teb_data( data );
+        signal_start_thread( data->start, data->param, teb );
+    }
+    else if (data->start)
+    {
+        void (*entry)(void *) = data->start;
+        entry( data->param );
+        PsTerminateSystemThread( 1 );
+    }
 }
 
 NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,
@@ -7340,7 +8080,7 @@ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES
     TRACE("(%p, %p, %d)\n", handle, attr, type);
 
     *handle = 0;
-    if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+    if ((ret = wine_server_alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( allocate_reserve_object )
     {
@@ -7520,11 +8260,13 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     }
 #endif
 
-    if (!peb->BeingDebugged) return ret;
+    if (!peb || !peb->BeingDebugged) return ret;
     if (!NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL) && port)
     {
-        NtCurrentTeb()->ExceptionCode = ret;
-        call_raise_user_exception_dispatcher();
+        struct thread_data *data = get_thread_data();
+        if (!data->teb) return ret;
+        data->teb->ExceptionCode = ret;
+        call_raise_user_exception_dispatcher( data );
     }
     return ret;
 }

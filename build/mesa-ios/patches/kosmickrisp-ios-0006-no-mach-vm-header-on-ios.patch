@@ -1,0 +1,45 @@
+kosmickrisp: iOS has no <mach/mach_vm.h>; use the vm_* calls (Madeira build fix for Mesa 26.3.1)
+
+--- a/src/kosmickrisp/vulkan/kk_bo.c	2026-11-23 19:16:06.809119126 -0700
++++ b/src/kosmickrisp/vulkan/kk_bo.c	2026-11-23 19:16:06.854300725 -0700
+@@ -15,7 +15,40 @@
+ 
+ #if DETECT_OS_APPLE
+ #include <mach/mach_init.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++/* Madeira (kosmickrisp-ios-0006): the iOS SDK refuses <mach/mach_vm.h> ("mach_vm.h unsupported").
++ * On 64-bit iOS the vm_* calls of <mach/vm_map.h> take the same arguments with 64-bit types,
++ * so these wrappers only convert the address pointer type. */
++#include <mach/vm_map.h>
++static inline kern_return_t
++kk_ios_vm_remap(vm_map_t task, mach_vm_address_t *addr, mach_vm_size_t size, mach_vm_offset_t mask,
++                int flags, vm_map_t src_task, mach_vm_address_t src_addr, boolean_t copy,
++                vm_prot_t *cur_prot, vm_prot_t *max_prot, vm_inherit_t inherit)
++{
++   vm_address_t a = (vm_address_t)*addr;
++   kern_return_t ret = vm_remap(task, &a, (vm_size_t)size, (vm_address_t)mask, flags, src_task,
++                                (vm_address_t)src_addr, copy, cur_prot, max_prot, inherit);
++   *addr = (mach_vm_address_t)a;
++   return ret;
++}
++static inline kern_return_t
++kk_ios_vm_map(vm_map_t task, mach_vm_address_t *addr, mach_vm_size_t size, mach_vm_offset_t mask,
++              int flags, mem_entry_name_port_t object, memory_object_offset_t offset, boolean_t copy,
++              vm_prot_t cur_prot, vm_prot_t max_prot, vm_inherit_t inherit)
++{
++   vm_address_t a = (vm_address_t)*addr;
++   kern_return_t ret = vm_map(task, &a, (vm_size_t)size, (vm_address_t)mask, flags, object,
++                              (vm_offset_t)offset, copy, cur_prot, max_prot, inherit);
++   *addr = (mach_vm_address_t)a;
++   return ret;
++}
++#define mach_vm_remap kk_ios_vm_remap
++#define mach_vm_map kk_ios_vm_map
++#define mach_vm_deallocate(task, addr, size) vm_deallocate((task), (vm_address_t)(addr), (vm_size_t)(size))
++#else
+ #include <mach/mach_vm.h>
++#endif
+ #endif /* DETECT_OS_APPLE */
+ 
+ VkResult

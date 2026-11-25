@@ -775,11 +775,11 @@ HWND WINAPI CreateDialogIndirectParamW( HINSTANCE hInst, LPCDLGTEMPLATEW dlgTemp
 /***********************************************************************
  *           DIALOG_DoDialogBox
  */
-INT DIALOG_DoDialogBox( HWND hwnd, HWND owner )
+INT_PTR DIALOG_DoDialogBox( HWND hwnd, HWND owner )
 {
     DIALOGINFO * dlgInfo;
     MSG msg;
-    INT retval;
+    INT_PTR retval;
     BOOL bFirstEmpty;
 
     if (!(dlgInfo = DIALOG_get_info( hwnd, FALSE ))) return -1;
@@ -1157,8 +1157,8 @@ BOOL WINAPI IsDialogMessageW( HWND hwndDlg, LPMSG msg )
     if (NtUserCallMsgFilter( msg, MSGF_DIALOGBOX )) return TRUE;
 
     hwndDlg = WIN_GetFullHandle( hwndDlg );
-    if (is_desktop_window(hwndDlg)) return FALSE;
     if ((hwndDlg != msg->hwnd) && !IsChild( hwndDlg, msg->hwnd )) return FALSE;
+    if (!NtUserGetAncestor( hwndDlg, GA_PARENT )) return FALSE;
 
     hwndDlg = DIALOG_FindMsgDestination(hwndDlg);
 

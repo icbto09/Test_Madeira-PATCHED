@@ -1331,6 +1331,118 @@ static BOOL winios_covers_desktop(CGRect px) {
 static void winios_forget_cursor_layer(void);   /* cursor section, below */
 static void winios_game_cursor_refresh(void);   /* cursor section, below */
 
+/* cover-window: a game whose only window is an ordinary (GDI) one that covers
+ * the whole guest desktop. The rule above never draws a desktop-covering
+ * window, because it is normally a Direct3D game's own window lying under its
+ * Metal picture. A program that draws with GDI and has no Metal picture at
+ * all (Emuera: a 1226x858 window on a 1152x800 desktop) was therefore never
+ * seen, and the library's starting screen stayed up over it for good.
+ *
+ * Such a window is now HELD instead of dropped: its layer and latest bits are
+ * kept, hidden. It is revealed only when all of these hold:
+ *   - no window of this session presents through Metal (g_game_metal empty),
+ *   - the grace period since it was first held has passed (8 s, or
+ *     MADEIRA_COVER_WINDOW_MS), which a Direct3D game uses to create its
+ *     swapchain, and
+ *   - it has painted something that is not one flat colour (a Direct3D game's
+ *     window under its picture gets at most a background erase).
+ * The moment any window presents through Metal, every held or revealed
+ * covering window is dropped again, exactly as before this change.
+ * MADEIRA_COVER_WINDOW=0 turns all of it off (the old rule). Logs [cover-window].
+ * main thread only. */
+static NSMutableSet<NSNumber *> *g_cover_armed;    /* grace timer started */
+static NSMutableSet<NSNumber *> *g_cover_due;      /* grace period over */
+static NSMutableSet<NSNumber *> *g_cover_content;  /* painted more than one flat colour */
+static NSMutableSet<NSNumber *> *g_cover_shown;    /* revealed */
+static NSMutableDictionary<NSNumber *, NSNumber *> *g_cover_visible;  /* last visible flag of a held window */
+static unsigned g_cover_generation;                /* bumped when the sets are cleared: old timers do nothing */
+static BOOL g_cover_picture;                       /* this session: OpenGL presents to the game layer (WiniosGL.m) */
+
+/* Does the session have a picture of its own? Direct3D and Vulkan windows are
+ * noted per window (g_game_metal); the OpenGL presenter (native GL, GLES, Zink,
+ * d3d9 = wined3d) only says that it exists (winios_note_game_picture). */
+static BOOL winios_cover_picture_exists(void) { return g_game_metal.count || g_cover_picture; }
+
+static BOOL winios_cover_window_enabled(void) {
+    const char *e = getenv("MADEIRA_COVER_WINDOW");   /* read every time: a game's own line */
+    return !(e && e[0] == '0' && !e[1]);
+}
+
+static double winios_cover_window_grace(void) {
+    const char *e = getenv("MADEIRA_COVER_WINDOW_MS");
+    long ms = e ? strtol(e, NULL, 10) : 0;
+    if (ms < 500 || ms > 120000) ms = 8000;
+    return ms / 1000.0;
+}
+
+static void winios_cover_forget_all(void) {
+    [g_cover_armed removeAllObjects];
+    [g_cover_due removeAllObjects];
+    [g_cover_content removeAllObjects];
+    [g_cover_shown removeAllObjects];
+    [g_cover_visible removeAllObjects];
+    g_cover_generation++;
+}
+
+static void winios_cover_reveal_if_ready(NSNumber *key, const char *why);
+
+/* Is this window a covering window that is kept hidden for now? Starts its
+ * grace timer the first time. NO for every window the old rule decides. */
+static BOOL winios_cover_held(NSNumber *key) {
+    if (!g_comp_game || !winios_cover_window_enabled()) return NO;
+    if (winios_cover_picture_exists()) return NO;
+    NSValue *rv = g_px_rects[key];
+    if (!rv || !winios_covers_desktop(rv.CGRectValue)) return NO;
+    if ([g_cover_shown containsObject:key]) return NO;
+    if (!g_cover_armed) {
+        g_cover_armed = [NSMutableSet new];
+        g_cover_due = [NSMutableSet new];
+        g_cover_content = [NSMutableSet new];
+        g_cover_shown = [NSMutableSet new];
+        if (!g_cover_visible) g_cover_visible = [NSMutableDictionary new];
+    }
+    if (![g_cover_armed containsObject:key]) {
+        unsigned gen = g_cover_generation;
+        double grace = winios_cover_window_grace();
+        [g_cover_armed addObject:key];
+        fprintf(stderr, "[cover-window] hwnd=0x%llx covers the guest desktop and no window presents through Metal: "
+                "held hidden, drawn after %.1f s if it paints and still nothing presents through Metal "
+                "(MADEIRA_COVER_WINDOW=0 disables)\n", key.unsignedLongLongValue, grace);
+        fflush(stderr);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(grace * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (gen != g_cover_generation || ![g_cover_armed containsObject:key]) return;
+            [g_cover_due addObject:key];
+            winios_cover_reveal_if_ready(key, "grace period over");
+        });
+    }
+    return YES;
+}
+
+/* A sparse look at a window's client area: does it hold more than one flat
+ * colour? The surface is larger than the window (128 px aligned) and the
+ * caption and borders are never flat, so only the client area inside the
+ * window is looked at. */
+static BOOL winios_cover_has_content(NSData *data, int sw, int sh, int stride, CGRect win, CGRect client) {
+    if (sw <= 0 || sh <= 0 || stride < sw * 4 || data.length < (NSUInteger)stride * (NSUInteger)sh) return NO;
+    int x0 = 0, y0 = 0, x1 = MIN(sw, (int)win.size.width), y1 = MIN(sh, (int)win.size.height);
+    if (!CGRectIsEmpty(client)) {
+        x0 = MAX(0, (int)(client.origin.x - win.origin.x));
+        y0 = MAX(0, (int)(client.origin.y - win.origin.y));
+        x1 = MIN(x1, x0 + (int)client.size.width);
+        y1 = MIN(y1, y0 + (int)client.size.height);
+    }
+    if (x1 - x0 < 2 || y1 - y0 < 2) return NO;
+    const uint8_t *b = (const uint8_t *)data.bytes;
+    int ystep = MAX(1, (y1 - y0) / 48), xstep = MAX(1, (x1 - x0) / 48);
+    uint32_t first = ((const uint32_t *)(b + (size_t)y0 * (size_t)stride))[x0] & 0x00ffffffu;
+    for (int y = y0; y < y1; y += ystep) {
+        const uint32_t *row = (const uint32_t *)(b + (size_t)y * (size_t)stride);
+        for (int x = x0; x < x1; x += xstep)
+            if ((row[x] & 0x00ffffffu) != first) return YES;
+    }
+    return NO;
+}
+
 /* main thread only. Removes the compositor view and every window layer. */
 static void winios_drop_compositor(const char *why) {
     g_game_input_key = nil;
@@ -1342,6 +1454,7 @@ static void winios_drop_compositor(const char *why) {
     [g_surf_sizes removeAllObjects];
     [g_metal_layers removeAllObjects];
     [g_client_rects removeAllObjects];
+    winios_cover_forget_all();
     g_fit_key = nil;
     [g_compositor_view removeFromSuperview];
     g_compositor_view = nil;
@@ -1358,6 +1471,13 @@ static BOOL winios_game_window_shown(NSNumber *key) {
     NSValue *rv = g_px_rects[key];
     BOOL metal = [g_game_metal containsObject:key];
     if (!metal && rv && !winios_covers_desktop(rv.CGRectValue)) return YES;
+    /* cover-window: a revealed covering window stays drawn while nothing presents through Metal */
+    if (!metal && rv && !winios_cover_picture_exists() && [g_cover_shown containsObject:key] && winios_cover_window_enabled())
+        return YES;
+    [g_cover_armed removeObject:key];
+    [g_cover_due removeObject:key];
+    [g_cover_content removeObject:key];
+    [g_cover_shown removeObject:key];
     CALayer *l = g_layers[key];
     if (l) {
         [l removeFromSuperlayer];
@@ -1386,6 +1506,32 @@ void winios_note_game_metal_hwnd(void *hwnd) {
         fprintf(stderr, "[winios] game window hwnd=%p presents through Metal; its GDI surface is not drawn\n", hwnd);
         fflush(stderr);
         if (g_comp_game) (void)winios_game_window_shown(key);
+        /* cover-window: a Metal picture exists now, so every covering window goes back to the old rule */
+        if (g_comp_game && g_cover_armed.count) {
+            for (NSNumber *k in g_cover_armed.allObjects) {
+                fprintf(stderr, "[cover-window] hwnd=0x%llx: a window presents through Metal now, covering window dropped\n",
+                        k.unsignedLongLongValue);
+                (void)winios_game_window_shown(k);
+            }
+            fflush(stderr);
+        }
+    });
+}
+
+/* cover-window: called by the OpenGL presenter (WiniosGL.m, any thread) when it
+ * takes the game layer. From then on the session has a picture and no covering
+ * window is held or drawn. */
+void winios_note_game_picture(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_cover_picture) return;
+        g_cover_picture = YES;
+        if (!g_comp_game) return;
+        for (NSNumber *k in g_cover_armed.allObjects) {
+            fprintf(stderr, "[cover-window] hwnd=0x%llx: OpenGL presents now, covering window dropped\n",
+                    k.unsignedLongLongValue);
+            (void)winios_game_window_shown(k);
+        }
+        fflush(stderr);
     });
 }
 
@@ -1398,6 +1544,8 @@ void winios_session_reset(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         g_game_input_key = nil;
         [g_game_metal removeAllObjects];
+        winios_cover_forget_all();
+        g_cover_picture = NO;
         if (g_comp_game) winios_drop_compositor("new session");
         winios_metal_hud_pick();   /* the window-level layer's HUD follows the session kind */
     });
@@ -1520,6 +1668,9 @@ static void winios_remove_layer(HWND hwnd) {
         if ([g_game_input_key isEqual:key]) g_game_input_key = nil;
         [g_game_metal removeObject:key];
         [g_client_rects removeObjectForKey:key];
+        /* cover-window: Wine reuses handle values, a new window must start clean */
+        [g_cover_armed removeObject:key]; [g_cover_due removeObject:key]; [g_cover_content removeObject:key];
+        [g_cover_shown removeObject:key]; [g_cover_visible removeObjectForKey:key];
         if (!g_layers) return;
         CALayer *l = g_layers[key];
         if (l) {
@@ -2011,6 +2162,21 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         if ([g_game_input_key isEqual:key]) g_game_input_hidden = !visible;
         if (g_comp_game) {   /* game-mode windows, see winios_game_window_shown */
             g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
+            if (!g_cover_visible) g_cover_visible = [NSMutableDictionary new];
+            g_cover_visible[key] = @(visible != 0);
+            if (winios_cover_held(key)) {
+                /* cover-window: keep its place up to date, hidden, until it is revealed or dropped */
+                CALayer *held = winios_layer_for(hwnd, true);
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                held.frame = winios_layer_rect(x, y, w, h);
+                held.hidden = YES;
+                winios_apply_contents_rect(key, held);
+                [CATransaction commit];
+                winios_sync_metal_hidden(key, held);
+                winios_cover_reveal_if_ready(key, "window moved");
+                return;
+            }
             if (!winios_game_window_shown(key)) return;
         }
         CALayer *l = winios_layer_for(hwnd, true);
@@ -2458,6 +2624,13 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         if (g_comp_game) {
             NSNumber *k = @((uintptr_t)hwnd);
             if (!g_px_rects[k] && ![g_game_metal containsObject:k]) pending = YES;
+            else if (winios_cover_held(k)) {
+                /* cover-window: keep the bits in the hidden layer */
+                pending = YES;
+                if (![g_cover_content containsObject:k] && winios_cover_has_content(data, sw, sh, stride, g_px_rects[k].CGRectValue,
+                                                                                       g_client_rects[k].CGRectValue))
+                    [g_cover_content addObject:k];
+            }
             else if (!winios_game_window_shown(k)) return;
         }
         CALayer *l = winios_layer_for(hwnd, true);
@@ -2485,11 +2658,43 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
             }
             winios_apply_contents_rect(key, l);
             CGImageRelease(img);
+            if (pending && [g_cover_armed containsObject:key]) winios_cover_reveal_if_ready(key, "it painted");
         }
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
     });
     return 1;
+}
+
+/* cover-window, main thread only: draw a held covering window once its grace
+ * period is over, it has painted, it is visible and still nothing presents
+ * through Metal. See winios_cover_held. */
+static void winios_cover_reveal_if_ready(NSNumber *key, const char *why) {
+    if (!g_comp_game || winios_cover_picture_exists() || !winios_cover_window_enabled()) return;
+    if (![g_cover_due containsObject:key] || ![g_cover_content containsObject:key]) return;
+    if ([g_cover_shown containsObject:key]) return;
+    NSValue *rv = g_px_rects[key];
+    CALayer *l = g_layers[key];
+    if (!rv || !l || !l.contents) return;
+    if (!winios_covers_desktop(rv.CGRectValue)) return;          /* the ordinary rule draws it */
+    if (!g_cover_visible[key].boolValue) return;   /* hidden by the program, or visibility not known yet */
+    CGRect r = rv.CGRectValue;
+    [g_cover_shown addObject:key];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    l.frame = winios_layer_rect((int)r.origin.x, (int)r.origin.y, (int)r.size.width, (int)r.size.height);
+    l.hidden = NO;
+    winios_apply_contents_rect(key, l);
+    winios_place_metal_layer(key);
+    [CATransaction commit];
+    winios_sync_metal_hidden(key, l);
+    /* the library's starting screen counts it, as for any drawn game-mode window */
+    atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
+    fprintf(stderr, "[cover-window] hwnd=0x%llx (%dx%d at %d,%d) drawn: %s, it painted and no window presents "
+            "through Metal (MADEIRA_COVER_WINDOW=0 disables)\n", key.unsignedLongLongValue,
+            (int)r.size.width, (int)r.size.height, (int)r.origin.x, (int)r.origin.y, why);
+    fflush(stderr);
+    winios_game_cursor_refresh();
 }
 
 /* ============================================================ *

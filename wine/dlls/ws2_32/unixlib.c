@@ -30,6 +30,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdio.h>  /* madeira [bsd-sockets]: fprintf for the once-per-process log line */
+#include <stdlib.h> /* madeira [bsd-sockets]: getenv */
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -846,6 +848,61 @@ static int madeira_dns_getaddrinfo( const char *node, const char *service, const
 }
 #endif
 
+/* madeira [bsd-sockets]: one switch for the BSD-socket fixes taken from MetalSharp-Wine
+ * patches 0149-0157 (ntdll, ws2_32 and wineserver each read it).
+ * env MADEIRA_BSD_SOCKETS=0 restores the previous behaviour; default on.
+ * On iOS this unix image lives as long as the app, across game sessions that each export their
+ * own env lines (see virtual_ios.c [x64-rwx-reread]), so the value is read again on every call
+ * and the log line is printed when it changes; callers test it after their cheap checks.
+ * Elsewhere it is read once per process. Never called from a signal handler.
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine (LGPL-2.1) */
+static int madeira_bsd_sockets(void)
+{
+#ifdef WINE_IOS
+    static int logged = -1;
+    const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+    int m = !(e && e[0] == '0' && !e[1]);
+
+    if (__atomic_exchange_n( &logged, m, __ATOMIC_RELAXED ) != m)
+        fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (ws2_32)\n", m ? "on" : "off" );
+    return m;
+#else
+    static int mode = -1;   /* -1 not read, 0 off, 1 on */
+    int m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
+
+    if (m < 0)
+    {
+        const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+        int expected = -1;
+
+        m = !(e && e[0] == '0' && !e[1]);
+        if (__atomic_compare_exchange_n( &mode, &expected, m, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (ws2_32)\n", m ? "on" : "off" );
+        else m = expected;
+    }
+    return m;
+#endif
+}
+
+/* MetalSharp: Windows resolves the computer's own name to its addresses, and programs rely on that to find them
+ * (a LAN game looking up the host it runs on). macOS knows the machine as <name>.local and resolves that name
+ * through multicast DNS, but not the bare <name>, which is the computer name Windows programs are given. Returns
+ * the full host name when name is its first part, in any case, or NULL.
+ * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0149 (LGPL-2.1)
+ * Madeira: the caller passes the buffer (upstream used a static one, shared by concurrent getaddrinfo calls). */
+static const char *own_host_name_for( const char *name, char *host, size_t size )
+{
+    size_t len;
+
+    if (!madeira_bsd_sockets()) return NULL;
+    if (!name || !name[0] || strchr( name, '.' )) return NULL;
+    if (gethostname( host, size )) return NULL;
+    host[size - 1] = 0;
+    len = strlen( name );
+    if (strncasecmp( host, name, len ) || host[len] != '.') return NULL;
+    return host;
+}
+
 static NTSTATUS unix_getaddrinfo( void *args )
 {
 #ifdef HAVE_GETADDRINFO
@@ -917,7 +974,25 @@ static NTSTATUS unix_getaddrinfo( void *args )
     ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
 #endif
     if (ret)
-        return addrinfo_err_from_unix( ret );
+    {
+        /* the machine's own name without its domain, when the system resolver only knows the full one.
+         * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0149 (LGPL-2.1) */
+        char own_buf[256];
+        const char *own = own_host_name_for( params->node, own_buf, sizeof(own_buf) );
+
+#ifdef WINE_IOS
+        /* the retry goes through the same wrapper as the first lookup (autorelease pool, MADEIRA_DNS_TIMEOUT_MS) */
+        if (!own || madeira_dns_getaddrinfo( own, service, hints ? &unix_hints : NULL, &unix_info ))
+#else
+        if (!own || getaddrinfo( own, service, hints ? &unix_hints : NULL, &unix_info ))
+#endif
+        {
+            /* macOS reports a service name it does not know as an unknown name; with no host asked for,
+             * the service is what was not found */
+            if (ret == EAI_NONAME && !params->node && service && madeira_bsd_sockets()) ret = EAI_SERVICE;
+            return addrinfo_err_from_unix( ret );
+        }
+    }
 
     for (src = unix_info; src != NULL; src = src->ai_next)
     {
@@ -1148,6 +1223,8 @@ static NTSTATUS unix_gethostbyname( void *args )
     struct gethostbyname_params *params = args;
     struct hostent stack_host, *unix_host;
     char *unix_buffer, *new_buffer;
+    char own_buf[256];          /* madeira [bsd-sockets] 0149 */
+    const char *own;
     int unix_size = 1024;
     int locerr;
     int ret;
@@ -1164,6 +1241,21 @@ static NTSTATUS unix_gethostbyname( void *args )
             return WSAENOBUFS;
         }
         unix_buffer = new_buffer;
+    }
+    /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0149 (LGPL-2.1) */
+    if (!unix_host && (own = own_host_name_for( params->name, own_buf, sizeof(own_buf) )))
+    {
+        while (gethostbyname_r( own, &stack_host, unix_buffer, unix_size,
+                                &unix_host, &locerr ) == ERANGE)
+        {
+            unix_size *= 2;
+            if (!(new_buffer = realloc( unix_buffer, unix_size )))
+            {
+                free( unix_buffer );
+                return WSAENOBUFS;
+            }
+            unix_buffer = new_buffer;
+        }
     }
 
     if (!unix_host)
@@ -1184,11 +1276,17 @@ static NTSTATUS unix_gethostbyname( void *args )
 {
     struct gethostbyname_params *params = args;
     struct hostent *unix_host;
+    char own_buf[256];          /* madeira [bsd-sockets] 0149 */
+    const char *own;
     int ret;
 
     pthread_mutex_lock( &host_mutex );
 
-    if (!(unix_host = gethostbyname( params->name )))
+    /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0149 (LGPL-2.1) */
+    if (!(unix_host = gethostbyname( params->name )) &&
+        (own = own_host_name_for( params->name, own_buf, sizeof(own_buf) )))
+        unix_host = gethostbyname( own );
+    if (!unix_host)
     {
         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
         pthread_mutex_unlock( &host_mutex );

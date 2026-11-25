@@ -147,13 +147,25 @@ static inline uint64_t IosNowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+/* MADEIRA section-views: 1 = place the per-instruction code-changed block right after the
+ * current block (MetalSharp patches/fex/0026, AGPL-3.0, Avery Felts); 0 = the old placement at
+ * the end of the block list, found by walking every block (quadratic in a fully checked block).
+ * Starts off; only the ARM64EC frontend turns it on (ProcessInit, unless MADEIRA_EC_SECTION_VIEWS=0),
+ * so the WOW64 module keeps the old placement. */
+extern "C" {
+uint32_t FEX_MadeiraSectionViews = 0;
+}
+/* madeira [jit-inval]: 1 = no per-instruction code check on an instruction that failed to decode.
+ * Set from the ARM64EC frontend (MADEIRA_EC_JIT_INVAL=0 clears it); 0 in WOW64 = old behaviour. */
+extern "C" {
+uint32_t FEX_MadeiraJitInvalCheck = 0;
+}
+
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
  * frontend (Module.cpp) which owns the thread registry. extern "C" so the
  * cross-layer reference has no namespace in its linkage name. */
 extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread);
-/* madeira kuser-remap: implemented in the ARM64EC frontend (IosJitAlias.cpp). */
-extern "C" int IosKuserWantsInsn(uint64_t Rip);
 #endif
 
 namespace FEXCore::Context {
@@ -406,8 +418,8 @@ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadSt
 void ContextImpl::ReconstructXMMRegisters(const FEXCore::Core::InternalThreadState* Thread, __uint128_t* XMM_Low, __uint128_t* YMM_High) {
   const size_t MaximumRegisters = Config.Is64BitMode ? FEXCore::Core::CPUState::NUM_XMMS : 8;
 
-  if (YMM_High != nullptr && HostFeatures.SupportsAVX) {
-    const bool SupportsConvergedRegisters = HostFeatures.SupportsSVE256;
+  if (YMM_High != nullptr && HostFeatures.SupportsAVX()) {
+    const bool SupportsConvergedRegisters = HostFeatures.SupportsSVE256();
 
     if (SupportsConvergedRegisters) {
       ///< Output wants to de-interleave
@@ -430,8 +442,8 @@ void ContextImpl::ReconstructXMMRegisters(const FEXCore::Core::InternalThreadSta
 
 void ContextImpl::SetXMMRegistersFromState(FEXCore::Core::InternalThreadState* Thread, const __uint128_t* XMM_Low, const __uint128_t* YMM_High) {
   const size_t MaximumRegisters = Config.Is64BitMode ? FEXCore::Core::CPUState::NUM_XMMS : 8;
-  if (YMM_High != nullptr && HostFeatures.SupportsAVX) {
-    const bool SupportsConvergedRegisters = HostFeatures.SupportsSVE256;
+  if (YMM_High != nullptr && HostFeatures.SupportsAVX()) {
+    const bool SupportsConvergedRegisters = HostFeatures.SupportsSVE256();
 
     if (SupportsConvergedRegisters) {
       ///< Output wants to de-interleave
@@ -627,18 +639,28 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
   // Set up the thread manager state
   Thread->CurrentFrame->Thread = Thread;
 #ifdef FEX_IOS_HOST
-  /* ml1205: the block-entry ring, when MADEIRA_BLOCK_RING is set (32 KB per thread, never freed). */
+  /* ml1205: the block-entry ring, when MADEIRA_BLOCK_RING is set (32 KB per thread; freed in DestroyThread). */
   {
     static int RingOn = -1;
     if (RingOn < 0) {
       const char* E = getenv("MADEIRA_BLOCK_RING");
       RingOn = (E && *E && *E != '0') ? 1 : 0;
+#if defined(ARCHITECTURE_arm64ec)
+      if (FEXCore::Core::IosBlockRingForce) {
+        RingOn = 1; /* madeira [crashmailer-dump]: Overwatch.exe, see ARM64EC Module.cpp */
+      }
+#endif
     }
     if (RingOn) {
-      const size_t Bytes = (FEXCore::Core::IosBlockRingEntries + 1) * sizeof(uint64_t);
-      auto* Ring = static_cast<uint64_t*>(FEXCore::Allocator::aligned_alloc(64, Bytes));
-      if (Ring) {
-        memset(Ring, 0, Bytes);
+      /* madeira [crashmailer-exit-probe]: N entries plus the index word plus ring[-1] = N. */
+      const uint32_t N = FEXCore::Core::IosBlockRingEntriesRT;
+      const size_t Bytes = (N + 2) * sizeof(uint64_t);
+      auto* Mem = static_cast<uint64_t*>(FEXCore::Allocator::aligned_alloc(64, Bytes));
+      uint64_t* Ring = nullptr;
+      if (Mem) {
+        memset(Mem, 0, Bytes);
+        Mem[0] = N;
+        Ring = Mem + 1;
       }
       Thread->CurrentFrame->IosBlockRing = Ring;
     }
@@ -660,6 +682,14 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
 void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
   FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
                                      Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+#ifdef FEX_IOS_HOST
+  /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: free the block ring (it starts one word before
+   * ring[0], see CreateThread). The ARM64EC frontend has already cleared the TEB's pointer to it. */
+  if (Thread->CurrentFrame && Thread->CurrentFrame->IosBlockRing) {
+    FEXCore::Allocator::aligned_free(Thread->CurrentFrame->IosBlockRing - 1);
+    Thread->CurrentFrame->IosBlockRing = nullptr;
+  }
+#endif
   delete Thread;
 }
 
@@ -760,6 +790,12 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
  * decommit_pages(), build/ntdll-unix/virtual_ios.c.
  */
 } // namespace (ml609: reopened below)
+#ifdef FEX_IOS_HOST
+namespace FEXCore::Core {
+uint32_t IosBlockRingEntriesRT = IosBlockRingEntries; /* madeira [crashmailer-exit-probe], see CoreState.h */
+}
+#endif
+
 namespace FEXCore::Core {
 namespace {
   // Keep in sync with the literals passed by the three call sites.
@@ -1280,7 +1316,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock) {
+        // madeira [jit-inval]: an instruction that failed to decode (NoExec/partial, InstSize 0, no TableInfo)
+        // has no bytes to check. Its check made the NoExec stub at Overwatch's entry ask for its own removal
+        // forever (0.2.83 log: "aligned: skipped" 8145 -> 536870865, no exception raised) instead of raising the
+        // execute fault the protector waits for. FEX_MadeiraJitInvalCheck = 0 (MADEIRA_EC_JIT_INVAL=0): old code.
+        const bool CheckThisInst = !FEX_MadeiraJitInvalCheck || (TableInfo && DecodedInfo->InstSize != 0);
+        if (CheckThisInst && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock)) {
           // Compare against the bytes the decoder read, not a second read of guest memory: code
           // rewritten between the two reads (HotSpot's `jmp $` placeholder replaced by the final jump
           // while a thread was translating it) would be checked against its new bytes but run as the
@@ -1297,7 +1338,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
           auto CurrentBlock = Thread->OpDispatcher->GetCurrentBlock();
-          auto CodeWasChangedBlock = Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
+          auto CodeWasChangedBlock = FEX_MadeiraSectionViews ? Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock) :
+                                                               Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
           Thread->OpDispatcher->SetTrueJumpTarget(InvalidateCodeCond, CodeWasChangedBlock);
 
           Thread->OpDispatcher->SetCurrentCodeBlock(CodeWasChangedBlock);
@@ -1309,7 +1351,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           // Invalidate and exit the function
           Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP);
 
-          auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
+          auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(FEX_MadeiraSectionViews ? CodeWasChangedBlock : CurrentBlock);
 
           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
@@ -1332,13 +1374,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
-#if defined(FEX_IOS_HOST) && defined(_WIN32)
-          Thread->OpDispatcher->SetIosKuserInsn(IosKuserWantsInsn(InstAddress) != 0);   // madeira kuser-remap
-#endif
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
-#if defined(FEX_IOS_HOST) && defined(_WIN32)
-          Thread->OpDispatcher->SetIosKuserInsn(false);
-#endif
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {
@@ -1662,6 +1698,10 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[4];
+/* bo3-null-call-trace: fault-free read of guest memory, IosJitAlias.cpp (NtQueryVirtualMemory check, then memcpy). */
+extern "C" bool IosSafeReadGuest(uint64_t Addr, void* Out, uint64_t Len);
+/* bo3-ring-at: PEB->ImageBaseAddress, IosJitAlias.cpp. */
+extern "C" uint64_t IosMainImageBase();
 #else
 /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
  * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
@@ -1784,6 +1824,115 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* iOS-Madeira bo3-ring-at (Black Ops III, Nov 21): its main thread ends up in a closed
+   * 41-state loop (read from a mid-run [block-ring] sample), so what matters is the code that
+   * ran just BEFORE the loop started. env.MADEIRA_BLOCK_RING_AT = <hex RVA in the main exe>
+   * (default unset = off; needs env.MADEIRA_BLOCK_RING = 1): the first time that block is
+   * compiled, which is the first time it runs, log this thread's whole ring (4096 block
+   * entries, oldest first) in the usual [block-ring] form, once per process. Log-only: reads
+   * through IosSafeReadGuest and changes no state. Studying only; the game is not changed. */
+  {
+    static std::atomic<uint64_t> RingAtRva {~0ULL};   /* ~0 = not read yet, 0 = off */
+    static std::atomic<bool> RingAtDone {false};
+    uint64_t Rva = RingAtRva.load(std::memory_order_relaxed);
+    if (Rva == ~0ULL) {
+      const char* E = std::getenv("MADEIRA_BLOCK_RING_AT");
+      Rva = (E && *E) ? strtoull(E, nullptr, 16) : 0;
+      RingAtRva.store(Rva, std::memory_order_relaxed);
+    }
+    const uint64_t* Ring = Thread->CurrentFrame->IosBlockRing;
+    if (Rva && Ring && !RingAtDone.load(std::memory_order_relaxed) && IosMainImageBase() && GuestRIP == IosMainImageBase() + Rva &&
+        !RingAtDone.exchange(true, std::memory_order_relaxed)) {
+      const uint32_t N = static_cast<uint32_t>(Ring[-1]);   /* [crashmailer-exit-probe]: ring[-1] = size */
+      const uint64_t Next = Ring[0] & (N - 1);
+      static const char HexDigits[] = "0123456789abcdef";
+      LogMan::Msg::EFmt("[ring-at] first compile of exe+{:#x} (rip {:#x}) on thread state {}: this thread's last {} block entries, oldest first",
+                        Rva, GuestRIP, static_cast<const void*>(Thread), N);
+      for (uint32_t i = N > FEXCore::Core::IosBlockRingEntries ? N - FEXCore::Core::IosBlockRingEntries : 0; i < N; i++) { /* the newest 4096, as before */
+        const uint64_t Ent = Ring[1 + ((Next + i) & (N - 1))];
+        if (!Ent) {
+          continue;
+        }
+        const uint64_t Rip = Ent & 0xffffffffffffULL;   /* ml1206: high 16 bits = bytes in the block */
+        uint32_t Len = static_cast<uint32_t>(Ent >> 48);
+        if (!Len || Len > 96) {
+          Len = Len ? 96 : 16;
+        }
+        uint8_t Bytes[96];
+        char Hex[96 * 3 + 1] = "?";
+        if (IosSafeReadGuest(Rip, Bytes, Len)) {
+          for (uint32_t k = 0; k < Len; k++) {
+            Hex[k * 3] = HexDigits[Bytes[k] >> 4];
+            Hex[k * 3 + 1] = HexDigits[Bytes[k] & 0xf];
+            Hex[k * 3 + 2] = ' ';
+          }
+          Hex[Len * 3] = 0;
+        }
+        LogMan::Msg::EFmt("[block-ring] -{} {:x}: {}", N - i, Rip, static_cast<const char*>(Hex));
+      }
+      /* bo3-ring-at v2: the loop reads only stack and rbp locals, so log the registers and those
+       * locals as they are on entry; with them the loop can be stepped offline. */
+      const auto& G = Frame->State.gregs;
+      LogMan::Msg::EFmt("[ring-at] regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
+                        G[X86State::REG_RAX], G[X86State::REG_RBX], G[X86State::REG_RCX], G[X86State::REG_RDX],
+                        G[X86State::REG_RSI], G[X86State::REG_RDI], G[X86State::REG_RBP], G[X86State::REG_RSP]);
+      LogMan::Msg::EFmt("[ring-at] regs r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                        G[X86State::REG_R8], G[X86State::REG_R9], G[X86State::REG_R10], G[X86State::REG_R11],
+                        G[X86State::REG_R12], G[X86State::REG_R13], G[X86State::REG_R14], G[X86State::REG_R15]);
+      auto DumpLocals = [&](const char* Tag, uint64_t Start, uint64_t Len) {
+        uint8_t Chunk[32];
+        for (uint64_t Off = 0; Off < Len; Off += sizeof(Chunk)) {
+          char Line[65];
+          if (!IosSafeReadGuest(Start + Off, Chunk, sizeof(Chunk))) {
+            LogMan::Msg::EFmt("[ring-at] {} {:#x}: unreadable", Tag, Start + Off);
+            continue;
+          }
+          for (uint32_t k = 0; k < sizeof(Chunk); k++) {
+            Line[k * 2] = HexDigits[Chunk[k] >> 4];
+            Line[k * 2 + 1] = HexDigits[Chunk[k] & 0xf];
+          }
+          Line[64] = 0;
+          LogMan::Msg::EFmt("[ring-at] {} {:#x}: {}", Tag, Start + Off, static_cast<const char*>(Line));
+        }
+      };
+      /* bo3-ring-at v3: the ring lines carry at most 96 bytes per entry, but most of the loop's
+       * translations are longer, so the loop could not be replayed offline. Dump the code of every
+       * DISTINCT ring entry once, up to 512 bytes (or the bytes left in its translation), in 32-byte
+       * lines. About 400 distinct entries, under 1 MB of log. */
+      {
+        static uint64_t Seen[FEXCore::Core::IosBlockRingEntries]; /* only the newest 4096 are walked */
+        uint32_t NSeen = 0;
+        for (uint32_t i = N > FEXCore::Core::IosBlockRingEntries ? N - FEXCore::Core::IosBlockRingEntries : 0; i < N; i++) {
+          const uint64_t Ent = Ring[1 + ((Next + i) & (N - 1))];
+          if (!Ent) {
+            continue;
+          }
+          const uint64_t Rip = Ent & 0xffffffffffffULL;
+          bool Dup = false;
+          for (uint32_t j = 0; j < NSeen && !Dup; j++) {
+            Dup = Seen[j] == Rip;
+          }
+          if (Dup) {
+            continue;
+          }
+          Seen[NSeen++] = Rip;
+          uint64_t Left = Ent >> 48;
+          if (!Left || Left > 512) {
+            Left = 512;
+          }
+          Left = (Left + 31) & ~31ULL;
+          DumpLocals("code", Rip, Left);
+        }
+        LogMan::Msg::EFmt("[ring-at] code: {} distinct entries", NSeen);
+      }
+      DumpLocals("rsp", G[X86State::REG_RSP] & ~0x1fULL, 0x300);
+      DumpLocals("rbp", (G[X86State::REG_RBP] - 0x200) & ~0x1fULL, 0x400);
+      LogMan::Msg::EFmt("[ring-at] end");
+    }
+  }
+#endif
+
 #ifdef FEX_IOS_HOST
   /* ml648: consume any pending Mono-backpatcher event.
    *
@@ -1875,6 +2024,84 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     static std::atomic<uint32_t> LowRipReports {0};
     if (LowRipReports.fetch_add(1, std::memory_order_relaxed) < 8)
       LogMan::Msg::IFmt("[low-rip-fault] ml1160 checked guest decode rip={:#x}", GuestRIP);
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+    /* iOS-Madeira bo3-null-call-trace (Black Ops III, Nov 20): the game's main thread
+     * reached RIP 0 right after its anti-tamper unpack and the log could not say which
+     * call did it. When a guest CALL lands on a low RIP, the return address is the qword
+     * at guest RSP and the call instruction sits just before it. Log both (plus a few
+     * stack qwords and registers) so the caller and the pointer slot it read can be found
+     * offline from the module bases in the same log. Log-only: no state is changed.
+     * arm64ec (x64 guests) only: the WOW64 module's 32-bit guest needs a different read.
+     * Reads go through IosSafeReadGuest (checked with NtQueryVirtualMemory first).
+     * Off switch: env.MADEIRA_NULL_CALL_TRACE = 0. */
+    static std::atomic<uint32_t> NullCallReports {0};
+    const char* NullCallTrace = std::getenv("MADEIRA_NULL_CALL_TRACE");
+    if (!(NullCallTrace && NullCallTrace[0] == '0') &&
+        NullCallReports.fetch_add(1, std::memory_order_relaxed) < 4) {
+      const uint64_t Rsp = Frame->State.gregs[X86State::REG_RSP];
+      uint64_t Stk[6] {};
+      if (!IosSafeReadGuest(Rsp, Stk, sizeof(Stk))) {
+        LogMan::Msg::EFmt("[null-call] rip={:#x} rsp={:#x} stack unreadable", GuestRIP, Rsp);
+      } else {
+        const uint64_t Ret = Stk[0];
+        uint8_t Code[16] {};
+        LogMan::Msg::EFmt("[null-call] rip={:#x} rsp={:#x} ret={:#x} stk+8..+40: {:#x} {:#x} {:#x} {:#x} {:#x}",
+                          GuestRIP, Rsp, Ret, Stk[1], Stk[2], Stk[3], Stk[4], Stk[5]);
+        if (Ret > sizeof(Code) && IosSafeReadGuest(Ret - sizeof(Code), Code, sizeof(Code))) {
+          LogMan::Msg::EFmt("[null-call] bytes before ret (ret-16..ret-1): {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} "
+                            "{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            Code[0], Code[1], Code[2], Code[3], Code[4], Code[5], Code[6], Code[7], Code[8], Code[9], Code[10],
+                            Code[11], Code[12], Code[13], Code[14], Code[15]);
+        } else {
+          LogMan::Msg::EFmt("[null-call] bytes before ret unreadable (ret={:#x} is not a code address: maybe a jmp/ret, not a call)", Ret);
+        }
+        LogMan::Msg::EFmt("[null-call] rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
+                          Frame->State.gregs[X86State::REG_RAX], Frame->State.gregs[X86State::REG_RCX],
+                          Frame->State.gregs[X86State::REG_RDX], Frame->State.gregs[X86State::REG_RBX],
+                          Frame->State.gregs[X86State::REG_RBP], Frame->State.gregs[X86State::REG_RSI],
+                          Frame->State.gregs[X86State::REG_RDI], Frame->State.gregs[X86State::REG_R8],
+                          Frame->State.gregs[X86State::REG_R9]);
+        LogMan::Msg::EFmt("[null-call] r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                          Frame->State.gregs[X86State::REG_R10], Frame->State.gregs[X86State::REG_R11],
+                          Frame->State.gregs[X86State::REG_R12], Frame->State.gregs[X86State::REG_R13],
+                          Frame->State.gregs[X86State::REG_R14], Frame->State.gregs[X86State::REG_R15]);
+        /* bo3-null-call-dump (Nov 21): ONCE per process, hex-dump the caller's code
+         * [ret-0x1800, ret+0x400) and the stack [rsp, rsp+0x400) so the lookup that produced
+         * the null pointer can be disassembled offline. Read in 256-byte chunks; an unreadable
+         * chunk is reported and skipped. Log-only, ~260 lines. Studying only: nothing in the
+         * game is changed. Off: env.MADEIRA_NULL_CALL_DUMP = 0. */
+        static std::atomic<bool> NullCallDumped {false};
+        const char* NullCallDump = std::getenv("MADEIRA_NULL_CALL_DUMP");
+        if (!(NullCallDump && NullCallDump[0] == '0') && !NullCallDumped.exchange(true, std::memory_order_relaxed)) {
+          static uint8_t Chunk[256];
+          static const char Hex[] = "0123456789abcdef";
+          auto DumpRange = [&](const char* Tag, uint64_t Start, uint64_t Len) {
+            for (uint64_t Off = 0; Off < Len; Off += sizeof(Chunk)) {
+              const uint64_t At = Start + Off;
+              if (!IosSafeReadGuest(At, Chunk, sizeof(Chunk))) {
+                LogMan::Msg::EFmt("[null-dump] {} {:#x}: unreadable", Tag, At);
+                continue;
+              }
+              for (uint32_t Line = 0; Line < sizeof(Chunk); Line += 32) {
+                char Buf[65];
+                for (uint32_t k = 0; k < 32; k++) {
+                  Buf[k * 2] = Hex[Chunk[Line + k] >> 4];
+                  Buf[k * 2 + 1] = Hex[Chunk[Line + k] & 0xf];
+                }
+                Buf[64] = 0;
+                LogMan::Msg::EFmt("[null-dump] {} {:#x}: {}", Tag, At + Line, static_cast<const char*>(Buf));
+              }
+            }
+          };
+          if (Ret > 0x1800) {
+            DumpRange("code", (Ret - 0x1800) & ~0xffULL, 0x1d00);   /* +0x100 covers the round-down */
+          }
+          DumpRange("stack", Rsp & ~0xffULL, 0x500);
+          LogMan::Msg::EFmt("[null-dump] end (ret={:#x} rsp={:#x})", Ret, Rsp);
+        }
+      }
+    }
+#endif
   }
 
 #ifdef FEX_IOS_HOST
@@ -3125,6 +3352,36 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+  const auto Store = [Size](uint64_t To, uint64_t V) {
+    if (Size == 8) {
+      *reinterpret_cast<uint64_t*>(To) = V;
+    } else if (Size == 4) {
+      *reinterpret_cast<uint32_t*>(To) = V;
+    } else {
+      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
+    }
+  };
+#ifdef FEX_IOS_HOST
+  /* MADEIRA [mono-miss-unlocked]: an alias miss stores AFTER CodeInvalidationMutex is released.
+   *
+   * On a miss the store below goes to the guest's R+X page and faults. The Windows fault handler
+   * (ARM64EC Module.cpp, the access-violation path before HandleRWXAccessViolation) takes
+   * ThreadCreationMutex, so this thread would wait for ThreadCreationMutex while WRITE-owning
+   * CodeInvalidationMutex. Every other path takes them the other way round, ThreadCreationMutex
+   * first (BTCpu64NotifyReadFile, NotifyUnmapViewOfSection, the write-fault path), so two threads
+   * wait on each other forever. Seen on 64-bit Unity games stuck loading (Test 12/13 Sentry logs,
+   * Nov 13 2026: Silksong, ULTRAKILL, Cult of the Lamb, Boomerang Fu, PvZ RH, Body Pay): main
+   * thread "[fexlock]" owner at MonoBackpatcherWrite (xtajit64.dll RVA 0x2044c), waiting on
+   * GetThreadCreationMutex (RVA 0x42d858) held by a worker that waits on CodeInvalidationMutex.
+   * Doing the faulting store outside the lock makes it an ordinary guest SMC write, handled the
+   * same way (and in the same lock order) as any other. A hit still stores to the writable alias
+   * under the lock; that store cannot fault. Off: env.MADEIRA_MONO_MISS_UNLOCKED = 0. */
+  static const bool IosMissUnlocked = [] {
+    const char* V = getenv("MADEIRA_MONO_MISS_UNLOCKED");
+    return !(V && V[0] == '0' && V[1] == 0);
+  }();
+  uint64_t IosMissDest = 0;
+#endif
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
@@ -3149,16 +3406,24 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
       Dest = RW;
     }
     ios_fex_mono_count_helper(RW ? 0 : 1);
+    if (!RW && IosMissUnlocked) {
+      IosMissDest = Dest; // stored below, once the lock is released
+    }
 #endif
 
-    if (Size == 8) {
-      *reinterpret_cast<uint64_t*>(Dest) = Value;
-    } else if (Size == 4) {
-      *reinterpret_cast<uint32_t*>(Dest) = Value;
-    } else {
-      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
+#ifdef FEX_IOS_HOST
+    if (!IosMissDest)
+#endif
+    {
+      Store(Dest, Value);
     }
   }
+
+#ifdef FEX_IOS_HOST
+  if (IosMissDest) {
+    Store(IosMissDest, Value);
+  }
+#endif
 
   CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
 }

@@ -249,7 +249,7 @@ static void balloon_create_timer( struct icon *icon )
     ti.uFlags = TTF_TRACK | TTF_IDISHWND;
     ti.lpszText = icon->info_text;
     SendMessageW( balloon_window, TTM_ADDTOOLW, 0, (LPARAM)&ti );
-    if ((icon->info_flags & NIIF_ICONMASK) == NIIF_USER)
+    if ((icon->info_flags & NIIF_ICON_MASK) == NIIF_USER)
     {
         SendMessageW( balloon_window, TTM_SETTITLEW, (WPARAM)icon->info_icon, (LPARAM)icon->info_title );
     }
@@ -257,7 +257,7 @@ static void balloon_create_timer( struct icon *icon )
     {
         UINT info_flags_wparam = icon->info_flags & NIIF_ERROR;
 
-        if (icon->info_flags & NIIF_LARGEICON)
+        if (icon->info_flags & NIIF_LARGE_ICON)
             info_flags_wparam += TTI_ERROR;
         SendMessageW( balloon_window, TTM_SETTITLEW, info_flags_wparam, (LPARAM)icon->info_title );
     }
@@ -891,7 +891,7 @@ static BOOL handle_incoming(HWND hwndSource, COPYDATASTRUCT *cds)
         icon_data += cbMaskBits + cbColourBits;
     }
 
-    if ((nid.uFlags & NIF_INFO) && (nid.dwInfoFlags & NIIF_ICONMASK) == NIIF_USER)
+    if ((nid.uFlags & NIF_INFO) && (nid.dwInfoFlags & NIIF_ICON_MASK) == NIIF_USER)
     {
         /* Balloon icon */
         LONG cbMaskBits;
@@ -1133,7 +1133,14 @@ static LRESULT WINAPI shell_traywnd_proc( HWND hwnd, UINT msg, WPARAM wparam, LP
         return 0;
 
     case WM_DRAWITEM:
+        if (((MEASUREITEMSTRUCT*)lparam)->CtlType == ODT_MENU)
+            return menu_wndproc(hwnd, msg, wparam, lparam);
         paint_taskbar_button( (const DRAWITEMSTRUCT *)lparam );
+        break;
+
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT*)lparam)->CtlType == ODT_MENU)
+            return menu_wndproc(hwnd, msg, wparam, lparam);
         break;
 
     case WM_COMMAND:

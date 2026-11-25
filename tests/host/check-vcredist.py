@@ -62,7 +62,7 @@ require(redist.count('"vcruntime140_1.dll"') >= 2 and 'arch == "x86" ? dllNames.
 
 # ------------------------------------------------------------------ static: wiring
 require('case welcome, localDevVPN = "localdevvpn", jit, signIn = "sign-in", dockClient = "dock-client",\n'
-        '             wineMono = "wine-mono", vcRedist = "vc-redist", done' in onboarding
+        '             wineMono = "wine-mono", vcRedist = "vc-redist", gameParts = "game-parts", done' in onboarding
         and "case .vcRedist: return 4" in onboarding and "static let revision = 4" in onboarding,
         "setup: the vc-redist step, introduced by revision 4")
 page = block(onboarding, "private var vcRedistPage: some View {")

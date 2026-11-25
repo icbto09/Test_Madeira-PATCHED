@@ -1,0 +1,123 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 35831c4..8ce2b67 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -29,6 +29,7 @@ $end_info$
+ #include <array>
+ #include <cstdint>
+ #include <cstdlib>
++#include <atomic> // madeira [kuser-rebase]
+ 
+ namespace FEXCore::IR {
+ 
+@@ -4681,6 +4682,68 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
+ }
+ 
+ 
++#if defined(FEX_IOS_HOST) && defined(_WIN32)
++}  // namespace FEXCore::IR
++extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);  // ml951/ml954, Source/Windows/ARM64EC/IosJitAlias.cpp
++namespace FEXCore::IR {
++
++/* madeira [kuser-rebase] (env MADEIRA_FEX_KUSER_REBASE = 0 turns it off; on by default). rev=kuser-rebase-1.
++ *
++ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0001
++ * "Windows: Rebase constant loads from a relocated KUSER_SHARED_DATA at JIT time"
++ * (LGPL-2.1 for Wine parts, MIT for FEX parts).
++ *
++ * iOS's 4GB __PAGEZERO keeps KUSER_SHARED_DATA from its architectural address 0x7ffe0000. ntdll maps it
++ * high and registers guest [0x7ffe0000, +page) as a sub-floor window onto the real page (ml952), which
++ * ntdll pushes into FEX's window table (ml951). Until now every guest read of the constant address took a
++ * Mach exception and was emulated by [subfloor] ml956 (over 45,000 of them in an Overwatch run, mostly
++ * TickCount/InterruptTime). His change: "Rebase constant-address 64-bit guest loads from 0x7ffe0000 by
++ * that delta instead of taking a fault per access (1.7us -> 0.3ns per read)". The delta here is the one
++ * FEX already holds, IosSubfloorToReal(0x7ffe0000); his reads Wine's __wine_user_shared_data export.
++ *
++ * Scope, as his: loads only, 64-bit address size, no base, index or segment (moffs A0/A1 and SIB
++ * disp32 forms), the whole access inside the page. Ours, in addition, rebases only real loads (not LEA,
++ * which goes through the same DecodeAddress in his patch), and nothing while code is compiled for a
++ * cache that is kept across processes (the real address differs per run). Anything this misses (register
++ * bases, RIP-relative, 0x67 32-bit addressing, string ops, stores) still faults into ml956, unchanged.
++ * Affects code generation: the switch is read once per process. */
++static bool MadeiraKuserRebase() {
++  static const bool On = [] {
++    const char* E = getenv("MADEIRA_FEX_KUSER_REBASE");
++    const bool V = !(E && E[0] == '0' && E[1] == '\0');
++    LogMan::Msg::EFmt("[kuser-rebase] rev=kuser-rebase-1 {}", V ? "on" : "off (MADEIRA_FEX_KUSER_REBASE=0)");
++    return V;
++  }();
++  return On;
++}
++
++void OpDispatchBuilder::IosKuserRebase(AddressMode& A, IR::OpSize Size) {
++  constexpr uint64_t KuserGuest = 0x7ffe0000ULL;
++  constexpr uint64_t KuserSize = 0x1000;
++  if (A.Base || A.Index || A.Segment || A.AddrSize != OpSize::i64Bit) {
++    return;
++  }
++  const uint64_t Off = static_cast<uint64_t>(A.Offset) - KuserGuest;
++  const uint64_t Bytes = Size == OpSize::iInvalid ? 1 : IR::OpSizeToSize(Size);
++  if (Off >= KuserSize || Bytes > KuserSize - Off) {
++    return;
++  }
++  if (!MadeiraKuserRebase() || CTX->RequiresRelocatableConstants()) {
++    return;
++  }
++  const uint64_t Real = IosSubfloorToReal(KuserGuest);
++  if (Real == KuserGuest) {
++    return; // no window registered yet: ml956 serves the access as before
++  }
++  static std::atomic<uint32_t> Said {0};
++  if (Said.fetch_add(1, std::memory_order_relaxed) < 4) {
++    LogMan::Msg::EFmt("[kuser-rebase] block {:#x}: {}-byte load of guest {:#x} -> real {:#x}", Entry, Bytes,
++                      static_cast<uint64_t>(A.Offset), Real + Off);
++  }
++  A.Offset = static_cast<int64_t>(Real + Off);
++}
++#endif
++
+ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
+                                              IR::OpSize OpSize, uint32_t Flags, const LoadSourceOptions& Options) {
+   auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage] = Options;
+@@ -4718,6 +4781,9 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
+ 
+   const bool ShouldLoad = (IsOperandMem(Operand, true) && LoadData) || ForceLoad;
+   if (ShouldLoad) {
++#if defined(FEX_IOS_HOST) && defined(_WIN32)
++    IosKuserRebase(A, OpSize); // [kuser-rebase]: real loads only, never LEA's address
++#endif
+     if (OpSize == OpSize::f80Bit) {
+       Ref MemSrc = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+       if (CTX->HostFeatures.SupportsSVE()) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 442991e..01f6a1f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -2715,6 +2715,11 @@ private:
+     Ref D = _And(OpSize::i64Bit, S, Constant(IosXl.Delta));
+     return Add(OpSize::i64Bit, EA, D);
+   }
++#if defined(FEX_IOS_HOST) && defined(_WIN32)
++  // madeira [kuser-rebase]: a load from a constant address inside KUSER_SHARED_DATA (0x7ffe0000) goes to
++  // the page's real, relocated address. Definition and credit in OpcodeDispatcher.cpp.
++  void IosKuserRebase(AddressMode& A, IR::OpSize Size);
++#endif
+   IROp_IRHeader* CurrentHeader {};
+ 
+   [[nodiscard]]
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index f978115..cbb7bf7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -40,7 +40,10 @@ OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_LoadSource_WithOpSize(
+       LOGMAN_THROW_A_FMT(!IsVSIB, "VSIB uses LoadVSIB instead");
+     }
+ 
+-    const AddressMode A = DecodeAddress(Op, Operand, AccessType, true /* IsLoad */);
++    AddressMode A = DecodeAddress(Op, Operand, AccessType, true /* IsLoad */);
++#if defined(FEX_IOS_HOST) && defined(_WIN32)
++    IosKuserRebase(A, NeedsHigh ? OpSize::i256Bit : OpSize::i128Bit); // [kuser-rebase]
++#endif
+     if (NeedsHigh) {
+       return _LoadMemPairFPRAutoTSO(OpSize::i128Bit, A, OpSize::i8Bit);
+     } else {

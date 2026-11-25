@@ -49,7 +49,7 @@ require('case .steam: SteamGamesSection(search: "", layout: "cards", width: widt
                 for case, name in (('epic', 'Epic'), ('gog', 'GOG'), ('itch', 'Itch'), ('ea', 'EA')))
         and 'case .other: otherGames' in content,
         "a store's page shows that store's own section; Other games has its own list")
-require('NewLookScrollPage(refresh: { await SteamGamesSection.refresh() }) { width in\n                NewLookStorePage(store: store,' in library
+require('NewLookScrollPage(refresh: { await SteamGamesSection.refresh() }, maxWidth: StoreGridMatch.on ? .infinity : 1100) { width in\n                NewLookStorePage(store: store,' in library   # store-grid-match
         and 'NewLookScrollPage(refresh: { await SteamGamesSection.refresh() }, top: lookTop[.library, default: 0])' in library,
         "pull down on the Library and on a store's page refreshes the stores")
 

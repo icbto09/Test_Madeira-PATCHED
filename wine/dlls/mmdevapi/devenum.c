@@ -503,6 +503,8 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
             pv.vt = VT_LPWSTR;
             pv.pwszVal = cur->drv_id;
 
+            set_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_InstanceId);
+
             if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
                 PROPVARIANT pv2;
 
@@ -965,7 +967,7 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD 
     if (This->devices_count)
     {
         This->devices = malloc(This->devices_count * sizeof(IMMDevice *));
-        if (!This->devices_count)
+        if (!This->devices)
             return E_OUTOFMEMORY;
 
         LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)

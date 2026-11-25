@@ -57,6 +57,14 @@
 #define HWREG_FEX_VENDOR      "GenuineIntel"
 #define HWREG_FEX_BRAND       "Unknown ARM CPU"
 
+/* madeira [cpu-x64-identity] (rev=cpu-identity-2, env MADEIRA_CPU_X64_IDENTITY = 0 turns it off): FEX's
+ * MADEIRA_X64_FAMILY_IDENTIFIER / MADEIRA_X64_BRAND (CPUID.cpp), Intel Core i3-N305 (Alder Lake-N, 8 cores,
+ * 8 threads), family 6 model 0xBE stepping 0; its brand string names no frequency. */
+#define HWREG_X64_STEPPING    0
+#define HWREG_X64_MODEL       0xE
+#define HWREG_X64_EXT_MODEL   0xB
+#define HWREG_X64_BRAND       "Intel(R) Core(TM) i3-N305"
+
 /* FEXCore::Context::TSC_SCALE_MAXIMUM; SmallTSCScale (default on) doubles a
  * slower cycle counter until it reaches this (FEXCore Core.cpp), and CPUID
  * 0x15 reports CNTFRQ_EL0 << TSCScale as the TSC rate. */
@@ -176,6 +184,79 @@ static inline uint64_t hwreg_fex_tsc_hz( uint64_t cntfrq )
     if (hz && hz < HWREG_TSC_SCALE_MAXIMUM)
         while (hz < HWREG_TSC_SCALE_MAXIMUM) hz <<= 1;
     return hz;
+}
+
+/* madeira [cpu-identity] (env MADEIRA_CPU_IDENTITY = 0 turns it off; on by default). rev=cpu-identity-1.
+ *
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0028 and commit
+ * 198a71f8fa (LGPL-2.1 for Wine parts, MIT for FEX parts): "They named 0, none, 1000MHz and 24MHz before,
+ * which protectors take for a VM." With the switch on, FEX's brand string ends in "@ x.xxGHz", the guest
+ * TSC's frequency (CPUID.cpp, CPUIDEmu::BrandString), and ProcessorNameString here is that same string; with
+ * it off, both are the bare product name, as before. Same rounding as FEX: MHz to the nearest 10MHz. */
+/* rev=cpu-identity-2: the master switch and two parts, parsed exactly as FEX parses them
+ * (FEXCore CPUID.cpp MadeiraBrandGHz / MadeiraCpuCountFix, Windows/Common/CPUFeatures.cpp): only the exact
+ * value "0" turns a switch off; the master off turns both parts off.
+ *   MADEIRA_CPU_IDENTITY        master
+ *   MADEIRA_CPU_IDENTITY_BRAND  the " @ x.xxGHz" suffix
+ *   MADEIRA_FEX_CPU_COUNT       one CentralProcessor key per processor, and as many CPUs in CPUID
+ *   MADEIRA_CPU_X64_IDENTITY    the Intel name and signature (HWREG_X64_*) instead of "Unknown ARM CPU" */
+#define HWREG_IDENTITY_BRAND 1
+#define HWREG_IDENTITY_COUNT 2
+#define HWREG_IDENTITY_X64   4
+
+static inline int hwreg_env_off( const char *env )
+{
+    return env && env[0] == '0' && !env[1];
+}
+
+static inline unsigned int hwreg_identity_parts( const char *master, const char *brand, const char *count,
+                                                 const char *x64 )
+{
+    unsigned int parts = 0;
+
+    if (hwreg_env_off( master )) return 0;
+    if (!hwreg_env_off( brand )) parts |= HWREG_IDENTITY_BRAND;
+    if (!hwreg_env_off( count )) parts |= HWREG_IDENTITY_COUNT;
+    if (!hwreg_env_off( x64 )) parts |= HWREG_IDENTITY_X64;
+    return parts;
+}
+
+/* [cpu-x64-identity]: the values hwreg_fex_cpu derives from the signature and the brand, for the Intel part
+ * FEX names with the x64 identity on. Called right after hwreg_fex_cpu; feature set and ~MHz are kept. The
+ * brand gets no " @ x.xxGHz" (hwreg_brand_ghz is not called then): the real string has none. */
+static inline void hwreg_x64_identity( struct hwreg_cpu *cpu )
+{
+    const uint32_t eax = HWREG_X64_STEPPING | HWREG_X64_MODEL << 4 | HWREG_FEX_FAMILY << 8 |
+                         HWREG_X64_EXT_MODEL << 16 | HWREG_FEX_EXT_FAMILY << 20;
+
+    snprintf( cpu->brand, sizeof(cpu->brand), "%s", HWREG_X64_BRAND );
+    cpu->level = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+    cpu->revision = ((eax & 0xf0000) >> 4) | ((eax & 0xf0) << 4) | (eax & 0xf);
+    snprintf( cpu->identifier, sizeof(cpu->identifier), "Intel64 Family %u Model %u Stepping %u",
+              cpu->level, (cpu->revision >> 8) & 0xff, cpu->revision & 0xff );
+}
+
+/* [cpu-identity]: CPUID's brand string, " @ x.xxGHz" appended when the TSC rate is known. */
+static inline void hwreg_brand_ghz( struct hwreg_cpu *cpu, uint64_t cntfrq )
+{
+    uint64_t mhz = hwreg_fex_tsc_hz( cntfrq ) / 1000000, centi;
+    size_t n = strlen( cpu->brand );
+
+    if (!mhz || n >= sizeof(cpu->brand) - 1) return;
+    centi = (mhz + 5) / 10;
+    snprintf( cpu->brand + n, sizeof(cpu->brand) - n, " @ %u.%02uGHz",
+              (unsigned int)(centi / 100), (unsigned int)(centi % 100) );
+}
+
+/* [cpu-identity]: how many CentralProcessor keys to write. It must equal the logical processor count
+ * FEX's CPUID gives the same session (Overwatch 2, 0.2.94: 8 keys with CPUID saying 1 -> crash at 5 s,
+ * 1 key with 1 -> runs). With the count part on, FEX names madeira_reported_cpu_count() (through
+ * PEB->NumberOfProcessors), which is `pending` here: the keys are written before init_peb sets the PEB
+ * (still 0 then). With it off FEX names 1, so 1 key. Same 1..HWREG_MAX_CPUS clamp as the caller. */
+static inline unsigned long hwreg_processors( unsigned long peb_count, unsigned long pending, unsigned int parts )
+{
+    if (!(parts & HWREG_IDENTITY_COUNT)) return 1;
+    return peb_count ? peb_count : pending;
 }
 
 /* `avx`: FEX runs with SupportsAVX (MADEIRA_FEX_AVX=1, read by FetchHostFeatures

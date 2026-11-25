@@ -19,7 +19,7 @@ struct DeferredContextInternalState {
   Com<MTLD3D11CommandList> current_cmdlist;
   std::unordered_map<DynamicBuffer *, DynamicBufferAllocation> current_dynamic_buffer_allocations;
   std::unordered_map<DynamicLinearTexture *, std::pair<TextureAllocation *, uint32_t>> current_dynamic_texture_allocations;
-  std::unordered_map<void *, std::pair<Com<IMTLD3DOcclusionQuery>, uint32_t>> building_visibility_queries;
+  std::unordered_map<void *, std::pair<Com<MTLD3D11OcclusionQuery>, uint32_t>> building_visibility_queries;
 };
 
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj) {
@@ -149,6 +149,8 @@ public:
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
+    if (unlikely(!pResource))
+      return E_INVALIDARG;
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
       if (!pMappedResource)
         return E_INVALIDARG;
@@ -262,6 +264,9 @@ public:
       }
       return S_OK;
     }
+    if (pMappedResource == nullptr) {
+      UNIMPLEMENTED("map-on-default: map");
+    }
     return E_FAIL;
   }
 
@@ -270,6 +275,8 @@ public:
   Unmap(ID3D11Resource *pResource, UINT Subresource) override {
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
+    if (unlikely(!pResource))
+      return;
     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
       BlitObject texture(device, pResource);
       UpdateTexture(TextureUpdateCommand(texture, Subresource, nullptr),
@@ -280,6 +287,9 @@ public:
   void
   STDMETHODCALLTYPE
   Begin(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
@@ -304,7 +314,7 @@ public:
         enc.beginVisibilityResultQuery(enc.currentDeferredVisibilityQuery(query_id));
       });
       ctx_state.building_visibility_queries.insert(
-          {(void *)pAsync, {static_cast<IMTLD3DOcclusionQuery *>(pAsync), query_id}}
+          {(void *)pAsync, {static_cast<MTLD3D11OcclusionQuery *>(pAsync), query_id}}
       );
       break;
     }
@@ -322,14 +332,22 @@ public:
   void
   STDMETHODCALLTYPE
   End(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
-    case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_EVENT:
+    case D3D11_QUERY_TIMESTAMP_DISJOINT:
       promote_flush = true;
       ctx_state.current_cmdlist->issued_event_query.push_back(static_cast<MTLD3D11EventQuery *>(pAsync));
       break;
+    case D3D11_QUERY_TIMESTAMP: {
+      promote_flush = true;
+      ctx_state.current_cmdlist->issued_timestamp_query.push_back(static_cast<MTLD3D11TimestampQuery *>(pAsync));
+      break;
+    }
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
       auto building_query = ctx_state.building_visibility_queries.find(pAsync);
@@ -348,7 +366,6 @@ public:
       ctx_state.building_visibility_queries.erase(building_query);
       break;
     }
-    case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_PIPELINE_STATISTICS: {
       // ignore
       break;
@@ -373,7 +390,15 @@ public:
 
   void
   STDMETHODCALLTYPE
-  ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override{IMPLEMENT_ME}
+  Flush1(D3D11_CONTEXT_TYPE Type, HANDLE hEvent) override {
+    // nop
+  }
+
+  void
+  STDMETHODCALLTYPE
+  ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override{
+    UNIMPLEMENTED("ExecuteCommandList on deferred context");
+  }
 
   HRESULT 
   STDMETHODCALLTYPE
@@ -393,7 +418,7 @@ public:
     ctx_state.current_dynamic_buffer_allocations.clear();
     ctx_state.current_dynamic_texture_allocations.clear();
 
-    *ppCommandList = std::move(ctx_state.current_cmdlist);
+    Com<MTLD3D11CommandList> list = std::move(ctx_state.current_cmdlist);
     device->CreateCommandList((ID3D11CommandList **)&ctx_state.current_cmdlist);
 
     if (RestoreDeferredContextState)
@@ -401,6 +426,13 @@ public:
     else
       ResetD3D11ContextState();
 
+    // ppCommandList is optional: without it the list is released, its commands dropped, as Windows does (Wine's
+    // test_deferred_context_rendering)
+    // Ported from Mullion 912be02 (LGPL-2.1+). Off: MADEIRA_DXMT_MULLION_FINISH_NULL=0 (old: writes through NULL).
+    static const bool finish_null_fix = mullionFix("FINISH_NULL");
+    if (!ppCommandList && finish_null_fix)
+      return E_UNEXPECTED;
+    *ppCommandList = std::move(list);
     return S_OK;
   }
 
@@ -436,6 +468,20 @@ public:
   STDMETHODCALLTYPE
   GetContextFlags() override {
     return context_flag;
+  }
+
+  void STDMETHODCALLTYPE
+  SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
+    // MSDN: SwapDeviceContextState is not supported on a deferred context.
+  }
+
+  HRESULT
+  AcquireSync(ID3D11Resource *pResource, UINT64 Key, DWORD dwMilliseconds) override {
+    return DXGI_ERROR_INVALID_CALL;
+  }
+  HRESULT
+  ReleaseSync(ID3D11Resource *pResource, UINT64 Key) override {
+    return DXGI_ERROR_INVALID_CALL;
   }
 
 private:

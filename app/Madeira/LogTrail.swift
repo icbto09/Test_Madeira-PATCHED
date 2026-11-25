@@ -28,9 +28,11 @@ import os
 enum LogTrail {
     static let enabled = MadeiraConfig.flag("MADEIRA_LOG_TRAIL")
 
-    enum Kind: String { case pad, focus, screen, tap, app, step }
+    enum Kind: String { case pad, focus, screen, tap, app, step, tapDiag = "tap-diag" }
+    /// A tap that hit a bare hosting view: what is under the finger (env.MADEIRA_TAP_DIAG = 0 turns it off).
+    static let tapDiag = MadeiraConfig.flag("MADEIRA_TAP_DIAG")
     /// Lines per kind per app run. A run of a few games stays at a few hundred lines.
-    private static let caps: [Kind: Int] = [.pad: 250, .focus: 120, .screen: 150, .tap: 120, .app: 60, .step: 160]
+    private static let caps: [Kind: Int] = [.pad: 250, .focus: 120, .screen: 150, .tap: 120, .app: 60, .step: 160, .tapDiag: 40]
     private static let lock = NSLock()
     private static var used: [Kind: Int] = [:]
     private static var capped = Set<Kind>()
@@ -262,6 +264,35 @@ enum LogTrail {
         text += " on \(screen)"
         if !lastOnTop.isEmpty { text += ", over \(lastOnTop)" }
         write(.tap, text)
+        // A tap that landed on a bare hosting view: say what the window looks like and which views
+        // sit under the finger (frames in window points), so a dead edge can be told apart from a
+        // control drawn where UIKit does not hit-test it. SwiftUI controls are not UIViews: the list
+        // shows UIKit and platform containers.
+        if tapDiag, let hit, shortType(hit).hasSuffix("HostingView") {
+            let traits = window.traitCollection
+            var under: [String] = []
+            var visited = 0
+            func walk(_ view: UIView, depth: Int) {
+                guard depth < 14, visited < 600, !view.isHidden, view.alpha > 0.01 else { return }
+                visited += 1
+                if view !== window {
+                    let frame = view.convert(view.bounds, to: window)
+                    if frame.contains(point), view.isUserInteractionEnabled,
+                       frame.width < size.width - 1 || frame.height < size.height - 1 {
+                        under.append("\(shortType(view)) \(Int(frame.minX)),\(Int(frame.minY)) \(Int(frame.width))x\(Int(frame.height))")
+                    }
+                }
+                for sub in view.subviews { walk(sub, depth: depth + 1) }
+            }
+            walk(window, depth: 0)
+            let shown = under.suffix(8).joined(separator: " | ")
+            let more = under.count > 8 ? " (+\(under.count - 8) outer)" : ""
+            let insets = window.safeAreaInsets
+            let root = window.rootViewController.map { shortType($0) } ?? "-"
+            let sizes = "h-size=\(traits.horizontalSizeClass.rawValue) v-size=\(traits.verticalSizeClass.rawValue) idiom=\(traits.userInterfaceIdiom.rawValue)"
+            let edges = "dir=\(window.effectiveUserInterfaceLayoutDirection.rawValue) insets=\(Int(insets.top)),\(Int(insets.left)),\(Int(insets.bottom)),\(Int(insets.right))"
+            write(.tapDiag, "[tap-diag] window \(Int(size.width))x\(Int(size.height)) \(sizes) \(edges) rootVC=\(root) under: \(shown.isEmpty ? "-" : shown)\(more)")
+        }
     }
 
     // MARK: Controller
@@ -346,6 +377,7 @@ enum LogTrail {
             if let background { lines.append("background=\(LogTrail.clock(background))") }
             if let lastError { lines.append("last-error=\(lastError)") }
             LogTrail.lock.unlock()
+            lines += AutoTune.markerLines()   // (auto-tune) where this run starts in the log
             guard let url = Self.markerURL else { return }
             try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         }
@@ -355,6 +387,13 @@ enum LogTrail {
     /// (log-fixes) Whether `title` is still running (its Wine not finished): Get Help's upload
     /// waits for the end of the run before it sends the logs.
     static func isRunning(_ title: String) -> Bool { lock.lock(); defer { lock.unlock() }; return session.title == title }
+    /// (auto-test) This app run's game: when its window showed, whether JIT came on, whether its session began.
+    /// Read from this run's session only (never from log text). env.MADEIRA_AUTO_TEST off: not called.
+    static func autoTestSnapshot() -> (shownAt: Double?, jitOn: Bool, began: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let shown = session.steps.first { $0.0.hasPrefix("game shown") || $0.0 == "Steam screen ended (game-window)" }
+        return (shown?.1, session.steps.contains { $0.0 == "JIT on" }, session.began)
+    }
     private static var warnings = 0
 
     static func clock(_ date: Date) -> String {
@@ -383,8 +422,11 @@ enum LogTrail {
         // (get-help) Not after the background: iOS ending it there, or a swipe, is no game problem.
         if fields["background"] == nil, let game = fields["game"] {
             GetHelpCenter.stopped(title: game, windowsPath: fields["path"], why: "Madeira closed while it ran")
+            AutoTune.lastRunKilled(title: game, windowsPath: fields["path"], fields: fields)   // (auto-tune)
         }
         LogRuns.previousRun(String(words.dropFirst("[last-run] ".count)))
+        FlightRecorder.lastRunDied()   // (flight-recorder)
+        RunLedger.unknownEnd(game: fields["game"] ?? "?", words: String(words.dropFirst("[last-run] ".count)))   // (run-ledger)
     }
 
     /// Play in the library (ContentView.launchLibraryEntry): the clock starts.
@@ -403,7 +445,8 @@ enum LogTrail {
         else if let id = entry.itchGameID { store = "itch \(id)" }
         else if let id = entry.eaOfferID { store = "EA \(id)" }
         write(.step, "[step] \(entry.title): play (\(store), \(entry.windowsPath))")
-        LogRuns.start(title: entry.title, store: store, windowsPath: entry.windowsPath)
+        AutoTune.play()   // (auto-tune) where this run starts in the log
+        LogRuns.start(title: entry.title, store: store, windowsPath: entry.windowsPath, settings: RunLedger.settingsText(entry))
     }
 
     /// The session begins (LibraryModel.begin): the state it starts in.
@@ -420,8 +463,9 @@ enum LogTrail {
         }
         session.inMenu = false; session.began = true
         lock.unlock()
+        if fresh { AutoTune.play() }   // (auto-tune) a start without Play: its run starts here in the log
         if !LogRuns.began(title: entry.title) {   // a start without Play: its run starts here
-            LogRuns.start(title: entry.title, store: dock ? "Madeira Dock" : "", windowsPath: entry.windowsPath)
+            LogRuns.start(title: entry.title, store: dock ? "Madeira Dock" : "", windowsPath: entry.windowsPath, settings: RunLedger.settingsText(entry))
             LogRuns.began(title: entry.title)
         }
         step("session")
@@ -525,7 +569,20 @@ enum LogTrail {
             || why == "it stopped before its window showed")
         GetHelpCenter.gameFinished(windowsPath: windowsPath, started: Date().addingTimeInterval(-total), seconds: total,
                                    ended: stoppedByItself ? "crash" : (reason != nil ? "quit" : "normal"))
-        LogRuns.ended(why + ", " + code + (dock.map { ", Madeira Dock result \($0)" } ?? "") + (crash.map { ", Wine: \($0)" } ?? ""), seconds: total)
+        // (rate-after-run) Only a clean run: no Windows error or exit code other than 0 (even if the player pressed Stop), a window showed, no Wine crash.
+        let badEnd = code.hasPrefix("Windows error") || (code.hasPrefix("exit code ") && !code.hasPrefix("exit code 0"))
+        if !badEnd, crash == nil, shown != nil { GetHelpCenter.ratePrompt(title: title, windowsPath: windowsPath, seconds: total) }
+        // (auto-tune) Read this run's log: judge a fix being tried, or get an offer ready after a crash.
+        AutoTune.ended(title: title, windowsPath: windowsPath, started: Date().addingTimeInterval(-total), seconds: total,
+                       windowShown: shown != nil, ending: stoppedByItself ? .crashed : .played)
+        // (auto-test) A Test Run game ended: judge it and go on (AutoTest.swift; off unless env.MADEIRA_AUTO_TEST = 1).
+        if AutoTest.enabled {
+            let endWhy = why, endCode = code, byTester = reason
+            DispatchQueue.main.async { MainActor.assumeIsolated { AutoTestRunner.shared.gameEnded(why: endWhy, code: endCode, reason: byTester) } }
+        }
+        LogRuns.ended(why + ", " + code + (dock.map { ", Madeira Dock result \($0)" } ?? "") + (crash.map { ", Wine: \($0)" } ?? ""), seconds: total,
+                      quit: reason.map { $0.hasPrefix("the start failed") ? "start failed" : (shown == nil ? "user, no window" : "user") }
+                          ?? (stoppedByItself ? "crash" : "normal"))
     }
 
     /// (game-child-exit) In a Madeira Dock or launcher session the program the app started (the Dock host,
@@ -732,6 +789,8 @@ enum LogRuns {
         var title: String
         var store: String
         var config: String
+        /// (log-settings) "32-bit · controller keys · display 1408x648 fit ...": the Game details settings that decide how the game runs.
+        var settings = ""
         /// (debug-logging) "Debug logging Medium · game config 3fa81c2e (14 lines)", test bundle with a level only.
         var debug: String?
         var started: Date
@@ -755,7 +814,7 @@ enum LogRuns {
     }
 
     /// A run starts (Play, or a session that began without Play). Returns its number.
-    static func start(title: String, store: String, windowsPath: String) {
+    static func start(title: String, store: String, windowsPath: String, settings: String = "") {
         guard enabled else { return }
         let config = configText(windowsPath)
         lock.lock()
@@ -766,7 +825,7 @@ enum LogRuns {
         count += 1
         let number = count
         let debug = DebugLogging.stamp(windowsPath: windowsPath)
-        runs.append(Run(number: number, title: title, store: store, config: config, debug: debug, started: Date()))
+        runs.append(Run(number: number, title: title, store: store, config: config, settings: settings, debug: debug, started: Date()))
         lock.unlock()
         LogStore.shared.log("[run-start] #\(number) \(title)")
         if let debug { LogStore.shared.log("[debug-log] #\(number) \(debug)") }
@@ -793,15 +852,18 @@ enum LogRuns {
         writeHeader()
     }
 
-    static func ended(_ words: String, seconds: Double) {
+    static func ended(_ words: String, seconds: Double, quit: String = "?") {
         guard enabled else { return }
         lock.lock()
         guard let i = runs.indices.last, runs[i].ended == nil else { lock.unlock(); return }
         runs[i].ended = words; runs[i].seconds = seconds
         let number = runs[i].number
+        let run = runs[i]
         lock.unlock()
+        if run.began { FlightRecorder.runEnded(started: run.started) }   // (flight-recorder) before [run-end], inside the run
         LogStore.shared.log("[run-end] #\(number)")
         writeHeader()
+        RunLedger.ended(run: run, words: words, seconds: seconds, quit: quit)   // (run-ledger)
     }
 
     /// The previous app run ended in a game ([last-run]).
@@ -827,8 +889,9 @@ enum LogRuns {
                    "madeira.cfg: " + LogTrail.clip(cfg.isEmpty ? "none" : cfg, 600)]
         if let previous { top.append("Previous run: " + LogTrail.clip(previous, 400)) }
         top.append(runs.isEmpty ? "Game runs: none yet" : "Game runs (\(runs.count)):")
-        var lines: [String] = []
+        var groups: [[String]] = []   // (review 7) one group per run, trimmed whole
         for run in runs {
+            var lines: [String] = []
             var line = "  \(run.number). \(run.title)" + (run.store.isEmpty ? "" : " (\(run.store))") + ", started \(LogTrail.clock(run.started)): "
             if let ended = run.ended {
                 line += (run.seconds.map { "ran \(duration($0)), " } ?? "") + ended
@@ -836,14 +899,15 @@ enum LogRuns {
                 line += "running" + (run.lastStep.map { ", last step \($0)" } ?? "")
             }
             lines.append(LogTrail.clip(line, 400))
+            if !run.settings.isEmpty { lines.append("     settings: " + LogTrail.clip(run.settings, 200)) }   // (log-settings)
             lines.append("     its config: " + LogTrail.clip(run.config, 400))
             if let debug = run.debug { lines.append("     " + LogTrail.clip(debug, 200)) }
+            groups.append(lines)
         }
         let end = [lastLine, "(The full log follows.)"]
         func joined(_ body: [String]) -> String { (top + body + end).joined(separator: "\n") + "\n" }
-        var body = lines
-        while joined(body).utf8.count > headerBytes - 2, body.count >= 2 { body.removeFirst(2) }
-        var text = joined(body)
+        while joined(groups.flatMap { $0 }).utf8.count > headerBytes - 2, groups.count >= 2 { groups.removeFirst() }
+        var text = joined(groups.flatMap { $0 })
         while text.utf8.count > headerBytes - 2 { text.removeLast(); }
         let pad = headerBytes - 1 - text.utf8.count
         return text + String(repeating: " ", count: max(0, pad)) + "\n"
@@ -923,10 +987,15 @@ enum LogRuns {
         if !header.isEmpty { out.append("") }
         out.append("--- One game run: Madeira's lines, Wine's errors, and its last \(tailLines) lines ---")
         var errors = 0
+        var crashLines = 0
+        // (crash-capture) Wine's "[crash-report]" block is kept line for line (80 lines at most); it has no
+        // time stamp, so without this rule it would be cut with the other Wine lines.
+        let keepCrash = MadeiraConfig.flag("MADEIRA_REPORT_CRASH_BLOCK")
         for i in run.indices {
             let line = lines[i]
             let madeira = line.hasPrefix("[") && line.dropFirst().prefix(12).filter({ $0 == ":" }).count == 2
             let wineError = line.contains(":err:") || line.contains("wine: ") || line.contains("Unhandled ")
+            if keepCrash, crashLines < 80, line.contains("[crash-report]") { out.append(line); crashLines += 1; continue }
             if i >= tailStart || madeira { out.append(line) }
             else if wineError, errors < wineErrors { out.append(line); errors += 1 }
         }
@@ -951,5 +1020,337 @@ enum PlainTime {
         let hms = String(format: "%02d:%02d:%02d", parts.tm_hour, parts.tm_min, parts.tm_sec)
         guard withDate else { return hms }
         return String(format: "%04d-%02d-%02d ", parts.tm_year + 1900, parts.tm_mon + 1, parts.tm_mday) + hms
+    }
+}
+
+// MARK: (run-ledger, keep-lastgood, log-settings, log-lastrun) one change, four switches
+//
+// env.MADEIRA_RUN_LEDGER = 0      no run-ledger.txt (one tab-separated line per game launch)
+// env.MADEIRA_KEEP_LASTGOOD = 0   no run-history/<game>/good.txt and fail.txt
+// env.MADEIRA_LOG_SETTINGS = 0    no "settings:" line under each game run in the log's summary block
+// env.MADEIRA_LOG_LASTRUN = 0     shared logs do not get the previous Madeira launch's last game run
+//
+// Files live in Documents/run-history/ (NOT Documents/logs: Get Help reads every .txt there as a
+// game log). Everything written is scrubbed (PrivacyScrub). Nothing here changes the game's launch.
+enum RunLedger {
+    static let ledgerOn = MadeiraConfig.flag("MADEIRA_RUN_LEDGER")
+    static let keepOn = MadeiraConfig.flag("MADEIRA_KEEP_LASTGOOD")
+    static let settingsOn = MadeiraConfig.flag("MADEIRA_LOG_SETTINGS")
+    static let lastRunOn = MadeiraConfig.flag("MADEIRA_LOG_LASTRUN")
+    static let ledgerName = "run-ledger.txt"
+    static let maxLines = 300
+    static let keepCap = 20 * 1024 * 1024
+    static let runCap = 2 * 1024 * 1024
+    static let shareCap = 600 * 1024
+    private static let lock = NSLock()
+    private static let queue = DispatchQueue(label: "madeira.run-ledger", qos: .utility)
+
+    static var folder: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("run-history", isDirectory: true)
+    }
+
+    /// "32-bit · controller keys · display 1408x648 fit · launch desktop · fps 1": the Game details settings.
+    static func settingsText(_ e: LibraryEntry) -> String {
+        guard settingsOn else { return "" }
+        return ["\(e.bits)-bit", "controller \(e.controllerMode ?? "game's own")", "display \(e.resolution) \(e.display ?? "fit")",
+                "launch \(e.launchMode ?? "direct")", "fps mode \(e.fpsMode)"].joined(separator: " \u{B7} ")
+    }
+
+    static func field(_ s: String) -> String {
+        PrivacyScrub.line(s.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " "))
+    }
+
+    /// One ledger line (pure: check-run-ledger.py mirrors it).
+    static func line(_ f: [String]) -> String { f.map(field).joined(separator: "\t") }
+
+    static func stamp() -> String { PlainTime.text(Date(), utc: true, withDate: true) + "Z" }
+
+    static let header = "# run ledger, one line per game launch, tab separated: time(UTC) | build | game | store | device | "
+        + "madeira.cfg hash | game cfg hash | quit by | seconds | last step | end | ended"
+
+    /// A run reached its [run-end].
+    static func ended(run: LogRuns.Run, words: String, seconds: Double, quit: String) {
+        if ledgerOn {
+            let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }.map { "\($0.key) = \($0.value)" }.joined(separator: "; ")
+            append(line([stamp(), BuildStamp.text, run.title, run.store, LogRuns.device, DebugLogging.configHash(cfg),
+                         DebugLogging.configHash(run.config), quit, String(Int(seconds.rounded())), run.lastStep ?? "-", words, "yes"]))
+        }
+        if keepOn { keepRun(title: run.title, number: run.number, words: words, seconds: seconds, quit: quit) }
+    }
+
+    /// The previous app run ended in a game without a [run-end] ([last-run]).
+    static func unknownEnd(game: String, words: String) {
+        guard ledgerOn else { return }
+        append(line([stamp(), BuildStamp.text, game, "-", "-", "-", "-", "unknown", "-", "-", words, "unknown"]))
+    }
+
+    private static func append(_ text: String) {
+        queue.async {
+            guard let dir = folder else { return }
+            lock.lock(); defer { lock.unlock() }
+            let fm = FileManager.default
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent(ledgerName)
+            var lines = ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
+            lines.append(text)
+            if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+            try? ([header] + lines).joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// The last `count` ledger lines, for shared logs and Get Help.
+    static func tailText(_ count: Int = 40, game: String? = nil) -> String? {
+        guard ledgerOn, let dir = folder, let text = try? String(contentsOf: dir.appendingPathComponent(ledgerName), encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n").map(String.init)
+        // (review 6) A share for one game lists only that game's launches; Settings (no game named) lists all.
+        let want = game.map(field)
+        let body = lines.filter { !$0.hasPrefix("#") && (want == nil || $0.split(separator: "\t", omittingEmptySubsequences: false).dropFirst(2).first.map(String.init) == want) }.suffix(count)
+        return body.isEmpty ? nil : "\n\n## Run ledger (last \(body.count) game launches, newest last; \(lines.first ?? ""))\n" + body.joined(separator: "\n") + "\n"
+    }
+
+    // MARK: last good and last fail run per game
+
+    static func gameFolder(_ title: String) -> URL? {
+        let name = ClaudeHelp.safeName(title)
+        return folder?.appendingPathComponent(name.allSatisfy { $0 == "." } ? "Game" : name, isDirectory: true)   // (review 8) never "." or ".."
+    }
+
+    /// Cuts the run from madeira-log.txt a moment later (the [run-end] line is written by then), scrubs it and
+    /// keeps it as good.txt (60 s or more, and a user quit or exit code 0) or fail.txt.
+    static func keepRun(title: String, number: Int, words: String, seconds: Double, quit: String) {
+        queue.asyncAfter(deadline: .now() + 3) {
+            guard let docs = ClaudeHelp.documents, let dir = gameFolder(title) else { return }
+            let log = docs.appendingPathComponent("madeira-log.txt")
+            // (review 1, 3) The run is found by its number, and the log is streamed: only the kept head and
+            // tail are held, and only those lines are scrubbed.
+            let startMark = "[run-start] #\(number) \(title)", endMark = "[run-end] #\(number)"
+            let half = runCap / 2
+            var head: [String] = [], tail: [String] = [], tailStart = 0, headBytes = 0, tailBytes = 0
+            var inRun = false, dropped = 0
+            LogLines.scan(in: log) { l in
+                if !inRun { if l.hasSuffix(startMark) { inRun = true; head = [l]; headBytes = l.utf8.count + 1 }; return true }
+                if tail.isEmpty, headBytes + l.utf8.count + 1 <= half { head.append(l); headBytes += l.utf8.count + 1 }
+                else {
+                    tail.append(l); tailBytes += l.utf8.count + 1
+                    while tailBytes > half, tailStart < tail.count { tailBytes -= tail[tailStart].utf8.count + 1; tailStart += 1; dropped += 1 }
+                    if tailStart > 4096 { tail.removeFirst(tailStart); tailStart = 0 }
+                }
+                return !l.hasSuffix(endMark)
+            }
+            guard inRun else { return }
+            // (review 2) Good = 60 s or more and the player quit with a window up, or it ended itself with exit code 0.
+            let good = seconds >= 60 && (quit == "user" || (quit == "normal" && words.contains("exit code 0")))
+            var out = [PrivacyScrub.line("# \(title), run #\(number), \(good ? "good" : "failed"): \(words), \(Int(seconds.rounded())) s, \(BuildStamp.text)")]   // (review 4) scrubbed
+            out += head.map(PrivacyScrub.line)
+            if dropped > 0 { out.append("--- (cut here: \(dropped) lines of the middle left out, the run was over \(runCap / 1_000_000) MB) ---") }
+            out += tail[tailStart...].map(PrivacyScrub.line)
+            let text = out.joined(separator: "\n") + "\n"
+            lock.lock(); defer { lock.unlock() }
+            let fm = FileManager.default
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? text.write(to: dir.appendingPathComponent(good ? "good.txt" : "fail.txt"), atomically: true, encoding: .utf8)
+            prune()
+        }
+    }
+
+    /// Oldest game folders go first until run-history is under keepCap.
+    private static func prune() {
+        guard let dir = folder else { return }
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isDirectoryKey]
+        var games = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys)) ?? []).filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        }
+        func size(_ u: URL) -> Int {
+            ((try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+                .reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) }
+        }
+        func when(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast }
+        var total = games.reduce(0) { $0 + size($1) }
+        games.sort { when($0) < when($1) }
+        while total > keepCap, let oldest = games.first {
+            total -= size(oldest); try? fm.removeItem(at: oldest); games.removeFirst()
+        }
+    }
+
+    // MARK: what a shared log gets added
+
+    /// "## Last good run" / "## Last failed run" for `title`, each cut to shareCap (newest end kept).
+    static func gameRuns(title: String?, skipping firstLine: String? = nil) -> String {
+        guard keepOn, let title, !title.isEmpty, let dir = gameFolder(title) else { return "" }
+        var out = ""
+        for (name, head) in [("fail.txt", "Last failed run"), ("good.txt", "Last good run")] {
+            guard let text = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8), !text.isEmpty else { continue }
+            // (review 5) The shared log is this same run: do not add it twice.
+            if let firstLine, text.split(separator: "\n", maxSplits: 2).dropFirst().first.map(String.init) == PrivacyScrub.line(firstLine) { continue }
+            let cut = text.utf8.count > shareCap
+            out += "\n\n## \(head) of \(title) (kept by Madeira" + (cut ? ", start cut to \(shareCap / 1000) KB" : "") + ")\n"
+                + (cut ? String(text.suffix(shareCap)) : text)
+        }
+        return out
+    }
+
+    /// (log-lastrun) The previous Madeira launch's last game run, for a shared log that has none of it
+    /// (this launch's log, or a share made after Madeira was opened again).
+    static func previousLaunchRun() -> String {
+        guard lastRunOn, let docs = ClaudeHelp.documents else { return "" }
+        let prev = docs.appendingPathComponent("madeira-log.prev.txt")
+        guard let text = LogRuns.lastRun(in: prev, game: nil, maxBytes: 300_000, tailLines: 200, wineErrors: 300) else { return "" }
+        return "\n\n## Last game run of the previous Madeira launch (madeira-log.prev.txt)\n" + PrivacyScrub.text(text)
+    }
+
+    /// Bytes a share can add after the full log: reserve them so the file stays near its cap.
+    static func extras(title: String?, log: URL? = nil) -> String {
+        var first: String?
+        if let log { LogLines.scan(in: log) { first = $0; return false } }
+        return (tailText(game: title) ?? "") + gameRuns(title: title, skipping: first)
+    }
+}
+
+// MARK: - (flight-recorder) Wine's ring of extra traces, copied into the log when a run ends
+//
+// Cameron, Nov 21: "is there like an ultimate perfect log that we can make every time? ... you always
+// have to add stuff to it". Wine (dlls/ntdll/unix/debug.c, flight_take) formats a few extra trace
+// channels (by default DLL loads and the loader's, process and thread code's warnings) into a fixed
+// ring in Library/Caches/flight-recorder.bin instead of the log, so they cost no log writes and no
+// LogStore parsing. The file outlives a crash or an iOS kill; it is not in Documents (no Files app,
+// no backup). When a game run ends (Stop, quit, a crash, the game closing), its last 60 s go into
+// madeira-log.txt just before [run-end], so every shared log and Get Help report carries them. After
+// Madeira itself died mid-game ([last-run]), they go at the end of madeira-log.prev.txt.
+//
+// Lines are scrubbed (PrivacyScrub), repeats are counted, at most 256 KB (newest) go in. The log's
+// own readers skip "] [flight] " lines (LogStore.shouldDropLine, HelpReport.noiseTags, LogSummary).
+// Off switch: env.MADEIRA_FLIGHT = 0 (Wine adds no channels; nothing is copied).
+// Also: env.MADEIRA_FLIGHT_CHANNELS = trace+seh,trace+module (only trace+/warn+ entries) for more,
+//       env.MADEIRA_FLIGHT_MB = <1-64> for the ring's size (default 8). Wine reads these once per
+//       Madeira launch.
+// Layout (keep in step with debug.c): 4096-byte header {magic "MFR1", slot size, slots, version,
+// next (UInt64 @16), opened_ms (UInt64 @24)}, then slots of 512 bytes {seq (0 = being written), ms,
+// len (UInt16 @16), text @20}.
+enum FlightRecorder {
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_FLIGHT") }
+    static let window: TimeInterval = 60
+    static let maxBytes = 256 * 1024
+    static let fileName = "flight-recorder.bin"
+    static let tag = "] [flight] "
+
+    static var url: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent(fileName)
+    }
+
+    struct Line { let seq: UInt64; let ms: UInt64; let text: String }
+
+    /// The finished lines written from `fromMS` to `toMS`, oldest first, and the ring's header numbers.
+    /// A plain read (not mapped): Wine may replace the file at the next start.
+    static func lines(fromMS: UInt64, toMS: UInt64) -> (lines: [Line], written: UInt64, opened: UInt64, newest: UInt64) {
+        guard let url, let data = try? Data(contentsOf: url), data.count >= 4096 else { return ([], 0, 0, 0) }
+        return data.withUnsafeBytes { raw in
+            func u32(_ at: Int) -> UInt32 { raw.loadUnaligned(fromByteOffset: at, as: UInt32.self) }
+            func u64(_ at: Int) -> UInt64 { raw.loadUnaligned(fromByteOffset: at, as: UInt64.self) }
+            guard u32(0) == 0x3152464d, u32(4) == 512, u32(12) == 1 else { return ([], 0, 0, 0) }
+            let slots = Int(u32(8)), written = u64(16), opened = u64(24)
+            guard slots > 0, 4096 + slots * 512 <= raw.count else { return ([], 0, 0, 0) }
+            var out: [Line] = []
+            var newest: UInt64 = 0
+            for i in 0..<slots {
+                let at = 4096 + i * 512
+                let seq = u64(at)
+                // A slot holds line seq-1 at index (seq-1) % slots; anything else is torn or stale.
+                guard seq != 0, seq <= written, Int((seq - 1) % UInt64(slots)) == i else { continue }
+                let ms = u64(at + 8)
+                newest = max(newest, ms)
+                guard ms >= fromMS, ms <= toMS else { continue }   // time first: only these are decoded
+                let len = min(Int(raw.loadUnaligned(fromByteOffset: at + 16, as: UInt16.self)), 492)
+                let bytes = UnsafeRawBufferPointer(rebasing: raw[(at + 20)..<(at + 20 + len)])
+                out.append(Line(seq: seq, ms: ms, text: String(decoding: bytes, as: UTF8.self)))
+            }
+            out.sort { $0.seq < $1.seq }
+            return (out, written, opened, newest)
+        }
+    }
+
+    static func ms(_ date: Date) -> UInt64 { UInt64(max(0, date.timeIntervalSince1970 * 1000)) }
+
+    /// The block for the log, "" when off or nothing is in the window. `died`: the run's end is the
+    /// ring's newest line, and nothing older than the launch that wrote it.
+    static func block(from: Date?, to: Date = Date(), died: Bool = false, why: String) -> String {
+        guard enabled else { return "" }
+        var toMS = ms(to) + 2000
+        var fromMS = from.map(ms) ?? 0
+        if died {
+            // First pass for the newest line and the launch it came from.
+            let probe = lines(fromMS: UInt64.max, toMS: UInt64.max)
+            guard probe.newest > 0 else { return "" }
+            toMS = probe.newest
+            fromMS = max(fromMS, probe.opened)
+        }
+        fromMS = max(fromMS, toMS > UInt64(window * 1000) ? toMS - UInt64(window * 1000) : 0)
+        let (picked, written, _, _) = lines(fromMS: fromMS, toMS: toMS)
+        guard !picked.isEmpty else { return "" }
+        let clock = DateFormatter()
+        clock.locale = Locale(identifier: "en_US_POSIX")
+        clock.dateFormat = "HH:mm:ss.SSS"
+        // Newest first, so the cap keeps the end; reversed at the end.
+        var body: [String] = []
+        var size = 0, shown = 0, cut = 0
+        var last: String?
+        var repeats = 0
+        func flushRepeat() {
+            if repeats > 0 { body.append("    (the line below \(repeats) more time\(repeats == 1 ? "" : "s"))"); repeats = 0 }
+        }
+        for line in picked.reversed() {
+            if size >= maxBytes { cut += 1; continue }
+            let stamp = "[\(clock.string(from: Date(timeIntervalSince1970: Double(line.ms) / 1000)))" + tag
+            // A slot can hold several lines of one trace: each gets the tag.
+            for part in line.text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
+                let text = PrivacyScrub.line(String(part))
+                if text == last { repeats += 1; continue }
+                flushRepeat()
+                last = text
+                let out = stamp + text
+                body.append(out)
+                size += out.utf8.count + 1
+            }
+            shown += 1
+        }
+        flushRepeat()
+        var head = "=== Flight recorder (\(why)): Wine's extra traces, up to the last \(Int(window)) s, \(shown) lines"
+        if cut > 0 { head += ", \(cut) older lines left out (256 KB cap)" }
+        head += "; \(written) lines recorded since the ring was made ==="
+        return ([head] + body.reversed() + ["=== end of flight recorder ==="]).joined(separator: "\n") + "\n"
+    }
+
+    /// Appends `text` to a log file with O_APPEND, so Wine's own appends are never overwritten.
+    static func append(_ text: String, to url: URL) {
+        guard !text.isEmpty else { return }
+        let fd = open(url.path, O_WRONLY | O_APPEND)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        let data = Data(text.utf8)
+        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    }
+
+    /// A run ended: its last 60 s into madeira-log.txt (before its [run-end] line). Only the
+    /// lines in the window are decoded and at most 256 KB scrubbed, so this stays short.
+    static func runEnded(started: Date) {
+        let text = block(from: started.addingTimeInterval(-5), why: "the end of this game run")
+        guard !text.isEmpty else { LogStore.shared.log("[flight-recorder] nothing recorded for this run"); return }
+        LogStore.shared.flushRepeats()   // a held-back repeat count belongs before the block
+        append(text, to: LogStore.shared.logURL)
+        LogStore.shared.log("[flight-recorder] \(text.utf8.count) bytes copied into the log")
+    }
+
+    /// Madeira died while a game ran: the ring's last 60 s go to the end of madeira-log.prev.txt.
+    static func lastRunDied() {
+        guard enabled, let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let prev = docs.appendingPathComponent("madeira-log.prev.txt")
+        DispatchQueue.global(qos: .utility).async {
+            guard FileManager.default.fileExists(atPath: prev.path) else { return }
+            let text = block(from: nil, died: true, why: "the last 60 s before Madeira closed")
+            guard !text.isEmpty else { return }
+            append("\n" + text, to: prev)
+            LogStore.shared.log("[flight-recorder] the previous run's last 60 s (\(text.utf8.count) bytes) were added to madeira-log.prev.txt")
+        }
     }
 }

@@ -95,3 +95,18 @@ the repository does not contain and the verification status of each step;
 as of 2026-09-16 that end-to-end rebuild has not been demonstrated from a
 clean checkout. Reverse engineering the combined work for debugging such
 modifications is permitted.
+
+MetalSharp (AGPL-3.0): some of Madeira's Overwatch 2 emulation fixes (section views, the x86 debug registers, the
+XSAVE state revert and the Intel flag behaviour) are ported from MetalSharp and MetalSharp-Wine, written by BOR1NG
+(Avery Felts, https://github.com/aaf2tbz). Thank you, BOR1NG. The complete source of each build that contains this
+code is published at https://github.com/camhoc/Madeira.
+
+MetalSharp-Wine (LGPL): the Overwatch 2 clock/CPU-speed fix and x64 context fields are also ported from MetalSharp-Wine by
+BOR1NG (Avery Felts, https://github.com/aaf2tbz).
+
+Mullion (LGPL-2.1-or-later): six Direct3D 11 fixes in DXMT are ported from Mullion (https://github.com/dttdrv/mullion) by
+dttdrv and contributors. Thank you.
+
+Fourteen Overwatch 2 items (sockets, section-table bound, read-only view copy, selector answer, partial copy, POP fault, x87 flags,
+x87 and direction-flag context fields, shared-data reads, CPU name, hard-error log, GLOBALROOT paths, and an opt-in bigger code buffer) are ported from MetalSharp-Wine (LGPL-2.1) and MetalSharp's FEX patches (MIT) by
+BOR1NG (Avery Felts, https://github.com/aaf2tbz). Thank you, BOR1NG.

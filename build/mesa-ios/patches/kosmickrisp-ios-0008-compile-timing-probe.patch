@@ -1,0 +1,255 @@
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -32,6 +32,135 @@
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
+ 
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* Madeira probe (Detroit shader compile): where does pipeline-creation time
++ * go, and how many pipelines are built at once? Logs one "[kk-compile]" line
++ * at most every 10 s while pipelines are being made. Logging only; it does
++ * not change what is compiled. Off: MADEIRA_KK_COMPILE_TIMING=0.
++ * Not counted: SPIR-V -> NIR in the Vulkan runtime before kk_compile_shaders. */
++enum { KK_CT_NEW = 0, KK_CT_HIT = 1, KK_CT_KINDS = 2 };
++static struct {
++   uint64_t n[KK_CT_KINDS];
++   uint64_t total_ns[KK_CT_KINDS];
++   uint64_t metal_ns[KK_CT_KINDS];
++   uint64_t max_ns[KK_CT_KINDS];
++   int32_t in_flight;
++   int32_t max_in_flight;
++   int64_t last_print_ns;
++   uint64_t prev_n[KK_CT_KINDS];
++} kk_ct;
++static __thread int kk_ct_tls_kind = -1;
++
++static bool
++kk_ct_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("MADEIRA_KK_COMPILE_TIMING");
++      on = !(e && !strcmp(e, "0"));
++   }
++   return on;
++}
++
++static void
++kk_ct_max_u64(uint64_t *dst, uint64_t v)
++{
++   uint64_t cur = p_atomic_read(dst);
++   while (v > cur) {
++      uint64_t seen = p_atomic_cmpxchg(dst, cur, v);
++      if (seen == cur)
++         break;
++      cur = seen;
++   }
++}
++
++static int64_t
++kk_ct_begin(int kind)
++{
++   if (!kk_ct_on() || kk_ct_tls_kind >= 0)
++      return 0;
++   kk_ct_tls_kind = kind;
++   int32_t now = p_atomic_inc_return(&kk_ct.in_flight);
++   int32_t cur = p_atomic_read(&kk_ct.max_in_flight);
++   while (now > cur) {
++      int32_t seen = p_atomic_cmpxchg(&kk_ct.max_in_flight, cur, now);
++      if (seen == cur)
++         break;
++      cur = seen;
++   }
++   return os_time_get_nano();
++}
++
++static void
++kk_ct_print(int64_t now)
++{
++   int64_t last = p_atomic_read(&kk_ct.last_print_ns);
++   if (now - last < 10000000000ll)
++      return;
++   if (p_atomic_cmpxchg(&kk_ct.last_print_ns, last, now) != last)
++      return; /* another thread prints this window */
++
++   uint64_t n[KK_CT_KINDS], win[KK_CT_KINDS];
++   double avg_ms[KK_CT_KINDS], metal_pct[KK_CT_KINDS], max_ms[KK_CT_KINDS];
++   for (int k = 0; k < KK_CT_KINDS; k++) {
++      n[k] = p_atomic_read(&kk_ct.n[k]);
++      win[k] = n[k] - kk_ct.prev_n[k];
++      kk_ct.prev_n[k] = n[k];
++      uint64_t tot = p_atomic_read(&kk_ct.total_ns[k]);
++      uint64_t met = p_atomic_read(&kk_ct.metal_ns[k]);
++      avg_ms[k] = n[k] ? (double)tot / n[k] / 1e6 : 0.0;
++      metal_pct[k] = tot ? 100.0 * (double)met / (double)tot : 0.0;
++      max_ms[k] = (double)p_atomic_read(&kk_ct.max_ns[k]) / 1e6;
++   }
++   fprintf(stderr,
++           "[kk-compile] since %s: new %llu, cache-hit %llu | all: new %llu "
++           "avg %.1f ms (Metal %.0f%%) max %.0f ms; cache-hit %llu avg %.1f ms "
++           "(Metal %.0f%%) | at once: now %d, max %d (off: "
++           "MADEIRA_KK_COMPILE_TIMING=0)\n",
++           last ? "last line" : "start", (unsigned long long)win[KK_CT_NEW],
++           (unsigned long long)win[KK_CT_HIT],
++           (unsigned long long)n[KK_CT_NEW], avg_ms[KK_CT_NEW],
++           metal_pct[KK_CT_NEW], max_ms[KK_CT_NEW],
++           (unsigned long long)n[KK_CT_HIT], avg_ms[KK_CT_HIT],
++           metal_pct[KK_CT_HIT], (int)p_atomic_read(&kk_ct.in_flight),
++           (int)p_atomic_read(&kk_ct.max_in_flight));
++}
++
++static void
++kk_ct_end(int kind, int64_t t0)
++{
++   if (t0 == 0)
++      return;
++   int64_t now = os_time_get_nano();
++   uint64_t dt = (uint64_t)(now - t0);
++   p_atomic_add(&kk_ct.total_ns[kind], dt);
++   p_atomic_inc(&kk_ct.n[kind]);
++   kk_ct_max_u64(&kk_ct.max_ns[kind], dt);
++   p_atomic_dec(&kk_ct.in_flight);
++   kk_ct_tls_kind = -1;
++   kk_ct_print(now);
++}
++
++/* Metal library + pipeline-state time, charged to the outer new/hit call. */
++static int64_t
++kk_ct_metal_begin(void)
++{
++   return (kk_ct_tls_kind >= 0) ? os_time_get_nano() : 0;
++}
++
++static void
++kk_ct_metal_end(int64_t t0)
++{
++   if (t0 && kk_ct_tls_kind >= 0)
++      p_atomic_add(&kk_ct.metal_ns[kk_ct_tls_kind],
++                   (uint64_t)(os_time_get_nano() - t0));
++}
++
+ static const nir_shader_compiler_options *
+ kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
+                    UNUSED const struct vk_pipeline_robustness_state *rs)
+@@ -1207,7 +1336,7 @@
+ }
+ 
+ static VkResult
+-kk_compile_compute_pipeline(struct kk_device *device,
++kk_compile_compute_pipeline_impl(struct kk_device *device,
+                             const struct msl_compile_data *data,
+                             uint32_t local_size_threads,
+                             mtl_compute_pipeline_state **pipe)
+@@ -1235,6 +1364,19 @@
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kk_compile_compute_pipeline(struct kk_device *device,
++                            const struct msl_compile_data *data,
++                            uint32_t local_size_threads,
++                            mtl_compute_pipeline_state **pipe)
++{
++   int64_t t0 = kk_ct_metal_begin();
++   VkResult r =
++      kk_compile_compute_pipeline_impl(device, data, local_size_threads, pipe);
++   kk_ct_metal_end(t0);
++   return r;
++}
++
+ static mtl_depth_stencil_state *
+ kk_compile_ds_state(struct kk_device *device, struct kk_shader_info *info)
+ {
+@@ -1432,7 +1574,7 @@
+ }
+ 
+ static VkResult
+-kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
++kk_compile_graphics_pipeline_impl(struct kk_device *device, struct kk_shader *vs)
+ {
+    struct kk_physical_device *pdev = kk_device_physical(device);
+ 
+@@ -1449,7 +1591,7 @@
+    for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i) {
+       uint32_t local_thread_size =
+          (i == 0u) ? 64u : vs->info.vs.tess_local_thread_size;
+-      result = kk_compile_compute_pipeline(device, &vs->msl_data[vs_stage],
++      result = kk_compile_compute_pipeline_impl(device, &vs->msl_data[vs_stage],
+                                            local_thread_size,
+                                            &pipe->gfx.pre_render[i]);
+ 
+@@ -1533,7 +1675,16 @@
+ }
+ 
+ static VkResult
+-kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
++kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
++{
++   int64_t t0 = kk_ct_metal_begin();
++   VkResult r = kk_compile_graphics_pipeline_impl(device, vs);
++   kk_ct_metal_end(t0);
++   return r;
++}
++
++static VkResult
++kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+                    struct vk_shader_compile_info *infos,
+                    const struct vk_graphics_pipeline_state *state,
+                    const struct vk_features *enabled_features,
+@@ -1659,6 +1810,22 @@
+    return result;
+ }
+ 
++static VkResult
++kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
++                   struct vk_shader_compile_info *infos,
++                   const struct vk_graphics_pipeline_state *state,
++                   const struct vk_features *enabled_features,
++                   const VkAllocationCallbacks *pAllocator,
++                   struct vk_shader **shaders_out)
++{
++   int64_t t0 = kk_ct_begin(KK_CT_NEW);
++   VkResult r = kk_compile_shaders_impl(device, shader_count, infos, state,
++                                        enabled_features, pAllocator,
++                                        shaders_out);
++   kk_ct_end(KK_CT_NEW, t0);
++   return r;
++}
++
+ static void
+ kk_msl_serialize(struct kk_shader *shader, mesa_shader_stage stage,
+                  struct blob *blob)
+@@ -1714,7 +1881,7 @@
+ }
+ 
+ static VkResult
+-kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
++kk_deserialize_shader_impl(struct vk_device *vk_dev, struct blob_reader *blob,
+                       uint32_t binary_version,
+                       const VkAllocationCallbacks *pAllocator,
+                       struct vk_shader **shader_out)
+@@ -1768,6 +1935,19 @@
+    return vk_error(dev, result);
+ }
+ 
++static VkResult
++kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
++                      uint32_t binary_version,
++                      const VkAllocationCallbacks *pAllocator,
++                      struct vk_shader **shader_out)
++{
++   int64_t t0 = kk_ct_begin(KK_CT_HIT);
++   VkResult r = kk_deserialize_shader_impl(vk_dev, blob, binary_version,
++                                           pAllocator, shader_out);
++   kk_ct_end(KK_CT_HIT, t0);
++   return r;
++}
++
+ void
+ kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd, struct kk_shader *shader)
+ {

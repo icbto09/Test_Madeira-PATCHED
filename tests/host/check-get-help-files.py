@@ -64,6 +64,16 @@ langs = {'de', 'es', 'ko', 'pt-BR', 'ru', 'zh-Hans'}
 entry = strings.get('Looking closer at your game…', {}).get('localizations', {})
 check(set(entry) == langs and all(v['stringUnit']['state'] == 'translated' for v in entry.values()), '"Looking closer" in all six languages')
 
+# (get-help-own-folder) Both file lists stay inside the game's own folder for a Steam entry.
+check('static func listFolder(of path: URL, ownFolder: Bool' in view
+      and 'let folder = listFolder(of: exe, ownFolder: MadeiraConfig.flag("MADEIRA_GET_HELP_OWN_FOLDER"))' in view
+      and 'let folder = exe.deletingLastPathComponent()' not in view,
+      'files.txt walks the entry itself when it is a folder (env.MADEIRA_GET_HELP_OWN_FOLDER = 0: the parent)')
+check('ownFolder: MadeiraConfig.flag("MADEIRA_GET_HELP_OWN_FOLDER")' in view
+      and 'if ownFolder, i + 1 == parts.count - 1, !parts[i + 1].lowercased().hasSuffix(".exe")' in files
+      and 'MadeiraConfig' not in files.split('import Foundation', 1)[1].replace('env.MADEIRA_GET_HELP_OWN_FOLDER', ''),
+      'Look closer keeps a Steam entry inside its own folder, and GetHelpFiles.swift stays free of the app')
+
 swiftc = shutil.which('swiftc')
 if not swiftc:
     print('SKIP: swiftc not found' + (' (required)' if '--require-swift' in sys.argv else ''))
@@ -94,6 +104,11 @@ let folder = GetHelpFiles.gameFolder(drive: drive, relativePath: "Steam/steamapp
 expect(folder?.lastPathComponent == "KH3", "a Steam game's folder is its steamapps/common folder")
 expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "Games/Foo/foo.exe")?.lastPathComponent == "Foo", "another game's folder is the program's folder")
 expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "foo.exe") == nil && GetHelpFiles.gameFolder(drive: drive, relativePath: "a/../b.exe") == nil, "no folder for odd paths")
+// (get-help-own-folder) A Steam entry's path ends at the game's folder: that folder, not steamapps/common.
+expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "Steam/steamapps/common/KH3")?.lastPathComponent == "KH3", "a Steam entry (its path is the game's folder) keeps its own folder")
+expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "Steam\\steamapps\\common\\KH3")?.lastPathComponent == "KH3", "the same with backslashes")
+expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "Steam/steamapps/common/KH3", ownFolder: false)?.lastPathComponent == "common", "switched off: the old parent folder")
+expect(GetHelpFiles.gameFolder(drive: drive, relativePath: "Steam/steamapps/common/loose.exe")?.lastPathComponent == "common", "a program right under steamapps/common is still a program")
 
 var places = GetHelpFiles.Places(steamRoot: drive.appendingPathComponent("Steam"), gameFolder: folder,
                                  runLog: { base.appendingPathComponent("run.txt") }, hasRun: true)

@@ -426,12 +426,14 @@ struct SteamWorkshopSections: View {
             } label: {
                 Label("Browse the Workshop", systemImage: "magnifyingglass")
             }.disabled(!steam.workshopReady || !installed)
+            .padLink("ws-browse", when: steam.workshopReady && installed) { SteamWorkshopBrowseView(appID: appID, title: title) }
             if !pending.isEmpty {
                 Button {
                     model.downloadAll(appID)
                 } label: {
                     Label(pending.count == 1 ? "Download 1 item" : "Download \(pending.count) items", systemImage: "arrow.down.circle")
                 }.disabled(!steam.workshopReady)
+                .padRow("ws-download-all", when: steam.workshopReady) { model.downloadAll(appID) }
             }
             if let url = URL(string: "https://steamcommunity.com/app/\(appID)/workshop/") {
                 Link(destination: url) { Label("Open the Workshop in Safari", systemImage: "safari") }
@@ -472,6 +474,11 @@ struct SteamWorkshopSections: View {
         let onDisk = model.isOnDisk(item, appID: appID)
         let job = model.jobs[item.id]
         SteamWorkshopItemRow(item: item, appID: appID)
+            // A on an item (pad-pages): stop its download, else download or update it, the row's first
+            // action; the rest stay in its menu and swipes, by touch.
+            .padRow("ws-item-\(item.id)", when: job != nil || (steam.workshopReady && item.downloadable && (!onDisk || model.record(appID).needsUpdate(item)))) {
+                if job != nil { model.cancel(item.id) } else { model.download(item, appID: appID) }
+            }
             .contextMenu { actions(item, subscribed: subscribed, onDisk: onDisk, job: job) }
             .swipeActions(edge: .trailing) {
                 if subscribed {

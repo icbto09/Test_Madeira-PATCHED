@@ -223,7 +223,14 @@ record each session's choices and the sensors switching on and off.
 
 ## Player 1 as a HID controller (DualSense, DirectInput)
 
-XInput stays the default and is unchanged. A game can instead see player 1 as
+By default (`env.MADEIRA_PAD_MODE` unset, "Automatic (recommended)") each game gets the
+API it needs: a game folder with `SDL2.dll` / `SDL3.dll`, or a Godot 4 game, gets a generic
+HID gamepad (such games read pads through SDL's joystick thread and never see XInput slot 0
+connecting late); every other game gets XInput, unchanged. The `[pad-auto]` log line names
+what was picked and why. `env.MADEIRA_PAD_MODE = xinput` or `env.MADEIRA_PAD_AUTO = 0` keeps
+XInput everywhere; a game's own `env.MADEIRA_PAD_MODE` line always wins.
+
+XInput is what every other game gets and is unchanged. A game can instead see player 1 as
 what it is, a HID game controller, the way CrossOver shows a DualSense on a
 Mac: `env.MADEIRA_PAD_MODE = hid` in madeira.cfg (Settings > All settings >
 Controllers > Controller API). `dualsense` or `generic` force the identity.

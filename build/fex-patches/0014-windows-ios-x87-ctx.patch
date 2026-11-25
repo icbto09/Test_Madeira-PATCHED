@@ -1,0 +1,60 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 29a2442..b34c953 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1407,6 +1407,15 @@ public:
+ };
+ } // namespace Exception
+ 
++/* madeira [x87-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0033 (MIT)
++ * (env MADEIRA_EC_X87_CTX = 0 turns it off; on by default). An ARM64EC context has no room for the x87 control,
++ * status and tag words, so the CONTEXT Wine converts from one (dispatch_emulation -> init_xcontext ->
++ * context_arm_to_x64, which memsets it: every NtContinue after a guest exception handler, every APC, every
++ * resume) carries FltSave.ControlWord/StatusWord/TagWord = 0, and LoadStateFromECContext loaded those zeros:
++ * FCW 0 (all x87 exceptions unmasked, precision control 24-bit), TOP 0, every tag empty, after each handled
++ * exception. Keep the JIT state's values across the reload. uint32_t, not bool: see IosFfsPeekFixup. */
++static uint32_t IosX87Ctx = 1;
++
+ extern "C" void SyncThreadContext(CONTEXT* Context) {
+   ProcessPendingCrossProcessEmulatorWork();
+   auto* Thread = GetCPUArea().ThreadState();
+@@ -1428,7 +1437,27 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+ #endif
+   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   Context->EFlags = (Context->EFlags & ValidMask) | (StateEFlags & ~ValidMask);
++  if (!IosX87Ctx) {
++    Exception::LoadStateFromECContext(Thread, *Context);
++    return;
++  }
++  // madeira [x87-ctx]: the fields LoadStateFromECContext takes from FltSave, other than the x87/MMX registers
++  // themselves (those travel in the ARM64EC context's X6-X17/Lr and are reloaded as before).
++  auto& State = Thread->CurrentFrame->State;
++  const auto FCW = State.FCW;
++  const auto FTW = State.AbridgedFTW;
++  const uint8_t X87Flags[] = {State.flags[FEXCore::X86State::X87FLAG_IE_LOC], State.flags[FEXCore::X86State::X87FLAG_C0_LOC],
++                              State.flags[FEXCore::X86State::X87FLAG_C1_LOC], State.flags[FEXCore::X86State::X87FLAG_C2_LOC],
++                              State.flags[FEXCore::X86State::X87FLAG_C3_LOC], State.flags[FEXCore::X86State::X87FLAG_TOP_LOC]};
+   Exception::LoadStateFromECContext(Thread, *Context);
++  State.FCW = FCW;
++  State.AbridgedFTW = FTW;
++  State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = X87Flags[0];
++  State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = X87Flags[1];
++  State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = X87Flags[2];
++  State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = X87Flags[3];
++  State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = X87Flags[4];
++  State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = X87Flags[5];
+ }
+ 
+ #ifdef FEX_IOS_HOST
+@@ -1642,6 +1671,11 @@ NTSTATUS ProcessInit() {
+     FEX_MadeiraJitInvalCheck = (JitInval && JitInval[0] == '0') ? 0 : 1;
+     LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 xtajit64 {}", FEX_MadeiraJitInvalCheck ? "on" : "off (MADEIRA_EC_JIT_INVAL=0)");
+     LogMan::Msg::EFmt("[section-views] rev=section-views-1 xtajit64 {}", FEX_MadeiraSectionViews ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)");
++    const char* X87Ctx = getenv("MADEIRA_EC_X87_CTX"); // madeira [x87-ctx]
++    if (X87Ctx && X87Ctx[0] == '0') {
++      IosX87Ctx = 0;
++    }
++    LogMan::Msg::EFmt("[x87-ctx] rev=x87-ctx-1 {}", IosX87Ctx ? "on" : "off (MADEIRA_EC_X87_CTX=0)");
+     LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
+                       "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
+                       IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0",

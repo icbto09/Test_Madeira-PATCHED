@@ -13,6 +13,9 @@
 #include <windef.h>
 #include <winternl.h>
 
+// madeira [section-views]: not declared by the mingw headers (as in MetalSharp fex/0025); ntdll.def exports it.
+extern "C" NTSTATUS WINAPI NtCompareObjects(HANDLE, HANDLE);
+
 /* ml623: targeted IR capture target (defined in FEXCore PassManager.cpp). File scope on
  * purpose -- an extern "C" at block scope is a compile error and cost a build earlier. */
 extern "C" uint64_t FEX_MadeiraIRCapTarget;
@@ -26,6 +29,20 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
 extern "C" int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size);  // ml1207, IosJitAlias.cpp
 #endif
+
+#ifdef FEX_IOS_HOST
+/* MADEIRA 16K traps: the iOS host page is 16 KB and Wine gives it the union of its four 4 KB
+ * pages' protections. A write trap armed on one 4 KB page left the host page writable whenever
+ * a sibling was untrapped (or hot), so writes to the trapped page were never seen and stale
+ * translations ran on: Project Zomboid's JVM, its code cache plain memory ([x64-rwx]), sat in
+ * Runtime1::patch_code at 100% because C1's patched call sites kept running the old code.
+ * The Escapists 2 (WOW64, Mono's call patch looped ~40,000 times a second) had the same bug.
+ * So traps are armed and released, write faults invalidate, and pages turn hot per host page. */
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = 0x4000;
+#else
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+static constexpr uint64_t MADEIRA_TRAP_PAGE_MASK = ~(MADEIRA_TRAP_PAGE_SIZE - 1);
 
 namespace FEX::Windows {
 uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
@@ -44,6 +61,11 @@ uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
 // they are counted and reported later from HandleImageMap, outside the lock.
 static std::atomic<uint64_t> NestedNotificationSkips {0};
 static std::atomic<uint64_t> NestedNotificationSkipsReported {0};
+// MADEIRA: memory notifications skipped because they were raised from inside this thread's own code
+// invalidation (InvalidatingThread). Counted, not logged: the allocator is mid-operation. Reported from
+// HandleImageMap, outside the locks, like NestedNotificationSkips.
+static std::atomic<uint64_t> OwnInvalidationSkips {0};
+static std::atomic<uint64_t> OwnInvalidationSkipsReported {0};
 
 #if !defined(ARCHITECTURE_arm64ec)
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
@@ -89,6 +111,11 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
   if (IntervalsLock.HeldByThisThread()) {
     // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (InsideOwnInvalidation()) {
+    // FEX's own memory, allocated or reprotected while this thread invalidates: see InvalidatingThread.
+    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
@@ -288,6 +315,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
                         Skips);
     }
   }
+  ReportOwnInvalidationSkips();
 
   FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
   FEX_CONFIG_OPT(MaxInst, MAXINST);
@@ -505,6 +533,11 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
     return {Address, 0};
   }
+  if (InsideOwnInvalidation()) {
+    // FEX's own memory, unmapped while this thread invalidates: see InvalidatingThread.
+    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
+    return {Address, 0};
+  }
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
     return {Address, 0};
@@ -559,10 +592,17 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
   return {SectionBase, SectionSize};
 }
 
-void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, bool NoFilter) {
   if (IntervalsLock.HeldByThisThread()) {
     // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (InsideOwnInvalidation()) {
+    // FEX's own memory, freed or decommitted while this thread invalidates (a lookup-cache page, the
+    // call-ret stack, a released code buffer): see InvalidatingThread. Invalidating here would take
+    // CodeBufferListLock again on this thread and park it for good.
+    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   if (!Address) {
@@ -581,6 +621,18 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     std::shared_lock Lock(IntervalsLock);
     MayHoldCode = XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
     MayNeedRemove = MayHoldCode || RWXIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+  }
+  if (NoFilter && !MayHoldCode) {
+    /* madeira [jit-inval] safety net: FEXCore's own JIT asked for this removal (a block found its code
+     * changed), so the "no code here" filter must not skip it. In the 0.2.83 Overwatch run the NoExec stub
+     * at 0x1405431e0 asked for its own removal and the filter skipped it forever; jit-inval-2's Core.cpp
+     * change stops that stub from checking itself, this keeps any other JIT removal from being dropped. */
+    static std::atomic<uint32_t> ForcedLog {0};
+    if (ForcedLog.fetch_add(1, std::memory_order_relaxed) < 16) {
+      LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 forced removal at {:#x}+{:#x}: the filter would have skipped it "
+                        "(page not executable now; MADEIRA_EC_JIT_INVAL=0 restores the filter)", Address, Size);
+    }
+    MayHoldCode = true;
   }
 
   if (MayHoldCode) {
@@ -644,25 +696,37 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   if (NeedsInvalidate) {
     // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
     // compiled from it relies on the write trap.
-    if (CountSMCWriteFault(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK)) {
+    if (CountSMCWriteFault(FaultAddress & MADEIRA_TRAP_PAGE_MASK)) {
       static std::atomic<uint32_t> HotLogCount {0};
       if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
         LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
                           "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
-                          FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, HotPageThreshold);
+                          FaultAddress & MADEIRA_TRAP_PAGE_MASK, HotPageThreshold);
       }
     }
     // IntervalsLock cannot be held during invalidation
     {
       const bool Locked = LockCodeInvalidationUnlessHeld("write-fault", FaultAddress);
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      const uint64_t TrapPage = FaultAddress & MADEIRA_TRAP_PAGE_MASK;
+      InvalidateIntervalInternalLocked(TrapPage, MADEIRA_TRAP_PAGE_SIZE);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
-      ULONG TmpProt;
-      void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
-      SIZE_T TmpSize = 1;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      // MADEIRA 16K traps: every RWX 4 KB page of the host page, each with its own untrap protection.
+      for (uint64_t Page = TrapPage; Page < TrapPage + MADEIRA_TRAP_PAGE_SIZE; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        ULONG PageUntrapProt = UntrapProt;
+        if ((Page ^ FaultAddress) & FEXCore::Utils::FEX_PAGE_MASK) {
+          std::shared_lock Lock(IntervalsLock);
+          if (!RWXIntervals.Query(Page).Enclosed) {
+            continue;
+          }
+          PageUntrapProt = GetUntrapProt(Page);
+        }
+        ULONG TmpProt;
+        void* TmpAddress = reinterpret_cast<void*>(Page);
+        SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PageUntrapProt, &TmpProt);
+      }
       if (Locked) {
         CTX.GetCodeInvalidationMutex().unlock();
       }
@@ -682,12 +746,125 @@ void InvalidationTracker::EnableHotSMCPages(uint32_t Threshold) {
   HotPageThreshold = Threshold;
 }
 
+// MADEIRA section-views: see InvalidationTracker.h. Ported from MetalSharp patches/fex/0025
+// (MetalSharp-Wine, AGPL-3.0, Avery Felts); idea also in GameNative's FEX patch 0001 (Dmage22).
+void InvalidationTracker::RecountSharedSectionViewsLocked() {
+  uint32_t Count = 0;
+  for (auto& View : SectionViews) {
+    View.Shared = false;
+    for (const auto& Other : SectionViews) {
+      if (&Other != &View && Other.Group == View.Group) {
+        View.Shared = true;
+        break;
+      }
+    }
+    Count += View.Shared;
+  }
+  SharedSectionViewCount.store(Count, std::memory_order_release);
+}
+
+void InvalidationTracker::HandleDataSectionMap(HANDLE Section, uint64_t Address, uint64_t Size, uint64_t Offset, bool NoInvalidate) {
+  if (!Section || !Address || !Size || IntervalsLock.HeldByThisThread()) {
+    return;
+  }
+  HANDLE Dup {};
+  if (NtDuplicateObject(NtCurrentProcess(), Section, NtCurrentProcess(), &Dup, 0, 0, DUPLICATE_SAME_ACCESS)) {
+    return;
+  }
+  const auto Base = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = (Address - Base + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+
+  std::vector<HANDLE> Stale;
+  std::vector<std::pair<uint64_t, uint64_t>> Recheck;
+  uint64_t Group = 0;
+  bool Joined = false;
+  {
+    std::unique_lock Lock(IntervalsLock);
+    // A view whose unmap was not seen cannot overlap a new one.
+    for (auto It = SectionViews.begin(); It != SectionViews.end();) {
+      if (It->Base < Base + AlignedSize && Base < It->Base + It->Size) {
+        Stale.push_back(It->Section);
+        It = SectionViews.erase(It);
+      } else {
+        ++It;
+      }
+    }
+    for (const auto& View : SectionViews) {
+      if (NtCompareObjects(View.Section, Dup) == 0) {
+        Group = View.Group;
+        break;
+      }
+    }
+    if (Group) {
+      Joined = true;
+      // Code already translated from the other views ran unchecked: translate it again with the checks.
+      for (const auto& View : SectionViews) {
+        if (View.Group == Group) {
+          Recheck.emplace_back(View.Base, View.Size);
+        }
+      }
+    } else {
+      Group = NextSectionGroup++;
+    }
+    SectionViews.push_back({Base, AlignedSize, Dup, Group, false});
+    RecountSharedSectionViewsLocked();
+  }
+  for (auto Handle : Stale) {
+    NtClose(Handle);
+  }
+  static std::atomic<uint32_t> LogCount {0};
+  if (LogCount.fetch_add(1, std::memory_order_relaxed) < 32) {
+    LogMan::Msg::EFmt("[section-views] view {:#x}+{:#x} offset={:#x} group={} {}{}", Base, AlignedSize, Offset, Group,
+                      Joined ? "SHARES its section with another view: its code is checked per instruction" : "first view of its section",
+                      (Joined && NoInvalidate) ? " (earlier code not dropped: compile lock held by this thread)" : "");
+  }
+  if (!NoInvalidate) {
+    for (auto [ViewBase, ViewSize] : Recheck) {
+      InvalidateIntervalInternal(ViewBase, ViewSize);
+    }
+  }
+}
+
+void InvalidationTracker::HandleDataSectionUnmap(uint64_t Address) {
+  if (IntervalsLock.HeldByThisThread()) {
+    return;
+  }
+  HANDLE Section {};
+  {
+    std::unique_lock Lock(IntervalsLock);
+    for (auto It = SectionViews.begin(); It != SectionViews.end(); ++It) {
+      if (Address >= It->Base && Address < It->Base + It->Size) {
+        Section = It->Section;
+        SectionViews.erase(It);
+        RecountSharedSectionViewsLocked();
+        break;
+      }
+    }
+  }
+  if (Section) {
+    NtClose(Section);
+  }
+}
+
+bool InvalidationTracker::IsSharedSectionPage(uint64_t Address) {
+  if (!SharedSectionViewCount.load(std::memory_order_acquire) || IntervalsLock.HeldByThisThread()) {
+    return false;
+  }
+  std::shared_lock Lock(IntervalsLock);
+  for (const auto& View : SectionViews) {
+    if (View.Shared && Address >= View.Base && Address < View.Base + View.Size) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
   const auto Used = HotPagesUsed.load(std::memory_order_acquire);
   if (!Used) {
     return false;
   }
-  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto Page = Address & MADEIRA_TRAP_PAGE_MASK;
   for (uint32_t i = 0; i < Used; ++i) {
     if (HotPages[i].load(std::memory_order_acquire) == Page) {
       return true;
@@ -707,7 +884,7 @@ bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
   }
 
   // Direct-mapped: a page evicted by another one simply starts counting again.
-  auto& Slot = HotFaults[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotFaultSlots];
+  auto& Slot = HotFaults[(Page / MADEIRA_TRAP_PAGE_SIZE) % HotFaultSlots];
   if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
     Slot = {Page, Now, 0};
   }
@@ -1012,8 +1189,33 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t 
   }
 }
 
+void InvalidationTracker::ReportOwnInvalidationSkips() {
+  const auto Skips = OwnInvalidationSkips.load(std::memory_order_relaxed);
+  auto Reported = OwnInvalidationSkipsReported.load(std::memory_order_relaxed);
+  if (Skips != Reported && OwnInvalidationSkipsReported.compare_exchange_strong(Reported, Skips)) {
+    LogMan::Msg::EFmt("[inval-own-mem] {} memory notification(s) for FEX's own memory raised during a code invalidation on the "
+                      "same thread were skipped (invalidating again would wait on CodeBufferListLock forever)",
+                      Skips);
+  }
+}
+
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+  // MADEIRA: mark this thread as invalidating for the memory notifications FEXCore's own frees raise below
+  // (see InvalidatingThread). The caller write-owns CodeInvalidationMutex, so no other thread writes the
+  // slot meanwhile; a nested call (LockCodeInvalidationUnlessHeld) restores the outer mark on return.
+  struct InvalidatingScope {
+    std::atomic<uint64_t>& Slot;
+    uint64_t Previous;
+    explicit InvalidatingScope(std::atomic<uint64_t>& Slot)
+      : Slot {Slot}
+      , Previous {Slot.load(std::memory_order_relaxed)} {
+      Slot.store(OwnedSharedMutex::Self(), std::memory_order_relaxed);
+    }
+    ~InvalidatingScope() {
+      Slot.store(Previous, std::memory_order_relaxed);
+    }
+  } Scope {InvalidatingThread};
 #if !defined(ARCHITECTURE_arm64ec)
   // The boundary into FEXCore: Address is a host address, FEXCore's code buffers and lookup caches
   // are keyed on guest addresses. Clip the range to the window and convert; the part outside the
@@ -1071,7 +1273,10 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
-  const auto End = Address + Size;
+  // MADEIRA 16K traps: whole host pages, see HandleRWXAccessViolation.
+  const auto End = (Address + Size + MADEIRA_TRAP_PAGE_SIZE - 1) & MADEIRA_TRAP_PAGE_MASK;
+  Address &= MADEIRA_TRAP_PAGE_MASK;
+  Size = End - Address;
   std::shared_lock Lock(IntervalsLock);
 
   if (SMCDetectionDisabled) {
@@ -1105,12 +1310,12 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
       } else {
         // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
         uint64_t RunBegin = Address;
-        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < ProtectEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        for (uint64_t Page = Address & MADEIRA_TRAP_PAGE_MASK; Page < ProtectEnd; Page += MADEIRA_TRAP_PAGE_SIZE) {
           if (IsHotSMCPage(Page)) {
             if (RunBegin < std::max(Page, Address)) {
               Protect(RunBegin, std::max(Page, Address));
             }
-            RunBegin = std::min(Page + FEXCore::Utils::FEX_PAGE_SIZE, ProtectEnd);
+            RunBegin = std::min(Page + MADEIRA_TRAP_PAGE_SIZE, ProtectEnd);
           }
         }
         if (RunBegin < ProtectEnd) {

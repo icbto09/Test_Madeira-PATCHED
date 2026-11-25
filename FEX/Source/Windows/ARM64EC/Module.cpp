@@ -6,6 +6,7 @@ desc: Implements the ARM64EC BT module API using FEXCore
 $end_info$
 */
 
+#include <bit> // madeira [getctx-guest]: std::popcount
 #include "../Common/ArenaManager.h"
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -71,6 +72,8 @@ $end_info$
 extern "C" char ios_va_log[];
 extern "C" int ios_va_log_len;
 
+extern "C" uint32_t FEX_MadeiraSectionViews; // madeira [section-views], Core.cpp
+extern "C" uint32_t FEX_MadeiraJitInvalCheck; // madeira [jit-inval], Core.cpp
 #ifdef FEX_IOS_HOST
 /* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
  * TU because ARM64EC class-method access to the static table directly from
@@ -80,11 +83,9 @@ extern "C" int ios_va_log_len;
 extern "C" uint64_t IosJitTranslate(uint64_t Addr);
 extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
+extern "C" void IosJitAliasStats(int* Count, int* Live, uint64_t* Refused, uint64_t* LastRefusedJit, uint64_t* Low, uint64_t* High); // fo4-alias-miss-probe
 extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
 extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
-extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real);   // madeira kuser-remap
-extern "C" int IosKuserNote(uint64_t Rip, uint64_t Tick, uint32_t* Strikes);
-extern "C" void IosKuserCounts(uint32_t* Rips, uint32_t* Pages);
 /* Defined in FEXCore Dispatcher.cpp; read when the dispatcher is emitted. */
 extern "C" uint32_t IosEcCodeBitMapCached;
 /* PEB->EcCodeBitMap as read in ProcessInit; ThreadInit stores it in every thread's frame. */
@@ -94,6 +95,11 @@ static uint64_t IosEcCodeBitMapValue = 0;
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
+/* ffs-peek: labels in Module.S around ExitToX64's native read of the call target (see the comment there). */
+extern "C" char IosFfsPeekBegin[];
+extern "C" char IosFfsPeekEnd[];
+extern "C" char IosFfsNoBypass[];
+uint32_t IosFfsPeekFixup = 1; /* uint32_t, not bool: a 1-byte global here broke an lld adrp/ldr pair before (see IosTebTsdImportFound). MADEIRA_FFS_PEEK_FIXUP=0 turns it off */
 /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
 extern "C" uint32_t IosEcReturnWithRet;
 
@@ -230,6 +236,18 @@ struct ThreadCPUArea {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+#ifdef FEX_IOS_HOST
+  // madeira [df-ctx]: the last exception went to the guest by RethrowGuestException (its context's CPSR bit 16 reached
+  // the handler, so the DF in the context it continues with is real). Cleared by RaiseException (the unix syscall
+  // path masks bit 16) and consumed by SyncThreadContext.
+  bool IosDfDelivered {};
+  // madeira [pfaf-int3]: the PF/AF RaiseException (int3 / ud / single-step, the unix syscall path) delivered with the
+  // guest RIP/RSP it delivered them at. The unix frame drops CPSR bit 27 (AF), so ntdll asks for them here
+  // (BTCpu64IosRaisePfAf) while it builds the handler's context. Consumed by that call.
+  bool IosRaiseValid {};
+  uint32_t IosRaiseFlags {};
+  uint64_t IosRaisePc {}, IosRaiseSp {};
+#endif
 };
 
 namespace {
@@ -607,6 +625,26 @@ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
   return Result.has_value();
 }
 
+#ifdef FEX_IOS_HOST
+/* madeira [pfaf-keep] (env MADEIRA_EC_PFAF_KEEP = 0 turns it off). rev=pfaf-keep-2. See ntdll
+ * signal_arm64ec.c ios_pfaf_stash: PF/AF go to the guest in CPSR bits 26/27 of the packed context,
+ * and come back in ContextAmd64.EFlags marked with reserved bit 15. */
+uint32_t IosPfAfKeep = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+/* madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 (MIT)
+ * (env MADEIRA_EC_DF_CTX = 0 turns it off, here, in the JIT (StoreDF write-through) and in ntdll). rev=df-ctx-1.
+ * DF goes to the guest in RES0 CPSR bit 16 of the packed context (ntdll's cpsr_to_eflags maps it; bits 26/27 are
+ * [pfaf-keep]'s PF/AF), and comes back the [pfaf-keep] way: never in CPSR (the unix syscall frame's cpsr_user_mask
+ * drops bit 16), but stashed by ntdll from the x64 context of NtContinue / NtSetContextThread(self) and put into
+ * ContextAmd64.EFlags by dispatch_emulation with reserved EFLAGS bit 3 set to say it is real. SyncThreadContext uses it
+ * only after an exception RethrowGuestException delivered (FrontendThreadData::IosDfDelivered): for traps raised through
+ * the unix path (RaiseException: int3, single-step, ud) bit 16 never reached the handler, so its context says DF=0
+ * whatever the code had, and the resume keeps the JIT state's DF as before. */
+uint32_t IosDfCtx = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+/* madeira [pfaf-int3] (env MADEIRA_EC_PFAF_INT3 = 0 turns it off; needs [pfaf-keep] on). rev=pfaf-int3-2. See
+ * RaiseException and BTCpu64IosRaisePfAf. */
+uint32_t IosPfAfInt3 = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+#endif
+
 static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
   auto& State = Thread->CurrentFrame->State;
 
@@ -853,6 +891,15 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ? (1U << 30) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC)) ? (1U << 31) : 0;
+#ifdef FEX_IOS_HOST
+  if (IosPfAfKeep) { // madeira [pfaf-keep]: RES0 bits; ntdll's cpsr_to_eflags maps them for the guest
+    ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
+    ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
+  }
+  if (IosDfCtx) { // madeira [df-ctx]: DF has no NZCV equivalent; RES0 bit 16, which ntdll's cpsr_to_eflags maps
+    ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)) ? (1U << 16) : 0;
+  }
+#endif
 
   ECContext.Fpcr = FPCR;
   ECContext.Fpsr = FPSR;
@@ -870,6 +917,10 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
 
   return ECContext;
 }
+
+#ifdef FEX_IOS_HOST
+static void IosAssertRecord(uint32_t Code, uint32_t EFlags, uint32_t LiveTF, const ARM64_NT_CONTEXT& Ctx); // madeira [assert-dump-2]
+#endif
 
 static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -896,6 +947,14 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
   // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+  [[maybe_unused]] const uint32_t RaiseLiveTF = (EFlags >> FEXCore::X86State::RFLAG_TF_RAW_LOC) & 1U; // madeira [assert-dump-2]
+#ifdef FEX_IOS_HOST
+  // madeira [df-ctx]: this path goes through the unix syscall frame, which drops CPSR bit 16: the handler saw DF=0 and
+  // the DF of the context it continues with is not real, so the resume keeps the JIT state's DF (as before).
+  if (auto* FTD = GetFrontendThreadData(Thread)) {
+    FTD->IosDfDelivered = false;
+  }
+#endif
   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
 
@@ -908,8 +967,242 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
     GuestContext.Pc -= 1;
   }
 
+#ifdef FEX_IOS_HOST
+  // madeira [pfaf-int3]: the handler's context gets PF from CPSR bit 26, but AF (bit 27) is masked out by the unix
+  // syscall frame (cpsr_user_mask). Keep the true PF/AF of this raise, with where it was raised, for ntdll to ask for.
+  if (auto* FTD = GetFrontendThreadData(Thread)) {
+    FTD->IosRaiseValid = Exception::IosPfAfKeep && Exception::IosPfAfInt3;
+    FTD->IosRaiseFlags = EFlags & ((1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC));
+    FTD->IosRaisePc = GuestContext.Pc;
+    FTD->IosRaiseSp = GuestContext.Sp;
+  }
+  IosAssertRecord(static_cast<uint32_t>(GuestRec.ExceptionCode), EFlags, RaiseLiveTF, GuestContext); // madeira [assert-dump-2]
+#endif
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 }
+
+#ifdef FEX_IOS_HOST
+/* madeira [assert-dump] (Overwatch 2, 0.2.84 log 61524411): LOG ONLY. Overwatch_loader.dll raises
+ * STATUS_ASSERTION_FAILURE (int 0x2c, C0000420 at loader+0x441960) on its int3-stepping thread when one of its
+ * checks fails; nothing in the log says which. On each such raise (first 8), log the x86 registers, flags, the
+ * code around RIP and the top of the guest stack. Memory is read with NtReadVirtualMemory, so a locked page
+ * reads as "??" instead of faulting inside the exception path. MADEIRA_EC_ASSERT_DUMP=0 turns it off. */
+extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+
+// assert-dump-2: Wine's NtReadVirtualMemory on our own process is a memmove under __TRY; touching a PAGE_GUARD page
+// there would silently clear the guest's guard bit. So only read ranges whose every page is committed, readable and
+// not guarded. Returns the blocking protection (or 0 when the range is safe).
+static uint32_t IosAssertUnsafe(uint64_t Base, size_t Len) {
+  for (uint64_t Page = Base & ~0xfffULL; Page < Base + Len; Page += 0x1000) {
+    MEMORY_BASIC_INFORMATION Mbi {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Page), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) != 0) {
+      return 0xffffffff;
+    }
+    if (Mbi.State != MEM_COMMIT || (Mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || Mbi.Protect == 0) {
+      return Mbi.State != MEM_COMMIT ? 0xfffffffe : static_cast<uint32_t>(Mbi.Protect);
+    }
+  }
+  return 0;
+}
+
+static void IosAssertHex(const char* What, uint64_t Base, size_t Len, const char* Sub = "") {
+  uint8_t Buf[64] {};
+  SIZE_T Got = 0;
+  if (Len > sizeof(Buf)) {
+    Len = sizeof(Buf);
+  }
+  if (const uint32_t Bad = IosAssertUnsafe(Base, Len)) {
+    LogMan::Msg::EFmt("[assert-dump]   {}{} {:#x} skipped (protect/state {:#x})", What, Sub, Base, Bad);
+    return;
+  }
+  const NTSTATUS Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Base), Buf, Len, &Got);
+  char Hex[sizeof(Buf) * 3 + 1] {};
+  size_t o = 0;
+  for (size_t i = 0; i < Len; i++) {
+    static const char Digits[] = "0123456789abcdef";
+    if (i < Got) {
+      Hex[o++] = Digits[Buf[i] >> 4];
+      Hex[o++] = Digits[Buf[i] & 15];
+    } else {
+      Hex[o++] = '?';
+      Hex[o++] = '?';
+    }
+    Hex[o++] = (i % 8 == 7) ? '|' : ' ';
+  }
+  Hex[o] = 0;
+  LogMan::Msg::EFmt("[assert-dump]   {}{} {:#x} (status {:#x}): {}", What, Sub, Base, static_cast<uint32_t>(Status), Hex);
+}
+
+static bool IosAssertDumpOn() {
+  static std::atomic<int8_t> On {-1};
+  int8_t V = On.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_EC_ASSERT_DUMP");
+    V = (E && E[0] == '0') ? 0 : 1;
+    On.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
+// madeira [crashmailer-dump] (env MADEIRA_EC_CRASHMAILER_DUMP = 0 turns it off). rev=crashmailer-dump-1. LOG ONLY.
+// FEX does no logging for it: it keeps the ring below filled (also when MADEIRA_EC_ASSERT_DUMP=0) and hands it, with
+// this thread's emulator state, to ntdll through BTCpu64IosCrashMailerData; ntdll prints it when the process starts
+// CrashMailer. ntdll reads the same switch and does not call in when it is off.
+static bool IosCrashMailerOn() {
+  static std::atomic<int8_t> On {-1};
+  int8_t V = On.load(std::memory_order_relaxed);
+  if (V < 0) {
+    const char* E = getenv("MADEIRA_EC_CRASHMAILER_DUMP");
+    V = (E && E[0] == '0') ? 0 : 1;
+    On.store(V, std::memory_order_relaxed);
+  }
+  return V != 0;
+}
+
+// assert-dump-2: a ring of the last 64 exception contexts as DELIVERED to the guest (all threads), so the dump can show
+// what the loader's int3/single-step handlers were handed just before its check failed. Entries are written without a
+// lock; a torn entry is possible if two threads raise at the same instant (it is only logged, never used).
+struct IosAssertRingEntry {
+  uint64_t Seq;
+  uint32_t Tid;
+  uint32_t Code;
+  uint32_t EFlags; // x86 EFlags as reconstructed by FEX (TF already cleared)
+  uint32_t LiveTF;
+  ARM64_NT_CONTEXT Ctx;
+};
+static IosAssertRingEntry IosAssertRing[64];
+static std::atomic<uint64_t> IosAssertRingSeq {0};
+
+static void IosAssertRecord(uint32_t Code, uint32_t EFlags, uint32_t LiveTF, const ARM64_NT_CONTEXT& Ctx) {
+  if (!IosAssertDumpOn() && !IosCrashMailerOn()) { // crashmailer-dump reads the ring too
+    return;
+  }
+  const uint64_t Seq = IosAssertRingSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto& E = IosAssertRing[Seq % 64];
+  E.Seq = 0; // mark as being written
+  E.Tid = GetCurrentThreadId();
+  E.Code = Code;
+  E.EFlags = EFlags;
+  E.LiveTF = LiveTF;
+  memcpy(&E.Ctx, &Ctx, sizeof(Ctx));
+  std::atomic_thread_fence(std::memory_order_release);
+  E.Seq = Seq;
+}
+
+static void IosAssertCtx(const char* What, const ARM64_NT_CONTEXT& C) {
+  // ARM64EC register mapping: rax=x8 rcx=x0 rdx=x1 rbx=x27 rsp=sp rbp=fp rsi=x25 rdi=x26 r8-r11=x2-x5 r12-r15=x19-x22.
+  LogMan::Msg::EFmt("[assert-dump]   {} pc(rip)={:#x} sp={:#x} cpsr={:#x} fpcr={:#x} fpsr={:#x} flags={:#x}", What, C.Pc, C.Sp, C.Cpsr,
+                    C.Fpcr, C.Fpsr, C.ContextFlags);
+  LogMan::Msg::EFmt("[assert-dump]   {} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rbp={:#x} rsi={:#x} rdi={:#x}", What, C.X[8], C.X[0],
+                    C.X[1], C.X[27], C.X[29], C.X[25], C.X[26]);
+  LogMan::Msg::EFmt("[assert-dump]   {} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}", What, C.X[2],
+                    C.X[3], C.X[4], C.X[5], C.X[19], C.X[20], C.X[21], C.X[22]);
+  LogMan::Msg::EFmt("[assert-dump]   {} other x6={:#x} x7={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x15={:#x} x16={:#x} x17={:#x} "
+                    "x23={:#x} x24={:#x} x28={:#x} lr={:#x}",
+                    What, C.X[6], C.X[7], C.X[9], C.X[10], C.X[11], C.X[12], C.X[15], C.X[16], C.X[17], C.X[23], C.X[24], C.X[28], C.X[30]);
+  for (int i = 0; i < 16; i += 4) {
+    LogMan::Msg::EFmt("[assert-dump]   {} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x} xmm{}={:016x}{:016x}", What, i,
+                      static_cast<uint64_t>(C.V[i].High), C.V[i].Low, i + 1, static_cast<uint64_t>(C.V[i + 1].High), C.V[i + 1].Low, i + 2,
+                      static_cast<uint64_t>(C.V[i + 2].High), C.V[i + 2].Low, i + 3, static_cast<uint64_t>(C.V[i + 3].High),
+                      C.V[i + 3].Low);
+  }
+}
+
+static bool IosAssertPlausiblePtr(uint64_t V) {
+  return V >= 0x10000 && V < 0x800000000000ULL;
+}
+
+static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t Rip, uint32_t EFlags, const ARM64_NT_CONTEXT& Delivered) {
+  static std::atomic<uint32_t> Count {0};
+  if (!IosAssertDumpOn() || Count.fetch_add(1, std::memory_order_relaxed) >= 8) {
+    return;
+  }
+  const auto& R = Thread->CurrentFrame->State.gregs;
+  using namespace FEXCore::X86State;
+  const uint32_t Tid = GetCurrentThreadId();
+  LogMan::Msg::EFmt("[assert-dump] rev=assert-dump-2 STATUS_ASSERTION_FAILURE rip={:#x} eflags={:#x} tid={:x}", Rip, EFlags, Tid);
+  LogMan::Msg::EFmt("[assert-dump]   rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}", R[REG_RAX],
+                    R[REG_RBX], R[REG_RCX], R[REG_RDX], R[REG_RSI], R[REG_RDI], R[REG_RBP], R[REG_RSP]);
+  LogMan::Msg::EFmt("[assert-dump]   r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}", R[REG_R8],
+                    R[REG_R9], R[REG_R10], R[REG_R11], R[REG_R12], R[REG_R13], R[REG_R14], R[REG_R15]);
+  LogMan::Msg::EFmt("[assert-dump]   dr0={:#x} dr1={:#x} dr2={:#x} dr3={:#x} dr6={:#x} dr7={:#x}", Thread->CurrentFrame->State.Dr[0],
+                    Thread->CurrentFrame->State.Dr[1], Thread->CurrentFrame->State.Dr[2], Thread->CurrentFrame->State.Dr[3],
+                    Thread->CurrentFrame->State.Dr6, Thread->CurrentFrame->State.Dr7);
+  IosAssertCtx("delivered", Delivered);
+
+  // Code around RIP.
+  IosAssertHex("code rip-64", Rip - 64, 64);
+  IosAssertHex("code rip", Rip, 64);
+
+  // Memory behind every register that looks like a pointer (128 bytes from reg-32).
+  static const char* const RegNames[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                           "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+  static const int RegIdx[16] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP,
+                                 REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+  for (int i = 0; i < 16; i++) {
+    const uint64_t V = R[RegIdx[i]];
+    if (!IosAssertPlausiblePtr(V) || RegIdx[i] == REG_RSP) {
+      continue;
+    }
+    IosAssertHex("mem -32 of ", V - 32, 64, RegNames[i]);
+    IosAssertHex("mem +32 of ", V + 32, 64, RegNames[i]);
+  }
+
+  // 2 KB of guest stack, read in 64-byte chunks; stop at the first chunk that cannot be read.
+  const uint64_t Rsp = R[REG_RSP];
+  uint64_t Slots[256] {};
+  size_t SlotCount = 0;
+  for (int i = 0; i < 32; i++) {
+    IosAssertHex("stack", Rsp + i * 64, 64);
+    SIZE_T Got = 0;
+    if (IosAssertUnsafe(Rsp + i * 64, 64) ||
+        NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Rsp + i * 64), &Slots[i * 8], 64, &Got) != 0 || Got != 64) {
+      break;
+    }
+    SlotCount = (i + 1) * 8;
+  }
+
+  // Callers: up to 8 stack values that point into committed executable memory, with 320 bytes of code around each.
+  int Callers = 0;
+  for (size_t i = 0; i < SlotCount && Callers < 8; i++) {
+    const uint64_t Val = Slots[i];
+    if (!IosAssertPlausiblePtr(Val) || (Val >= Rsp - 0x100000 && Val < Rsp + 0x100000)) {
+      continue;
+    }
+    MEMORY_BASIC_INFORMATION Mbi {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Val), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) != 0 ||
+        Mbi.State != MEM_COMMIT ||
+        !(Mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+      continue;
+    }
+    LogMan::Msg::EFmt("[assert-dump]   caller #{} at stack slot rsp+{:#x} = {:#x} (alloc base {:#x} protect {:#x} pe {:#x})", Callers, i * 8,
+                      Val, reinterpret_cast<uint64_t>(Mbi.AllocationBase), static_cast<uint32_t>(Mbi.Protect), IosJitReverseTranslate(Val));
+    IosAssertHex("  code ret-256", Val - 256, 64);
+    IosAssertHex("  code ret-192", Val - 192, 64);
+    IosAssertHex("  code ret-128", Val - 128, 64);
+    IosAssertHex("  code ret-64", Val - 64, 64);
+    IosAssertHex("  code ret", Val, 64);
+    Callers++;
+  }
+
+  // The last 12 exceptions this thread was handed before this one (newest first), from the ring.
+  const uint64_t Now = IosAssertRingSeq.load(std::memory_order_relaxed);
+  int Shown = 0;
+  for (uint64_t k = 0; k < 64 && Shown < 12 && k < Now; k++) {
+    const auto& E = IosAssertRing[(Now - k) % 64];
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (E.Seq != Now - k || E.Tid != Tid) {
+      continue;
+    }
+    LogMan::Msg::EFmt("[assert-dump]   prev-{} seq={} code={:#x} x86eflags={:#x} liveTF={}", Shown, E.Seq, E.Code, E.EFlags, E.LiveTF);
+    static const char* const PrevNames[12] = {"prev-0", "prev-1", "prev-2", "prev-3", "prev-4",  "prev-5",
+                                              "prev-6", "prev-7", "prev-8", "prev-9", "prev-10", "prev-11"};
+    IosAssertCtx(PrevNames[Shown], E.Ctx);
+    Shown++;
+  }
+  LogMan::Msg::EFmt("[assert-dump]   end: {} callers, {} earlier exceptions of this thread shown (ring seq {})", Callers, Shown, Now);
+}
+#endif // FEX_IOS_HOST (assert-dump)
 
 #ifdef FEX_IOS_HOST
 // MADEIRA (local fork): keep the dispatch Madeira has run on device. The guest context and record
@@ -924,6 +1217,9 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
     ReconstructThreadState(Thread, Context);
   }
   Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+  if (auto* FTD = GetFrontendThreadData(Thread)) { // madeira [df-ctx]: bit 16 reaches the handler on this path
+    FTD->IosDfDelivered = IosDfCtx != 0;
+  }
 
   // ml341: see RaiseException.
   const uint64_t PeRip = IosJitReverseTranslate(Args->Context.Pc);
@@ -947,11 +1243,15 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
 
   BOOL FirstChance = TRUE; // KiUserExceptionDispatcher takes no second-chance input
   Args->Rec = FEX::Windows::HandleGuestException(Fault, Rec, Args->Context.Pc, Args->Context.X8, Args->Context.X0, FirstChance);
+  if (Args->Rec.ExceptionCode == STATUS_ASSERTION_FAILURE) {
+    IosAssertDump(Thread, Args->Context.Pc, EFlags, Args->Context); // madeira [assert-dump]
+  }
   if (Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     Args->Context.Cpsr &= ~(1 << 21); // PSTATE.SS
   } else if (Args->Rec.ExceptionCode == EXCEPTION_BREAKPOINT) {
     Args->Context.Pc -= 1;
   }
+  IosAssertRecord(static_cast<uint32_t>(Args->Rec.ExceptionCode), EFlags, TfDiagLiveTF, Args->Context); // madeira [assert-dump-2]
   // tf-diag: ctxTF = Cpsr bit 21 as reconstructed, ctxSS = the same bit as finally delivered
   // (after the single-step clear). Only TF/step related raises are logged.
   if (TfDiagLiveTF || TfDiagCtxTF || Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP || Args->Rec.ExceptionCode == EXCEPTION_PRIV_INSTRUCTION) {
@@ -1002,6 +1302,17 @@ static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore:
   case FEXCore::Core::FAULT_SIGSEGV: Record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; break;
   default: ERROR_AND_DIE_FMT("Unknown fault signal"); break;
   }
+
+#ifdef FEX_IOS_HOST
+  // [fex-faultfree] log the first few hits: exception code, guest RIP, guest RSP.
+  {
+    static std::atomic<uint32_t> FaultFreeHits {0};
+    if (FaultFreeHits.fetch_add(1, std::memory_order_relaxed) < 8) {
+      LogMan::Msg::IFmt("[fex-faultfree] SynchronousExceptionHandler code={:#x} rip={:#x} rsp={:#x}", static_cast<uint32_t>(Record.ExceptionCode),
+                        static_cast<uint64_t>(Context.Pc), static_cast<uint64_t>(Context.Sp));
+    }
+  }
+#endif
 
   RaiseException(Thread, Record, Context);
   ERROR_AND_DIE_FMT("This should always noreturn");
@@ -1055,7 +1366,15 @@ public:
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    // madeira [jit-inval]: a removal FEXCore asked for is never filtered (MADEIRA_EC_JIT_INVAL=0: old behaviour).
+    static std::atomic<int8_t> NoFilterCached {-1};
+    int8_t NoFilter = NoFilterCached.load(std::memory_order_relaxed);
+    if (NoFilter < 0) {
+      const char* E = getenv("MADEIRA_EC_JIT_INVAL");
+      NoFilter = (E && E[0] == '0') ? 0 : 1;
+      NoFilterCached.store(NoFilter, std::memory_order_relaxed);
+    }
+    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false, NoFilter != 0);
   }
 
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
@@ -1112,8 +1431,13 @@ public:
       static uint32_t QueryFailCount = 0;
       if (QueryFailCount < 12) {
         QueryFailCount++;
-        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x}",
-                          static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address));
+        int AliasCount = 0, AliasLive = 0;
+        uint64_t AliasRefused = 0, AliasLastRefused = 0, JitLow = 0, JitHigh = 0;
+        IosJitAliasStats(&AliasCount, &AliasLive, &AliasRefused, &AliasLastRefused, &JitLow, &JitHigh);
+        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x} alias-table={}/256 live={} refused={} "
+                          "last-refused-jit={:#x} jit-bounds=[{:#x},{:#x}) probe=fo4-alias-miss-probe",
+                          static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address),
+                          AliasCount, AliasLive, AliasRefused, AliasLastRefused, JitLow, JitHigh);
       }
     }
 #endif
@@ -1127,8 +1451,16 @@ public:
     if (OrigAddr != Address && InvalidationTracker->IsHotSMCPage(OrigAddr)) {
       return true;
     }
+    if (OrigAddr != Address && FEX_MadeiraSectionViews && InvalidationTracker->IsSharedSectionPage(OrigAddr)) {
+      return true; // madeira [section-views]
+    }
 #endif
-    return InvalidationTracker->IsHotSMCPage(Address);
+    if (InvalidationTracker->IsHotSMCPage(Address)) {
+      return true;
+    }
+    // madeira [section-views]: code in a data-section view whose section has another view mapped
+    // can be rewritten through that view without a fault; check it per instruction.
+    return FEX_MadeiraSectionViews && InvalidationTracker->IsSharedSectionPage(Address);
   }
 
   void PreCompile() override {
@@ -1136,6 +1468,15 @@ public:
   }
 };
 } // namespace Exception
+
+/* madeira [x87-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0033 (MIT)
+ * (env MADEIRA_EC_X87_CTX = 0 turns it off; on by default). An ARM64EC context has no room for the x87 control,
+ * status and tag words, so the CONTEXT Wine converts from one (dispatch_emulation -> init_xcontext ->
+ * context_arm_to_x64, which memsets it: every NtContinue after a guest exception handler, every APC, every
+ * resume) carries FltSave.ControlWord/StatusWord/TagWord = 0, and LoadStateFromECContext loaded those zeros:
+ * FCW 0 (all x87 exceptions unmasked, precision control 24-bit), TOP 0, every tag empty, after each handled
+ * exception. Keep the JIT state's values across the reload. uint32_t, not bool: see IosFfsPeekFixup. */
+static uint32_t IosX87Ctx = 1;
 
 extern "C" void SyncThreadContext(CONTEXT* Context) {
   ProcessPendingCrossProcessEmulatorWork();
@@ -1146,9 +1487,56 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
 
+  uint32_t ValidMask = ECValidEFlagsMask;
+#ifdef FEX_IOS_HOST
+  // madeira [pfaf-keep]: ntdll marks a resume whose PF/AF came from the guest's own context with bit 15.
+  if (Context->EFlags & (1U << 15)) {
+    Context->EFlags &= ~(1U << 15);
+    if (Exception::IosPfAfKeep) {
+      ValidMask |= (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC);
+    }
+  }
+  // madeira [df-ctx]: ntdll marks a resume whose DF came from the guest's own context with reserved bit 3. It is used
+  // only when the exception before it was delivered with DF (RethrowGuestException); otherwise, and without the mark, DF
+  // stays merged in from the JIT state, as before (single-step/int3 traps raised through the unix path, thread
+  // suspend/resume, contexts built from ARM ones).
+  {
+    auto* FTD = GetFrontendThreadData(Thread);
+    const bool DfDelivered = FTD && FTD->IosDfDelivered;
+    if (FTD) {
+      FTD->IosDfDelivered = false;
+    }
+    if (Context->EFlags & (1U << 3)) {
+      Context->EFlags &= ~(1U << 3);
+      if (Exception::IosDfCtx && DfDelivered) {
+        ValidMask |= 1U << FEXCore::X86State::RFLAG_DF_RAW_LOC;
+      }
+    }
+  }
+#endif
   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
-  Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
+  Context->EFlags = (Context->EFlags & ValidMask) | (StateEFlags & ~ValidMask);
+  if (!IosX87Ctx) {
+    Exception::LoadStateFromECContext(Thread, *Context);
+    return;
+  }
+  // madeira [x87-ctx]: the fields LoadStateFromECContext takes from FltSave, other than the x87/MMX registers
+  // themselves (those travel in the ARM64EC context's X6-X17/Lr and are reloaded as before).
+  auto& State = Thread->CurrentFrame->State;
+  const auto FCW = State.FCW;
+  const auto FTW = State.AbridgedFTW;
+  const uint8_t X87Flags[] = {State.flags[FEXCore::X86State::X87FLAG_IE_LOC], State.flags[FEXCore::X86State::X87FLAG_C0_LOC],
+                              State.flags[FEXCore::X86State::X87FLAG_C1_LOC], State.flags[FEXCore::X86State::X87FLAG_C2_LOC],
+                              State.flags[FEXCore::X86State::X87FLAG_C3_LOC], State.flags[FEXCore::X86State::X87FLAG_TOP_LOC]};
   Exception::LoadStateFromECContext(Thread, *Context);
+  State.FCW = FCW;
+  State.AbridgedFTW = FTW;
+  State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = X87Flags[0];
+  State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = X87Flags[1];
+  State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = X87Flags[2];
+  State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = X87Flags[3];
+  State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = X87Flags[4];
+  State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = X87Flags[5];
 }
 
 #ifdef FEX_IOS_HOST
@@ -1209,6 +1597,9 @@ static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM6
 /* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
 /* Keep a word-sized global, matching the module's iOS relocation guards. */
 namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
+/* madeira [crashmailer-dump]: set by ProcessInit (Overwatch.exe only, see there); read once by the ml1205 block ring
+ * (Core.cpp allocation, JIT.cpp emission) as if MADEIRA_BLOCK_RING=1 were set. */
+namespace FEXCore::Core { uint32_t IosBlockRingForce = 0; }
 extern "C" const uint64_t IosGuestBranchTraceLayout[3] = {
   0x314744454742444dULL,
   offsetof(FEXCore::Core::CpuStateFrame, IosGuestBranchHistory) |
@@ -1274,10 +1665,40 @@ NTSTATUS ProcessInit() {
   /* Recorder emitted only for this executable, before CTX/JIT creation. */
   const auto HistoryName = fextl::string {AppConfigName};
   const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
+  /* madeira [term-trace]: MADEIRA_FEX_BRANCH_HISTORY = 1 records for any executable
+   * (a per-game config line; BO3's self-exit). Unset keeps the old rule. */
   FEXCore::Core::IosGuestBranchTraceEnabled =
-    _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
+    (HistoryOpt && HistoryOpt[0] == '1') ||
+    (_stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0'));
   LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
                    FEXCore::Core::IosGuestBranchTraceEnabled != 0, AppConfigName);
+  /* madeira [crashmailer-dump] rev=crashmailer-dump-1: branch-history-v1 keeps only 8 exit edges per thread, so it
+   * cannot give the last 4096 blocks. The ml1205 block ring can (4096 entries per thread, ~10 instructions per block
+   * entry, 32 KB per thread). Turn it on for Overwatch.exe only, unless MADEIRA_EC_CRASHMAILER_DUMP=0 or
+   * MADEIRA_BLOCK_RING=0; every other game is unchanged. Must run before the first thread and the first block. */
+  {
+    const char* CmOpt = getenv("MADEIRA_EC_CRASHMAILER_DUMP");
+    const char* RingOpt = getenv("MADEIRA_BLOCK_RING");
+    FEXCore::Core::IosBlockRingForce = _stricmp(HistoryName.c_str(), "Overwatch.exe") == 0 && !(CmOpt && CmOpt[0] == '0') &&
+                                       !(RingOpt && RingOpt[0] == '0');
+    if (FEXCore::Core::IosBlockRingForce) {
+      LogMan::Msg::IFmt("[crashmailer-dump] rev=crashmailer-dump-1 fex: block ring on for {} (MADEIRA_BLOCK_RING=0 turns it off)",
+                        AppConfigName);
+    }
+    /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2 (env MADEIRA_EC_EXIT_PROBE = 0 turns it off):
+     * ntdll's exit probe snapshots the main thread's last 65536 blocks, so the ring is 65536 entries (512 KB per
+     * thread instead of 32 KB; rev 2: freed when the thread exits, ThreadTerm and Core.cpp DestroyThread) for
+     * Overwatch.exe only. */
+    const char* XpOpt = getenv("MADEIRA_EC_EXIT_PROBE");
+    if (FEXCore::Core::IosBlockRingForce && !(XpOpt && XpOpt[0] == '0' && XpOpt[1] == '\0')) {
+      FEXCore::Core::IosBlockRingEntriesRT = FEXCore::Core::IosBlockRingEntriesMax;
+    }
+    if (FEXCore::Core::IosBlockRingForce) {
+      LogMan::Msg::IFmt("[crashmailer-exit-probe] rev=crashmailer-exit-probe-2 fex: block ring {} entries per thread{}",
+                        FEXCore::Core::IosBlockRingEntriesRT,
+                        FEXCore::Core::IosBlockRingEntriesRT == FEXCore::Core::IosBlockRingEntries ? " (MADEIRA_EC_EXIT_PROBE=0)" : "");
+    }
+  }
 #endif
 
 
@@ -1351,6 +1772,33 @@ NTSTATUS ProcessInit() {
     if (PoolOut && PoolOut[0] == '0') {
       IosEcPoolFastOut = 0;
     }
+    const char* PfAf = getenv("MADEIRA_EC_PFAF_KEEP"); // madeira [pfaf-keep]
+    if (PfAf && PfAf[0] == '0') {
+      Exception::IosPfAfKeep = 0;
+    }
+    LogMan::Msg::EFmt("[pfaf-keep] rev=pfaf-keep-2 xtajit64 {}", Exception::IosPfAfKeep ? "on" : "off (MADEIRA_EC_PFAF_KEEP=0)");
+    const char* DfCtx = getenv("MADEIRA_EC_DF_CTX"); // madeira [df-ctx]
+    if (DfCtx && DfCtx[0] == '0') {
+      Exception::IosDfCtx = 0;
+    }
+    LogMan::Msg::EFmt("[df-ctx] rev=df-ctx-1 xtajit64 {}", Exception::IosDfCtx ? "on" : "off (MADEIRA_EC_DF_CTX=0)");
+    const char* PfAfInt3 = getenv("MADEIRA_EC_PFAF_INT3"); // madeira [pfaf-int3]
+    if (PfAfInt3 && PfAfInt3[0] == '0' && PfAfInt3[1] == '\0') {
+      Exception::IosPfAfInt3 = 0;
+    }
+    LogMan::Msg::EFmt("[pfaf-int3] rev=pfaf-int3-2 xtajit64 {}",
+                      !Exception::IosPfAfKeep ? "off (MADEIRA_EC_PFAF_KEEP=0)" : Exception::IosPfAfInt3 ? "on" : "off (MADEIRA_EC_PFAF_INT3=0)");
+    const char* SectionViews = getenv("MADEIRA_EC_SECTION_VIEWS"); // madeira [section-views]
+    FEX_MadeiraSectionViews = (SectionViews && SectionViews[0] == '0') ? 0 : 1;
+    const char* JitInval = getenv("MADEIRA_EC_JIT_INVAL"); // madeira [jit-inval]
+    FEX_MadeiraJitInvalCheck = (JitInval && JitInval[0] == '0') ? 0 : 1;
+    LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 xtajit64 {}", FEX_MadeiraJitInvalCheck ? "on" : "off (MADEIRA_EC_JIT_INVAL=0)");
+    LogMan::Msg::EFmt("[section-views] rev=section-views-1 xtajit64 {}", FEX_MadeiraSectionViews ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)");
+    const char* X87Ctx = getenv("MADEIRA_EC_X87_CTX"); // madeira [x87-ctx]
+    if (X87Ctx && X87Ctx[0] == '0') {
+      IosX87Ctx = 0;
+    }
+    LogMan::Msg::EFmt("[x87-ctx] rev=x87-ctx-1 {}", IosX87Ctx ? "on" : "off (MADEIRA_EC_X87_CTX=0)");
     LogMan::Msg::EFmt("[build-id] Module.S iOS paths present (stamp {}) -- alias xlate and sweep "
                       "gate are compiled in; ExitToX64 FFS bypass {}; EC in-pool fast-out {}",
                       IosEcAsmIosBuilt, IosFfsBypassEnable ? "ENABLED" : "disabled by MADEIRA_EC_FFS_BYPASS=0",
@@ -1415,6 +1863,9 @@ NTSTATUS ProcessInit() {
     const char* LeanOpt = getenv("MADEIRA_FEX_EC_EXIT_LEAN");
     IosEcExitLean = !HostFeatures.SupportsAFP && !(LeanOpt && strcmp(LeanOpt, "0") == 0);
     LogMan::Msg::IFmt("FEX: ec-exit-lean-v3 madeira-bcd enabled={} afp={} (jit exit translates, in-pool fast-out, L1 all ways)", IosEcExitLean != 0, HostFeatures.SupportsAFP);
+    const char* FfsPeekOpt = getenv("MADEIRA_FFS_PEEK_FIXUP");
+    IosFfsPeekFixup = (FfsPeekOpt && strcmp(FfsPeekOpt, "0") == 0) ? 0 : 1;
+    LogMan::Msg::IFmt("FEX: ffs-peek enabled={}", IosFfsPeekFixup);
 #endif
   }
 
@@ -1642,58 +2093,6 @@ public:
 };
 
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
-#ifdef FEX_IOS_HOST
-/* madeira kuser-remap (see IosJitAlias.cpp): a JIT load from the KUSER_SHARED_DATA window that
- * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction's 4 KB page and drop its
- * compiled code, then resume the SAME host PC with the context untouched: the load faults
- * again and ntdll emulates it (it hands each host PC over once), and the next time the guest
- * reaches the instruction it runs the recompiled code with the address translated inline.
- * The guest state is never rebuilt here: a first version resumed at the reconstructed RIP,
- * which can name an earlier instruction mid-block, re-ran it and corrupted PRAGMATA's hash of
- * this page (crash on a wild pointer, log 2026-11-22 12:09).
- * Returns true when the fault is consumed (always, once it is a KUSER load from JIT code). */
-static bool IosKuserRemapFault(const ThreadCPUArea CPUArea, FEXCore::Core::InternalThreadState* Thread, uint64_t FaultAddress,
-                               ARM64_NT_CONTEXT* NativeContext) {
-  if (FaultAddress < 0x7ffe0000ull || FaultAddress >= 0x7fff0000ull) {
-    return false;
-  }
-  uint64_t Low = 0, Size = 0, Real = 0;
-  if (!IosKuserWindow(&Low, &Size, &Real) || FaultAddress < Low || FaultAddress - Low >= Size) {
-    return false;
-  }
-  if (!CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc)) {
-    return false;
-  }
-  const uint64_t Rip = CTX->RestoreRIPFromHostPC(Thread, NativeContext->Pc);
-  if (!Rip) {
-    return false;
-  }
-  uint64_t Tick;
-  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(Tick));
-  uint32_t Strikes = 0;
-  int Action;
-  {
-    std::scoped_lock Lock(ThreadCreationMutex);
-    Action = IosKuserNote(Rip, Tick, &Strikes);
-    if (Action && InvalidationTracker) {
-      InvalidationTracker->InvalidateAlignedInterval(Rip, 1, false);
-    }
-  }
-  static std::atomic<uint32_t> Said {0};
-  const uint32_t N = Said.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (N <= 24 || (N & (N - 1)) == 0) {
-    uint32_t Rips = 0, Pages = 0;
-    IosKuserCounts(&Rips, &Pages);
-    static const char* const What[4] = {"gave up (left to ntdll)", "learned the instruction", "learned its 4 KB page",
-                                        "page already learned: dropped its code again"};
-    LogMan::Msg::EFmt("[kuser-remap] #{} guest rip {:#x} read {:#x} (host pc {:#x}): {} (strike {}); {} pages learned, {} re-faulting rips",
-                      N, Rip, FaultAddress, NativeContext->Pc, What[Action & 3], Strikes, Pages, Rips);
-  }
-  (void)CPUArea;
-  return true;   // NtContinueNative re-runs the faulting load in the old code; ntdll emulates it
-}
-#endif
-
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   auto Thread = CPUArea.ThreadState();
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
@@ -1742,12 +2141,6 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
       if (IosDeferAvLog) IosLogAv();
       return true;
     }
-
-#ifdef FEX_IOS_HOST
-    if (!IosDeferAvLog && IosKuserRemapFault(CPUArea, Thread, FaultAddress, NativeContext)) {   // madeira kuser-remap: reads only
-      return true;
-    }
-#endif
 
     std::scoped_lock Lock(ThreadCreationMutex);
     static std::atomic<uint64_t> IosSmcHandled {0};
@@ -1894,10 +2287,51 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     if (IosDeferAvLog) IosLogAv();   /* ml1055: NOT self-modifying code -- a real fault, always logged */
   }
 
+#ifdef FEX_IOS_HOST
+  /* ffs-peek: a READ fault on ExitToX64's native peek at the x64 call target (Module.S, IosFfsPeekBegin..End).
+   * Resume at IosFfsNoBypass, the path taken when the target is not an FFS, so FEX's frontend meets the page
+   * itself and raises the guest execute fault Windows would. The pc may be the PE VA or wine's pool copy of this
+   * DLL; both are compared in PE space and the resume pc keeps the faulting pc's space. Read faults only: the
+   * peek never writes, so anything else here is a real bug and passes through untouched. */
+  if (IosFfsPeekFixup && Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && Exception->NumberParameters >= 2 &&
+      Exception->ExceptionInformation[0] == 0) {
+    auto ToPe = [](uint64_t A) {
+      const uint64_t R = IosJitReverseTranslate(A);
+      return R ? R : A;
+    };
+    const uint64_t Pc = NativeContext->Pc;
+    const uint64_t PeBegin = ToPe(reinterpret_cast<uint64_t>(IosFfsPeekBegin));
+    const uint64_t PeEnd = ToPe(reinterpret_cast<uint64_t>(IosFfsPeekEnd));
+    /* The pc can be the pool copy while ExceptionAddress is already the PE VA (0.2.59 log: 154EDE980 vs 70EE388980).
+     * If the alias table does not cover this DLL's own copy, the pc test alone would miss, so ExceptionAddress
+     * (the same instruction) is tested too. */
+    uint64_t PePc = ToPe(Pc);
+    if (!(PePc >= PeBegin && PePc < PeEnd)) {
+      PePc = ToPe(reinterpret_cast<uint64_t>(Exception->ExceptionAddress));
+    }
+    if (PePc >= PeBegin && PePc < PeEnd) {
+      const uint64_t PeResume = ToPe(reinterpret_cast<uint64_t>(IosFfsNoBypass));
+      NativeContext->Pc = Pc - PePc + PeResume;
+      static std::atomic<uint32_t> FfsPeekCount;
+      const uint32_t N = FfsPeekCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (N <= 16 || (N % 1000) == 0) {
+        LogMan::Msg::EFmt("[ffs-peek] #{} read fault at {:X} on target {:X} (read of {:X}) -> normal emulation rev=ffs-peek", N, Pc,
+                          NativeContext->X9, static_cast<uint64_t>(Exception->ExceptionInformation[1]));
+      }
+      return true;
+    }
+  }
+#endif
+
   bool IsJIT = CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc);
   if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Exception::HandleUnalignedAccess(CPUArea, *NativeContext, IsJIT)) {
     LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", NativeContext->Pc);
     return true;
+  }
+
+  if (NativeContext->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
   }
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
@@ -2149,6 +2583,40 @@ extern "C" void NotifyImageMap(void* Address) {
 }
 
 NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Size, ULONG AllocType, ULONG Prot) {
+  /* madeira [section-views] (MetalSharp patches/fex/0025, AGPL-3.0): Wine passes a section handle
+   * (Unk1) and view offset (Unk2) only for a DATA-section view; image maps keep Unk1 == NULL and
+   * take the unchanged path below. A data view is never queued or treated as an image. */
+  if (Unk1) {
+    if (!FEX_MadeiraSectionViews || !InvalidationTracker || !ImageTracker || ProcessTerminating.load(std::memory_order_relaxed)) {
+      return STATUS_SUCCESS;
+    }
+    bool SelfShared = false;
+    if (CTX) {
+      uint64_t Teb = 0;
+      __asm__ volatile("mov %0, x18" : "=r"(Teb));
+      const uint64_t Stamp = CTX->GetCodeInvalidationMutex().IosStampAddress();
+      auto Held = [Stamp](uint64_t T) {
+        return T && *reinterpret_cast<const uint32_t*>(T + 0x16f0) != 0 && *reinterpret_cast<const uint64_t*>(T + 0x16f8) == Stamp;
+      };
+#ifdef FEX_IOS_HOST
+      const uint64_t TebTsd = reinterpret_cast<uint64_t>(IOSLoadTEB());
+#else
+      const uint64_t TebTsd = 0;
+#endif
+      SelfShared = Held(Teb) || (TebTsd != Teb && Held(TebTsd));
+    }
+    if (SelfShared) {
+      // Same reason as the madeira-bcd case below: no ThreadCreationMutex, no invalidation.
+      InvalidationTracker->HandleDataSectionMap(Unk1, reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size),
+                                                reinterpret_cast<uint64_t>(Unk2), true);
+    } else {
+      std::scoped_lock Lock(ThreadCreationMutex);
+      InvalidationTracker->HandleDataSectionMap(Unk1, reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size),
+                                                reinterpret_cast<uint64_t>(Unk2), false);
+    }
+    return STATUS_SUCCESS;
+  }
+
   /* iOS-Madeira ml183: do NOT require GetCPUArea().ThreadState() here.
    *
    * HandleImageMap() only needs InvalidationTracker + ImageTracker — it never touches
@@ -2225,13 +2693,61 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
     if (Size) {
       HandleImageUnmap(Start, Size);
     }
+    InvalidationTracker->HandleDataSectionUnmap(reinterpret_cast<uint64_t>(Address)); // madeira [section-views]
   } else {
     ThreadCreationMutex.unlock();
   }
 }
 
+/* MADEIRA [flush-own-lock]: a flush FEX itself issued while holding the code invalidation lock.
+ *
+ * On iOS, FEX's JIT flushes its own code through NtFlushInstructionCache (JIT.cpp IOSFlushOneInstr,
+ * Arm64.cpp ClearICache), and wine's EC wrapper of that call comes back here. A block delinker does
+ * it from LookupCache::InvalidateRange, i.e. with CodeInvalidationMutex WRITE-owned, and then waited
+ * here for ThreadCreationMutex. Every other path takes ThreadCreationMutex first and
+ * CodeInvalidationMutex second (ResetToConsistentStateImpl's write-fault path), so the two threads
+ * waited on each other forever: PvZ Fusion with MelonLoader (Test 8, Get Help logs, Nov 10) froze
+ * 24 s and 100 s in, both times "RtlpWaitForCriticalSection ... blocked by" on this mutex
+ * (xtajit64.dll+0x42c848) against a "[fexlock] STUCK" on CodeInvalidationMutex taken at
+ * LockCodeInvalidationUnlessHeld. Such a flush names FEX's own code buffer, never guest code, so
+ * there is nothing to invalidate: return without taking either lock. (Invalidating anyway would be
+ * worse: the delinker runs inside InvalidateCodeBuffersCodeRange, which holds CodeBufferListLock and
+ * the lookup cache's write lock, neither of them recursive.) The same holds for a thread with only a
+ * shared emission hold (a compile's own flush): taking ThreadCreationMutex there closes the same loop.
+ * Guest flushes never arrive with these locks held: guest code does not run under them.
+ * Off: env.MADEIRA_FLUSH_OWN_LOCK = 0 (upstream behaviour). */
+static bool IosFlushOwnLockAllowed() {
+  static const bool Allowed = [] {
+    const char* V = getenv("MADEIRA_FLUSH_OWN_LOCK");
+    return !(V && V[0] == '0' && V[1] == 0);
+  }();
+  return Allowed;
+}
+
+// Flushes skipped by IosFlushUnderOwnLock (for a debugger or a later report).
+static std::atomic<uint64_t> IosFlushOwnLockSkips {0};
+
+// True when the flush was handled here (the caller returns).
+static bool IosFlushUnderOwnLock() {
+  if (!IosFlushOwnLockAllowed() || !CTX) {
+    return false;
+  }
+  const bool Exclusive = CTX->GetCodeInvalidationMutex().IosHeldExclusiveByThisThread();
+  const bool Shared = !Exclusive && FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf();
+  if (!Exclusive && !Shared) {
+    return false;
+  }
+  // No log line here: it would allocate with CodeBufferListLock and the lookup cache's write lock
+  // held, and an allocation can come back through the memory notifications. Count only.
+  IosFlushOwnLockSkips.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
+    return;
+  }
+  if (IosFlushUnderOwnLock()) {
     return;
   }
 
@@ -2241,6 +2757,9 @@ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
 
 void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
+    return;
+  }
+  if (IosFlushUnderOwnLock()) {
     return;
   }
 
@@ -2347,6 +2866,329 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
  * Returns a bitmask of what was actually released so the caller can log it;
  * every branch is reported, so silence never has to be interpreted.
  */
+#ifdef FEX_IOS_HOST
+/* madeira [getctx-guest] (env MADEIRA_GETCTX_GUEST = 0 turns it off; on by default). rev=getctx-guest-2. Ours.
+ *
+ * NtGetContextThread on ANOTHER thread of this process whose native pc is in FEX's translated code. ntdll's
+ * ARM64EC wrapper converts the native ARM64 context with the ARM64EC register mapping, which is right for EC code
+ * but not for the JIT: there Pc is a code-buffer address, the guest RSP lives in x23 (SRA mapping) and the flags are
+ * FEX's compacted ones (CF inverted in NZCV, PF/AF deferred in x9/x24). This rebuilds the guest view of that
+ * snapshot. It is READ ONLY: nothing of the target is written (review-2 must-fix 1: on iOS a "suspended" thread can
+ * still be running unless MADEIRA_REAL_SUSPEND=1, so its State must not be touched).
+ * - Every read of the target (its TEB, CPU area, CpuStateFrame, block header) is a checked NtReadVirtualMemory, so a
+ *   target that exits meanwhile gives "no answer" instead of a fault.
+ * - RIP: the block header is read ONCE and ios_fex_rip_from_hostpc walks that block's RIP table. It returns 0 when
+ *   the host pc is not inside that block (the target moved on, is in a block's first two instructions, or in a
+ *   linked block): then the caller keeps its old answer (review-2 must-fix 2).
+ * - Flags: NZCV from the snapshot's Cpsr (CF un-inverted), PF/AF computed locally from the snapshot's x9/x24 the way
+ *   ReconstructCompactedEFLAGS does, TF/DF read from State.flags.
+ * - GPRs through the SRA table (RSP is x23), the non-SRA ones from State.gregs; XMM0-15 are already at v0-v15.
+ *   x87/MMX from State.mm, as StoreStateToPackedECContext packs them (the same approximation as the exception path:
+ *   the x87 stack pass can leave State.mm stale in the middle of a block).
+ * Teb: the target's TEB (ntdll passes the snapshot's x18; checked here against Tib.Self at 0x30 and
+ * ClientId.UniqueProcess at 0x40, and refused when it is the caller's). Context: a COPY the caller may discard.
+ * Returns 1 when Context was rewritten, 0 otherwise. Op must be 1 (op 0, the review-2 SHOULD probe, is gone). */
+extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC); // Core.cpp (ml549)
+
+extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*); // madeira [getctx-guest]: the earlier declaration is inside namespace Exception
+template<typename T>
+static bool IosGcRead(uint64_t Addr, T* Out, size_t Len = sizeof(T)) {
+  SIZE_T Got = 0;
+  return Addr && NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Addr), Out, Len, &Got) == 0 && Got == Len;
+}
+
+extern "C" uint32_t BTCpu64IosGuestContext(void* Teb, ARM64_NT_CONTEXT* Context, uint32_t Op) {
+  static const bool Enabled = [] {
+    const char* E = getenv("MADEIRA_GETCTX_GUEST");
+    return !(E && E[0] == '0' && E[1] == '\0');
+  }();
+  if (!Enabled || Op != 1 || !Teb || !Context || !CTX) {
+    return 0;
+  }
+  using FEXCore::Core::CpuStateFrame;
+  const uint64_t TebAddr = reinterpret_cast<uint64_t>(Teb);
+  uint64_t Area = 0, FrameAddr = 0, BlockBegin = 0, TebSelf = 0, TebPid = 0;
+  // Teb comes from the snapshot's x18: accept it only if it is a TEB of this process (Tib.Self, ClientId).
+  if (TebAddr == reinterpret_cast<uint64_t>(NtCurrentTeb()) || !IosGcRead(TebAddr + 0x30, &TebSelf) || TebSelf != TebAddr ||
+      !IosGcRead(TebAddr + 0x40, &TebPid) || TebPid != *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(NtCurrentTeb()) + 0x40)) {
+    return 0;
+  }
+  if (!IosGcRead(TebAddr + ThreadCPUArea::TEBCPUAreaOffset, &Area) ||
+      !IosGcRead(Area + offsetof(CHPE_V2_CPU_AREA_INFO, EmulatorData), &FrameAddr) || !FrameAddr) { // EmulatorData[0] = StateFrame
+    return 0;
+  }
+  const uint64_t StateAddr = FrameAddr + offsetof(CpuStateFrame, State);
+  uint64_t Gregs[16];
+  uint64_t Mm[8][2];
+  uint8_t Flags[FEXCore::Core::CPUState::NUM_EFLAG_BITS];
+  if (!IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader), &BlockBegin) || !BlockBegin ||
+      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, gregs), &Gregs) ||
+      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, mm), &Mm) ||
+      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, flags), &Flags)) {
+    return 0;
+  }
+  // The block must be readable and contain the host pc before ios_fex_rip_from_hostpc walks it.
+  uint32_t OffsetToTail = 0;
+  uint64_t BlockSize = 0;
+  if (!IosGcRead(BlockBegin, &OffsetToTail) || !IosGcRead(BlockBegin + OffsetToTail, &BlockSize) ||
+      Context->Pc < BlockBegin || Context->Pc >= BlockBegin + BlockSize) {
+    return 0;
+  }
+  {
+    uint8_t Probe[1];
+    if (!IosGcRead(BlockBegin + BlockSize - 1, &Probe)) {
+      return 0;
+    }
+  }
+  const uint64_t Rip = ios_fex_rip_from_hostpc(BlockBegin, Context->Pc);
+  if (!Rip) {
+    return 0;
+  }
+
+  // Flags of the snapshot, computed here (no write to the target).
+  const uint32_t HostCpsr = Context->Cpsr;
+  const uint32_t PFByte = static_cast<uint32_t>(Context->X9) & 0xff; // REG_PF under ARM64EC
+  const uint32_t PF = std::popcount(PFByte ^ 1) & 1;
+  const uint32_t AF = ((static_cast<uint32_t>(Context->X24) ^ PFByte) >> 4) & 1; // REG_AF under ARM64EC
+  const uint32_t TF = Flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] & 1;
+  const uint32_t DF = (Flags[FEXCore::X86State::RFLAG_DF_RAW_LOC] & 0x80) ? 1 : 0;
+
+  const auto& Config = SignalDelegator->GetConfig();
+  uint64_t G[16];
+  for (size_t i = 0; i < 16; i++) {
+    G[i] = Gregs[i];
+  }
+  for (size_t i = 0; i < Config.SRAGPRCount && i < 16; i++) {
+    G[i] = Context->X[Config.SRAGPRMapping[i]];
+  }
+  Context->X8 = G[FEXCore::X86State::REG_RAX];
+  Context->X0 = G[FEXCore::X86State::REG_RCX];
+  Context->X1 = G[FEXCore::X86State::REG_RDX];
+  Context->X27 = G[FEXCore::X86State::REG_RBX];
+  Context->Sp = G[FEXCore::X86State::REG_RSP];
+  Context->Fp = G[FEXCore::X86State::REG_RBP];
+  Context->X25 = G[FEXCore::X86State::REG_RSI];
+  Context->X26 = G[FEXCore::X86State::REG_RDI];
+  Context->X2 = G[FEXCore::X86State::REG_R8];
+  Context->X3 = G[FEXCore::X86State::REG_R9];
+  Context->X4 = G[FEXCore::X86State::REG_R10];
+  Context->X5 = G[FEXCore::X86State::REG_R11];
+  Context->X19 = G[FEXCore::X86State::REG_R12];
+  Context->X20 = G[FEXCore::X86State::REG_R13];
+  Context->X21 = G[FEXCore::X86State::REG_R14];
+  Context->X22 = G[FEXCore::X86State::REG_R15];
+  Context->Pc = Rip;
+
+  Context->Lr = Mm[0][0];
+  Context->X6 = Mm[1][0];
+  Context->X7 = Mm[2][0];
+  Context->X9 = Mm[3][0];
+  Context->X16 = (Mm[3][1] & 0xffff) << 48 | (Mm[2][1] & 0xffff) << 32 | (Mm[1][1] & 0xffff) << 16 | (Mm[0][1] & 0xffff);
+  Context->X10 = Mm[4][0];
+  Context->X11 = Mm[5][0];
+  Context->X12 = Mm[6][0];
+  Context->X15 = Mm[7][0];
+  Context->X17 = (Mm[7][1] & 0xffff) << 48 | (Mm[6][1] & 0xffff) << 32 | (Mm[5][1] & 0xffff) << 16 | (Mm[4][1] & 0xffff);
+  Context->X13 = 0;
+  Context->X14 = 0;
+  Context->X18 = 0;
+  Context->X23 = 0;
+  Context->X24 = 0;
+  Context->X28 = 0;
+
+  // ARM64EC Cpsr convention (what ntdll's cpsr_to_eflags reads): N=SF, Z=ZF, C=CF (not inverted), V=OF.
+  uint32_t Cpsr = (HostCpsr & 0xd0000000) | ((~HostCpsr) & (1U << 29));
+  Cpsr |= TF ? (1U << 21) : 0;
+  if (Exception::IosPfAfKeep) { // same RES0 bits as StoreStateToPackedECContext ([pfaf-keep])
+    Cpsr |= PF ? (1U << 26) : 0;
+    Cpsr |= AF ? (1U << 27) : 0;
+  }
+  if (Exception::IosDfCtx) { // [df-ctx]
+    Cpsr |= DF ? (1U << 16) : 0;
+  }
+  Context->Cpsr = Cpsr;
+  return 1;
+}
+
+/* madeira [pfaf-int3] rev=pfaf-int3-2. Ours. ntdll's prepare_exception_arm64ec calls this for the context it is
+ * about to hand the guest's exception handlers. When the exception is the one RaiseException last raised on this
+ * thread (same guest RIP and RSP), returns 0x100 | its x86 PF (bit 2) and AF (bit 4); else 0. Either way the saved
+ * value is used up, so it can never be applied to a later exception. */
+extern "C" uint32_t BTCpu64IosRaisePfAf(uint64_t Pc, uint64_t Sp) {
+  auto* Thread = GetCPUArea().ThreadState();
+  auto* FTD = Thread ? GetFrontendThreadData(Thread) : nullptr;
+  if (!FTD || !FTD->IosRaiseValid) {
+    return 0;
+  }
+  FTD->IosRaiseValid = false;
+  if (FTD->IosRaisePc != Pc || FTD->IosRaiseSp != Sp) {
+    return 0;
+  }
+  return 0x100 | FTD->IosRaiseFlags;
+}
+
+/* madeira [dr-pass] (env MADEIRA_EC_DEBUG_REGS = 0 turns it off; ntdll reads the same switch and
+ * then never calls this). rev=dr-pass-1.
+ *
+ * x64 debug registers for ARM64EC guest code. FEXCore already implements x86 instruction
+ * breakpoints from State.Dr[0..3]/Dr7 (upstream FEX PR #6045, Frontend.cpp decoder check +
+ * OpDispatchBuilder::BreakpointOp), but the ARM64EC frontend never fills them: Wine's x64 -> ARM64
+ * context conversion drops Dr0-Dr7, and LoadStateFromECContext's copy is disabled
+ * ("if constexpr (false)"). Online: FEX #6099 (Overwatch loader under ARM64EC) - maintainer:
+ * "needs Debug Register support"; MetalSharp-Wine commit 4614051 (Nov 7 2026) passes the debug
+ * registers from ntdll to FEX and says Overwatch's protector uses hardware breakpoints. Our own
+ * code; ideas only.
+ *
+ * ntdll calls this for the CURRENT thread only. Regs = { Dr0, Dr1, Dr2, Dr3, Dr6, Dr7 }.
+ * Op 0: read State into Regs. Op 1: write Regs into State, first invalidating cached blocks at
+ * old/new instruction-breakpoint addresses (same logic as the disabled upstream block). Returns 1
+ * when done, 0 when there is no emulator thread state yet. */
+extern "C" uint32_t BTCpu64IosDebugRegs(uint32_t Op, uint64_t* Regs) {
+  auto* Thread = GetCPUArea().ThreadState();
+  if (!Thread || !Regs) {
+    return 0;
+  }
+  auto& State = Thread->CurrentFrame->State;
+  if (Op == 0) {
+    for (int i = 0; i < 4; ++i) {
+      Regs[i] = State.Dr[i];
+    }
+    Regs[4] = State.Dr6;
+    Regs[5] = State.Dr7;
+    return 1;
+  }
+  const uint64_t NewDr7 = Regs[5];
+  bool AnyChanged = false;
+  bool Changed[4] {};
+  for (int i = 0; i < 4; ++i) {
+    const uint64_t BPMask = (uint64_t {0b1111} << (16 + 4 * i)) | (uint64_t {0b11} << (2 * i));
+    Changed[i] = Regs[i] != State.Dr[i] || ((NewDr7 ^ State.Dr7) & BPMask);
+    AnyChanged |= Changed[i];
+  }
+  if (AnyChanged && InvalidationTracker && !ProcessTerminating.load(std::memory_order_relaxed)) {
+    std::scoped_lock Lock(ThreadCreationMutex);
+    for (int i = 0; i < 4; ++i) {
+      if (!Changed[i]) {
+        continue;
+      }
+      // Only instruction breakpoints (R/W bits 00) change generated code.
+      if (Regs[i] && ((NewDr7 >> (16 + 4 * i)) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Regs[i], 8, false);
+      }
+      if (State.Dr[i] && ((State.Dr7 >> (16 + 4 * i)) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[i], 8, false);
+      }
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    State.Dr[i] = Regs[i];
+  }
+  State.Dr6 = Regs[4];
+  State.Dr7 = NewDr7;
+  return 1;
+}
+
+/* madeira [crashmailer-dump] rev=crashmailer-dump-1. Data only: no logging, no locks, no allocation. ntdll calls it
+ * once, from NtCreateUserProcess on the thread that starts CrashMailer. The layouts are mirrored in
+ * signal_arm64ec.c (struct ios_cmd_fex_thread / ios_cmd_fex_exc); keep them in step.
+ * Op 0: this thread's emulator state as FEX last stored it (State is written back at JIT exits, so for a thread
+ *       that is in native ARM64EC code it is the state at its last exit, not a live view). Returns 1, or 0 when
+ *       the thread has no emulator state.
+ * Op 1: the assert-dump-2 ring of delivered exception contexts (all threads), newest first, as many as fit in
+ *       Size. Returns the number copied. */
+struct IosCmFexThread {
+  uint64_t Version; // 1
+  uint64_t Rip;
+  uint64_t Gregs[16];
+  uint64_t EFlags, Fcw, Ftw, Mxcsr;
+  uint64_t Dr[6];
+  uint64_t Xmm[16][2];
+  uint64_t RingSeq;
+  uint64_t BlockRing;
+};
+struct IosCmFexExc {
+  uint64_t Seq;
+  uint32_t Tid, Code, EFlags, LiveTF;
+  uint64_t X[31];
+  uint64_t Sp, Pc;
+  uint32_t Cpsr, Fpcr, Fpsr, ContextFlags;
+  uint64_t V[32][2];
+};
+static_assert(sizeof(IosCmFexThread) == 8 * 62 && sizeof(IosCmFexExc) == 816, "mirrored in signal_arm64ec.c");
+
+extern "C" uint32_t BTCpu64IosCrashMailerData(uint32_t Op, void* Buf, uint32_t Size) {
+  if (!Buf || !Exception::IosCrashMailerOn()) {
+    return 0;
+  }
+  if (Op == 0) {
+    auto* Thread = GetCPUArea().ThreadState();
+    if (!Thread || Size < sizeof(IosCmFexThread)) {
+      return 0;
+    }
+    const auto& State = Thread->CurrentFrame->State;
+    auto* T = static_cast<IosCmFexThread*>(Buf);
+    memset(T, 0, sizeof(*T));
+    T->Version = 1;
+    T->Rip = State.rip;
+    for (int i = 0; i < 16; i++) {
+      T->Gregs[i] = State.gregs[i];
+      T->Xmm[i][0] = State.xmm.sse.data[i][0];
+      T->Xmm[i][1] = State.xmm.sse.data[i][1];
+    }
+    T->EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+    T->Fcw = State.FCW;
+    T->Ftw = State.AbridgedFTW;
+    T->Mxcsr = State.mxcsr;
+    for (int i = 0; i < 4; i++) {
+      T->Dr[i] = State.Dr[i];
+    }
+    T->Dr[4] = State.Dr6;
+    T->Dr[5] = State.Dr7;
+    T->RingSeq = Exception::IosAssertRingSeq.load(std::memory_order_relaxed);
+    T->BlockRing = reinterpret_cast<uint64_t>(Thread->CurrentFrame->IosBlockRing);
+    return 1;
+  }
+  if (Op == 1) {
+    const uint32_t Max = Size / sizeof(IosCmFexExc);
+    auto* Out = static_cast<IosCmFexExc*>(Buf);
+    const uint64_t Now = Exception::IosAssertRingSeq.load(std::memory_order_relaxed);
+    uint32_t N = 0;
+    for (uint64_t k = 0; k < 64 && k < Now && N < Max; k++) {
+      const auto& E = Exception::IosAssertRing[(Now - k) % 64];
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (E.Seq != Now - k) {
+        continue; // being rewritten
+      }
+      auto& O = Out[N];
+      O.Seq = E.Seq;
+      O.Tid = E.Tid;
+      O.Code = E.Code;
+      O.EFlags = E.EFlags;
+      O.LiveTF = E.LiveTF;
+      for (int i = 0; i < 31; i++) {
+        O.X[i] = E.Ctx.X[i];
+      }
+      O.Sp = E.Ctx.Sp;
+      O.Pc = E.Ctx.Pc;
+      O.Cpsr = E.Ctx.Cpsr;
+      O.Fpcr = E.Ctx.Fpcr;
+      O.Fpsr = E.Ctx.Fpsr;
+      O.ContextFlags = E.Ctx.ContextFlags;
+      for (int i = 0; i < 32; i++) {
+        O.V[i][0] = E.Ctx.V[i].Low;
+        O.V[i][1] = static_cast<uint64_t>(E.Ctx.V[i].High);
+      }
+      if (E.Seq != Now - k) {
+        continue; // torn while copying: drop it
+      }
+      N++;
+    }
+    return N;
+  }
+  return 0;
+}
+#endif
+
 /* ml618: TEB is passed EXPLICITLY rather than read from x18.
  *
  * This is invoked from wine's pthread_exit_wrapper on a dying thread, so the
@@ -2958,6 +3800,13 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
   delete[] ThreadState->CurrentFrame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT];
 
   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
+#ifdef FEX_IOS_HOST
+  if (ThreadState->CurrentFrame->IosBlockRing && Info.TebBaseAddress) {
+    /* madeira [crashmailer-exit-probe] rev=crashmailer-exit-probe-2: DestroyThread frees the block ring, so the
+     * TEB stops naming it first (ntdll's reporters then say "no block ring" instead of reading freed memory). */
+    __atomic_store_n(reinterpret_cast<uint64_t**>(reinterpret_cast<uintptr_t>(Info.TebBaseAddress) + 0x1710), nullptr, __ATOMIC_RELEASE);
+  }
+#endif
   CTX->DestroyThread(ThreadState);
   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
   if (ThreadTID == GetCurrentThreadId()) {

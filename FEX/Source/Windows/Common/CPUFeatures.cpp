@@ -159,13 +159,86 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
                       HostFeatures.SupportsAFP, Probe ? Probe : "none");
   }
 #endif
-  HostFeatures.CPUMIDRs.push_back(0u);
+  /* madeira [cpu-identity-2] (fex-cpu-count, FEX patch 0005 reworked): one CPUMIDRs entry per processor.
+   * The iOS host has no MIDR registry to read, and this pushed ONE entry, so FEXCore's CPUID
+   * (Cores = CPUMIDRs.size()) said 1 logical processor while the PEB, GetSystemInfo, KUSER_SHARED_DATA,
+   * SystemLogicalProcessorInformationEx and (with cpu-identity) the registry said 8. Overwatch 2's loader
+   * crashed at 5 s with 8 CentralProcessor keys and 1 CPUID processor, and ran with 1 and 1.
+   *
+   * The count is the PEB's NumberOfProcessors, which init_peb (build/ntdll-unix/env_ios.c) set from
+   * madeira_reported_cpu_count() = `madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count`, the same
+   * expression the registry writer (server_ios.c, ios_hw_registry_publish) uses for its key count. So the two
+   * sides cannot diverge. Upstream FEX counts the CentralProcessor keys instead (the non-iOS branch below); we
+   * count them too, as a check: if the session's registry has a different number of keys (it was written by
+   * the session's first process, which may have run with other settings), CPUID follows the registry the
+   * program sees and the log says MISMATCH. All entries are MIDR 0, as the single one was: nothing is called
+   * hybrid and the brand is unchanged. Capped at 64 (8-bit CPUID fields, one processor group).
+   * Off: MADEIRA_FEX_CPU_COUNT=0, or the master MADEIRA_CPU_IDENTITY=0 (FEXCore CPUID.cpp reads the same
+   * two variables for the HTT bit and leaf 0xB). */
+  {
+    const auto EnvOff = [](const char* Name) {
+      const char* E = getenv(Name);
+      return E && E[0] == '0' && E[1] == '\0';
+    };
+    const bool CountOn = !EnvOff("MADEIRA_CPU_IDENTITY") && !EnvOff("MADEIRA_FEX_CPU_COUNT");
+    uint32_t Count = 1;
+    uint32_t PebCount = 0;
+    uint32_t Keys = 0;
+    if (CountOn) {
+      const auto* Peb = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb;
+      PebCount = Peb ? Peb->NumberOfProcessors : 0;
+      Count = PebCount == 0 ? 1 : PebCount > 64 ? 64 : PebCount;
+      // Upstream's way of counting (the non-iOS branch): open CentralProcessor\0, \1, ... until one is missing.
+      while (Keys < 64) {
+        HKEY Key = OpenProcessorKey(Keys);
+        if (!Key) {
+          break;
+        }
+        RegCloseKey(Key);
+        ++Keys;
+      }
+      if (Keys && Keys != Count) {
+        Count = Keys;
+      }
+    }
+    HostFeatures.CPUMIDRs.assign(Count, 0u);
+    if (!CountOn) {
+      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count off: CPUID reports 1 CPU (MADEIRA_FEX_CPU_COUNT=0 or MADEIRA_CPU_IDENTITY=0)");
+    } else if (!Keys) {
+      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count {} CPUs reported through CPUID (peb={}, no CentralProcessor keys)", Count, PebCount);
+    } else {
+      LogMan::Msg::IFmt("[cpu-identity] rev=cpu-identity-2 cpu-count {} CPUs reported through CPUID (peb={} registry={} {})", Count, PebCount,
+                        Keys, Keys == PebCount ? "MATCH" : "MISMATCH: following the registry");
+    }
+  }
   HostFeatures.ProcessPID = ProcessPID;
   HostFeatures.ProcessFeatures.HostType = HostType;
   HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
-  // Madeira delivers guest faults through its own exception path; keep the
-  // pre-existing (non fault-free) synchronous fault handling.
+  // Madeira delivers guest faults through its own exception path; by default keep
+  // the pre-existing (non fault-free) synchronous fault handling.
+  // [fex-faultfree] MADEIRA_FEX_FAULTFREE=1 (game config line env.MADEIRA_FEX_FAULTFREE = 1)
+  // turns the ARM64EC fault-free path on: FEX then raises guest faults from its
+  // own SynchronousExceptionHandler instead of through a host trap. Any other value,
+  // or unset, keeps the default (off). WOW64 always stays off.
   HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = false;
+  {
+    const char* FaultFree = getenv("MADEIRA_FEX_FAULTFREE");
+    const bool Wanted = FaultFree && FaultFree[0] == '1' && FaultFree[1] == '\0';
+    if (Wanted && HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
+      HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = true;
+    }
+    static bool Logged = false;
+    if (!Logged) {
+      Logged = true;
+      if (HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults) {
+        LogMan::Msg::IFmt("[fex-faultfree] on (ARM64EC SynchronousExceptionHandler) rev=fex-faultfree");
+      } else if (Wanted) {
+        LogMan::Msg::IFmt("[fex-faultfree] off (requested, but host is not ARM64EC) rev=fex-faultfree");
+      } else {
+        LogMan::Msg::IFmt("[fex-faultfree] off rev=fex-faultfree");
+      }
+    }
+  }
   /* iOS-Madeira: AVX/AVX2 stay off (titles that check CPUID take their SSE
    * paths), but a game built for AVX dies on its first VEX instruction. The app
    * sets MADEIRA_FEX_AVX=1 for such a game; FEX then runs AVX through its
@@ -177,7 +250,7 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
    * line env.MADEIRA_FEX_AVX = 2. */
   if (const char* Avx = getenv("MADEIRA_FEX_AVX");
       Avx && (Avx[0] == '1' || (Avx[0] == '2' && Avx[1] == '\0')) && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64) {
-    HostFeatures.SupportsAVX = true;
+    HostFeatures.ProcessFeatures.SupportsAVX = true;
     HostFeatures.SupportsAES256 = HostFeatures.SupportsAES;
     if (Avx[0] == '1') {
       LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=1: AVX and AVX2 reported and emulated");
@@ -208,15 +281,15 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   FEX::FetchHostFeatures(Features, HostFeatures, IsWine, CTR, MIDR);
 
   // Force-disable SVE until wine/windows gain support for SVE context save/restore
-  HostFeatures.SupportsSVE128 = false;
-  HostFeatures.SupportsSVE256 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE128 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE256 = false;
 
   HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine || FEX::Windows::UnixLib::SupportsTPIDRRO_CPU();
 
   HostFeatures.ProcessPID = ProcessPID;
 
   // AVX is unsupported for WOW64
-  HostFeatures.SupportsAVX = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+  HostFeatures.ProcessFeatures.SupportsAVX = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
 
   HostFeatures.ProcessFeatures.HostType = HostType;
   HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;

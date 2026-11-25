@@ -302,7 +302,15 @@ static UINT64 read_tsc_frequency(void)
 static UINT64 read_tsc_frequency(void)
 {
     UINT64 tsc_frequency;
+    WCHAR off[2];
     __asm__ volatile( "mrs %[Res], CNTFRQ_EL0" : [Res] "=r" (tsc_frequency) );
+    /* madeira [tsc-mhz] (env MADEIRA_EC_TSC_MHZ = 0 turns it off). Credit: BOR1NG (Avery Felts,
+     * https://github.com/aaf2tbz), MetalSharp-Wine patch 0134 (LGPL-2.1). x86 code under the
+     * emulator reads RDTSC as this counter doubled until it reaches 1 GHz (FEX SmallTSCScale:
+     * 24 MHz -> 1536 MHz), and CPUID 0x16 names that rate with MADEIRA_FEX_CPUID_FREQ=1; ~MHz now names the same one, as on x86
+     * hardware. The raw 24 MHz disagreed with everything the program measured. */
+    if (tsc_frequency && !(GetEnvironmentVariableW( L"MADEIRA_EC_TSC_MHZ", off, ARRAY_SIZE(off) ) == 1 && off[0] == '0'))
+        while (tsc_frequency < 1000000000) tsc_frequency <<= 1;
     return tsc_frequency;
 }
 
@@ -832,10 +840,10 @@ static void create_computer_name_keys(void)
     HKEY key, subkey;
 
     if (gethostname( buffer, sizeof(buffer) )) return;
-    hints.ai_flags = AI_CANONNAME;
+    hints.ai_flags = AI_CANONNAME | AI_DNS_ONLY;
     if (getaddrinfo( buffer, NULL, &hints, &res ) != 0)
         res = NULL;
-    else if (res->ai_canonname && strcasecmp( res->ai_canonname, "localhost" ) != 0)
+    else if (res->ai_canonname && stricmp( res->ai_canonname, "localhost" ) != 0)
         name = res->ai_canonname;
     dot = strchr( name, '.' );
     if (dot) *dot++ = 0;
@@ -909,6 +917,26 @@ static void create_volatile_environment_registry_key(void)
     }
 
     set_reg_value( hkey, L"SESSIONNAME", L"Console" );
+    RegCloseKey( hkey );
+}
+
+static void create_sqmclient_registry_key(void)
+{
+    HKEY hkey;
+    LONG r;
+    UUID uuid;
+    RPC_WSTR uuid_str;
+
+    r = RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\SQMClient", 0, NULL, 0,
+                         KEY_ALL_ACCESS, NULL, &hkey, NULL );
+    if (r) return;
+
+    r = RegQueryValueExW( hkey, L"MachineId", NULL, NULL, NULL, NULL );
+    if (r == ERROR_FILE_NOT_FOUND && UuidCreate( &uuid ) == S_OK && UuidToStringW( &uuid, &uuid_str ) == RPC_S_OK)
+    {
+        set_reg_value( hkey, L"MachineId", uuid_str );
+        RpcStringFreeW( &uuid_str );
+    }
     RegCloseKey( hkey );
 }
 
@@ -1423,15 +1451,33 @@ static int ProcessWindowsFileProtection(void)
     return 1;
 }
 
+static BOOL create_native_process( const WCHAR *app, WCHAR *cmdline, BOOL inherit, DWORD flags,
+                                   const WCHAR *curdir, PROCESS_INFORMATION *info )
+{
+    struct _PROC_THREAD_ATTRIBUTE_LIST *list;
+    STARTUPINFOEXW si = { .StartupInfo.cb = sizeof(si) };
+    SIZE_T size = 1024;
+    BOOL ret;
+    USHORT machine = machines[0].Machine;
+
+    si.lpAttributeList = list = malloc( size );
+    InitializeProcThreadAttributeList( list, 1, 0, &size );
+    UpdateProcThreadAttribute( list, 0, PROC_THREAD_ATTRIBUTE_MACHINE_TYPE,
+                               &machine, sizeof(machine), NULL, NULL );
+    ret = CreateProcessW( app, cmdline, NULL, NULL, inherit,
+                          EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
+    free( list );
+    return ret;
+}
+
 static BOOL start_services_process(void)
 {
     static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
     PROCESS_INFORMATION pi;
-    STARTUPINFOW si = { sizeof(si) };
     HANDLE wait_handles[2];
 
-    if (!CreateProcessW(L"C:\\windows\\system32\\services.exe", NULL,
-                        NULL, NULL, TRUE, DETACHED_PROCESS, NULL, NULL, &si, &pi))
+    if (!create_native_process( L"C:\\windows\\system32\\services.exe", NULL,
+                                TRUE, DETACHED_PROCESS, L"C:\\windows\\system32", &pi))
     {
         WINE_ERR("Couldn't start services.exe: error %lu\n", GetLastError());
         return FALSE;
@@ -1518,13 +1564,11 @@ static HWND show_wait_window(void)
 static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD machine )
 {
     WCHAR app[MAX_PATH + ARRAY_SIZE(L"\\rundll32.exe" )];
-    STARTUPINFOW si;
+    STARTUPINFOW si = { .cb = sizeof(si) };
     PROCESS_INFORMATION pi;
     WCHAR *buffer;
     DWORD len;
-
-    memset( &si, 0, sizeof(si) );
-    si.cb = sizeof(si);
+    BOOL ret;
 
     if (!GetSystemWow64Directory2W( app, MAX_PATH, machine )) return 0;
     lstrcatW( app, L"\\rundll32.exe" );
@@ -1535,12 +1579,15 @@ static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD 
     if (!(buffer = malloc( len * sizeof(WCHAR) ))) return 0;
     swprintf( buffer, len, L"%s setupapi,InstallHinfSection %s 128 %s", app, install, inf_path );
 
-    if (CreateProcessW( app, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
-        CloseHandle( pi.hThread );
+    if (machine == IMAGE_FILE_MACHINE_TARGET_HOST)
+        ret = create_native_process( app, buffer, FALSE, 0, NULL, &pi );
     else
-        pi.hProcess = 0;
+        ret = CreateProcessW( app, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
 
     free( buffer );
+    if (!ret) return 0;
+
+    CloseHandle( pi.hThread );
     return pi.hProcess;
 }
 
@@ -1804,21 +1851,21 @@ int __cdecl main( int argc, char *argv[] )
     if( !SetCurrentDirectoryW( windowsdir ) )
         WINE_ERR("Cannot set the dir to %s (%ld)\n", wine_dbgstr_w(windowsdir), GetLastError() );
 
+    if (NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
+                                    machines, sizeof(machines), NULL )) machines[0].Machine = 0;
+
     if (IsWow64Process( GetCurrentProcess(), &is_wow64 ) && is_wow64)
     {
-        STARTUPINFOW si;
         PROCESS_INFORMATION pi;
         WCHAR filename[MAX_PATH];
         void *redir;
         DWORD exit_code;
 
-        memset( &si, 0, sizeof(si) );
-        si.cb = sizeof(si);
         GetSystemDirectoryW( filename, MAX_PATH );
         wcscat( filename, L"\\wineboot.exe" );
 
         Wow64DisableWow64FsRedirection( &redir );
-        if (CreateProcessW( filename, GetCommandLineW(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
+        if (create_native_process( filename, GetCommandLineW(), FALSE, 0, NULL, &pi ))
         {
             WINE_TRACE( "restarting %s\n", wine_dbgstr_w(filename) );
             WaitForSingleObject( pi.hProcess, INFINITE );
@@ -1875,9 +1922,6 @@ int __cdecl main( int argc, char *argv[] )
 
     if (shutdown) return 0;
 
-    if (NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
-                                    machines, sizeof(machines), NULL )) machines[0].Machine = 0;
-
     /* create event to be inherited by services.exe */
     InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF | OBJ_INHERIT, 0, NULL );
     NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, NotificationEvent, 0 );
@@ -1904,6 +1948,7 @@ int __cdecl main( int argc, char *argv[] )
     create_volatile_environment_registry_key();
     create_known_dlls();
     initialize_internet();
+    create_sqmclient_registry_key();
 
     ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunOnce", TRUE, TRUE );
 

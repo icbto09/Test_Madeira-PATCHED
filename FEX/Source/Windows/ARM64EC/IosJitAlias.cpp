@@ -469,151 +469,6 @@ extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* S
   return 0;
 }
 
-/* ================== madeira kuser-remap: KUSER_SHARED_DATA reads, inline =================
- * Windows keeps KUSER_SHARED_DATA at the constant 0x7ffe0000. iOS can't map anything below
- * 4 GB, so ntdll registers that page as a sub-floor window (ml952) and every guest read of
- * the constant faults and is emulated by the Mach handler, ~10 us each. PRAGMATA's
- * protection code reads it ~100,000 times a second (21.8 M in one 4-minute run), which kept
- * the game on a black loading screen.
- *
- * With env.MADEIRA_KUSER_REMAP = 1, ntdll hands the first fault at each JIT site to FEX
- * (ResetToConsistentState) instead of emulating it. FEX records the guest instruction
- * here and drops its compiled code; the faulting load itself is retried unchanged and
- * emulated by ntdll. The recompile gives that instruction's memory LOADS the same inline
- * window translation ml1057 uses for sub-floor images (no NZCV clobber).
- *
- * Learning is per 4 KB GUEST PAGE from the first fault (every load in that page gets the
- * translation). The first version learned single instructions in an 8192-slot table:
- * PRAGMATA's protection code has well over 6,000 distinct KUSER reads (6,144 learned in
- * 15 s, ~4,000 a second at the end), the table filled and everything after it stayed on
- * ntdll's emulation at ~100,000 traps a second (log 2026-11-22 14:42). Pages are far fewer
- * and the table is 8x bigger.
- * A fault from a page already learned is old compiled code (another thread, or a block
- * still running) or a load path the translation misses. It is tracked per RIP:
- *   1st/2nd time: drop the page's code again;  3rd+: give up (left to ntdll's emulation).
- * A repeat within 20 ms doesn't count as a strike, but no RIP gets more than 8 re-drops.
- * The tables only grow; learning runs under ThreadCreationMutex, lookups are lock-free.
- * Stores are never translated: KUSER_SHARED_DATA is read-only to Windows programs. */
-static constexpr uint64_t kIosKuserLow = 0x7ffe0000ull;
-static constexpr unsigned kIosKuserRipSlots = 16384;  // power of two
-static constexpr unsigned kIosKuserPageSlots = 65536; // power of two
-struct IosKuserRipEnt {
-  uint64_t Rip;       // 0 = empty; published last
-  uint64_t LastTick;
-  uint32_t Strikes;
-  uint32_t Drops;     // times its page's code was dropped again for it
-};
-static IosKuserRipEnt g_IosKuserRips[kIosKuserRipSlots];
-static uint64_t g_IosKuserPages[kIosKuserPageSlots];   // guest page number + 1, 0 = empty
-static uint32_t g_IosKuserRipCount, g_IosKuserPageCount;
-
-static inline uint64_t IosKuserHash(uint64_t V) {
-  V ^= V >> 33;
-  V *= 0xff51afd7ed558ccdull;
-  V ^= V >> 33;
-  return V;
-}
-
-// The KUSER_SHARED_DATA window as ntdll registered it (ml952): 1 and the window, or 0.
-extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real) {
-  const int count = g_SubfloorCount;
-  for (int i = 0; i < count; i++) {
-    if (g_Subfloor[i].LowBase == kIosKuserLow && g_Subfloor[i].Size && g_Subfloor[i].RealBase) {
-      *Low = g_Subfloor[i].LowBase;
-      *Real = g_Subfloor[i].RealBase;
-      *Size = g_Subfloor[i].Size;
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static IosKuserRipEnt* IosKuserFindRip(uint64_t Rip) {
-  const unsigned Mask = kIosKuserRipSlots - 1;
-  unsigned i = static_cast<unsigned>(IosKuserHash(Rip)) & Mask;
-  for (unsigned n = 0; n < kIosKuserRipSlots; n++, i = (i + 1) & Mask) {
-    const uint64_t R = __atomic_load_n(&g_IosKuserRips[i].Rip, __ATOMIC_ACQUIRE);
-    if (R == Rip) return &g_IosKuserRips[i];
-    if (!R) return nullptr;
-  }
-  return nullptr;
-}
-
-static bool IosKuserHasPage(uint64_t Page) {
-  const unsigned Mask = kIosKuserPageSlots - 1;
-  unsigned i = static_cast<unsigned>(IosKuserHash(Page)) & Mask;
-  for (unsigned n = 0; n < kIosKuserPageSlots; n++, i = (i + 1) & Mask) {
-    const uint64_t P = __atomic_load_n(&g_IosKuserPages[i], __ATOMIC_ACQUIRE);
-    if (P == Page + 1) return true;
-    if (!P) return false;
-  }
-  return false;
-}
-
-// JIT, per guest instruction: should this instruction's loads get the KUSER window?
-extern "C" int IosKuserWantsInsn(uint64_t Rip) {
-  if (!__atomic_load_n(&g_IosKuserPageCount, __ATOMIC_ACQUIRE)) {
-    return 0;   // the switch is off or nothing learned yet: one load per instruction
-  }
-  return IosKuserHasPage(Rip >> 12) ? 1 : 0;
-}
-
-/* Learn from a fault at guest Rip. Caller holds ThreadCreationMutex (single writer).
- * Returns 2 = its page learned, 3 = page already learned: drop its code again,
- * 0 = give up (leave the fault to ntdll). *Strikes gets the count. */
-extern "C" int IosKuserNote(uint64_t Rip, uint64_t Tick, uint32_t* Strikes) {
-  static constexpr uint64_t kRepeatTicks = 480000;   // 20 ms at the 24 MHz system counter
-  const uint64_t Page = Rip >> 12;
-  if (!IosKuserHasPage(Page)) {
-    if (g_IosKuserPageCount >= kIosKuserPageSlots * 3 / 4) {
-      *Strikes = 0;
-      return 0;
-    }
-    const unsigned Mask = kIosKuserPageSlots - 1;
-    unsigned i = static_cast<unsigned>(IosKuserHash(Page)) & Mask;
-    while (g_IosKuserPages[i]) i = (i + 1) & Mask;
-    __atomic_store_n(&g_IosKuserPages[i], Page + 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_IosKuserPageCount, g_IosKuserPageCount + 1, __ATOMIC_RELEASE);
-    *Strikes = 1;
-    return 2;
-  }
-  IosKuserRipEnt* E = IosKuserFindRip(Rip);
-  if (!E) {
-    if (g_IosKuserRipCount >= kIosKuserRipSlots * 3 / 4) {
-      *Strikes = 0;
-      return 0;
-    }
-    const unsigned Mask = kIosKuserRipSlots - 1;
-    unsigned i = static_cast<unsigned>(IosKuserHash(Rip)) & Mask;
-    while (g_IosKuserRips[i].Rip) i = (i + 1) & Mask;
-    g_IosKuserRips[i].LastTick = Tick;
-    g_IosKuserRips[i].Strikes = 2;
-    g_IosKuserRips[i].Drops = 1;
-    __atomic_store_n(&g_IosKuserRips[i].Rip, Rip, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_IosKuserRipCount, g_IosKuserRipCount + 1, __ATOMIC_RELEASE);
-    *Strikes = 2;
-    return 3;
-  }
-  // Drops bounds the re-drops too: a load path the translation misses would otherwise
-  // recompile, fault at a new host PC within 20 ms, recompile again... forever.
-  if (++E->Drops > 8) {
-    *Strikes = E->Strikes;
-    return 0;
-  }
-  if (Tick - E->LastTick >= kRepeatTicks) {
-    E->LastTick = Tick;
-    E->Strikes++;
-  }
-  *Strikes = E->Strikes;
-  return E->Strikes <= 3 ? 3 : 0;
-}
-
-extern "C" void IosKuserCounts(uint32_t* Rips, uint32_t* Pages) {
-  *Rips = __atomic_load_n(&g_IosKuserRipCount, __ATOMIC_ACQUIRE);
-  *Pages = __atomic_load_n(&g_IosKuserPageCount, __ATOMIC_ACQUIRE);
-}
-/* ======================== end madeira kuser-remap ======================== */
-
 // real -> low, or Addr unchanged. Used to map a tracker result back into the
 // guest's own address domain so the guest RIP is never moved high.
 uint64_t IosSubfloorToLow(uint64_t Addr) {
@@ -688,6 +543,26 @@ static bool IosSubfloorAdd(uint64_t LowBase, uint64_t RealBase, uint64_t Size) {
 }
 /* ======================= end ml951 SUB-FLOOR WINDOWS ===================== */
 
+/* fo4-alias-miss-probe: how many registrations the full table refused, the
+ * JIT base of the last one, and a snapshot for the MISS log line. Log-only. */
+uint64_t IosAliasRefused = 0;
+uint64_t IosAliasLastRefusedJit = 0;
+void IosJitAliasStats(int* Count, int* Live, uint64_t* Refused, uint64_t* LastRefusedJit, uint64_t* Low, uint64_t* High) {
+  const int n = g_EntryCount;
+  int live = 0;
+  for (int i = 0; i < n; i++) {
+    if (g_Entries[i].Size) {
+      live++;
+    }
+  }
+  *Count = n;
+  *Live = live;
+  *Refused = __atomic_load_n(&IosAliasRefused, __ATOMIC_RELAXED);
+  *LastRefusedJit = __atomic_load_n(&IosAliasLastRefusedJit, __ATOMIC_RELAXED);
+  *Low = __atomic_load_n(&g_JitLow, __ATOMIC_RELAXED);
+  *High = __atomic_load_n(&g_JitHigh, __ATOMIC_RELAXED);
+}
+
 void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
   /* ml951: a sub-floor window arrives through this same entry point, marked by
    * a below-4GB "PeBase" (no real PE base can be there on iOS). Route it to the
@@ -752,8 +627,10 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
      * unix call that corrupted the running syscall's frame (gta-2237:
      * RockstarService died at pc == its syscall frame). Count only
      * (tools/patch-fex-ios-alias-full-quiet.py). */
-    static uint64_t refused = 0;
-    __atomic_fetch_add(&refused, 1, __ATOMIC_RELAXED);
+    /* fo4-alias-miss-probe: counted in globals so the [iOS-xquery] MISS line
+     * (logged from the JIT thread, not from a unix call) can print them. */
+    __atomic_fetch_add(&IosAliasRefused, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&IosAliasLastRefusedJit, JitBase, __ATOMIC_RELAXED);
     return;
   }
   g_Entries[count].PeBase = PeBase;
@@ -789,6 +666,68 @@ uint64_t IosJitReverseTranslate(uint64_t Addr) {
     }
   }
   return Addr;
+}
+
+/* bo3-ring-at: the main exe's load address, PEB->ImageBaseAddress (PEB+0x10 on 64-bit; mingw's
+ * winternl.h names that field Reserved3[1], so read it by offset). Used by Core.cpp CompileBlock.
+ * The TEB comes from the TSD slot (TPIDRRO_EL0 + IosTebTsdOffset, as Module.cpp IOSLoadTEB does),
+ * NOT NtCurrentTeb(): that reads x18, which iOS clobbers, and this runs from CompileBlock.
+ * Returns 0 when the TEB or PEB is not known yet; the base is cached after the first success. */
+extern "C" uint32_t IosTebTsdOffset;
+uint64_t IosMainImageBase() {
+  static std::atomic<uint64_t> Cached {0};
+  uint64_t Base = Cached.load(std::memory_order_relaxed);
+  if (Base) {
+    return Base;
+  }
+  const uint32_t Off = IosTebTsdOffset;
+  if (!Off) {
+    return 0;
+  }
+  uintptr_t Tpidrro;
+  __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+  Tpidrro &= ~uintptr_t(7);
+  const auto* Teb = *reinterpret_cast<const _TEB* const*>(Tpidrro + Off);
+  if (!Teb) {
+    return 0;
+  }
+  const auto* Peb = reinterpret_cast<const uint8_t*>(Teb->ProcessEnvironmentBlock);
+  if (!Peb) {
+    return 0;
+  }
+  Base = *reinterpret_cast<const uint64_t*>(Peb + 0x10);
+  Cached.store(Base, std::memory_order_relaxed);
+  return Base;
+}
+
+/* bo3-null-call-trace: copy Len bytes of guest memory only if every byte lies in committed,
+ * readable, non-guard memory per NtQueryVirtualMemory; otherwise return false without touching
+ * it. Used by the [null-call] logger in Core.cpp CompileBlock. Log-only callers. */
+bool IosSafeReadGuest(uint64_t Addr, void* Out, uint64_t Len) {
+  if (!Out || Len == 0 || Addr + Len < Addr) {
+    return false;
+  }
+  uint64_t Cur = Addr;
+  const uint64_t End = Addr + Len;
+  while (Cur < End) {
+    MEMORY_BASIC_INFORMATION Info {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Cur), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
+      return false;
+    }
+    const DWORD Prot = Info.Protect & 0xff;
+    const bool Readable = Prot == PAGE_READONLY || Prot == PAGE_READWRITE || Prot == PAGE_WRITECOPY || Prot == PAGE_EXECUTE_READ ||
+                          Prot == PAGE_EXECUTE_READWRITE || Prot == PAGE_EXECUTE_WRITECOPY;
+    if (Info.State != MEM_COMMIT || !Readable || (Info.Protect & PAGE_GUARD)) {
+      return false;
+    }
+    const uint64_t RegionEnd = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize;
+    if (RegionEnd <= Cur) {
+      return false;
+    }
+    Cur = RegionEnd;
+  }
+  __builtin_memcpy(Out, reinterpret_cast<const void*>(Addr), Len);
+  return true;
 }
 
 }  // extern "C"

@@ -82,11 +82,10 @@ extern void set_native_thread_name( DWORD tid, const char *name );
 /* init routines */
 extern void loader_init( CONTEXT *context, void **entry );
 extern void version_init(void);
-extern void debug_init(void);
 extern void actctx_init(void);
 extern void locale_init(void);
 extern void init_user_process_params(void);
-extern void get_resource_lcids( LANGID *user, LANGID *user_neutral, LANGID *system );
+extern ULONG get_resource_lcids( LANGID *langs, ULONG size, LCID lcid );
 
 /* module handling */
 extern FARPROC RELAY_GetProcAddress( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
@@ -214,6 +213,11 @@ struct ios_xp_nt
     struct ios_xp_nt_qpc qpc[256];   /* per-thread slot (tid hash): gap between QPC reads */
 };
 extern struct ios_xp_nt ios_xp_nt;
+/* [ptr-origin-1] Overwatch pointer-origin probe (signal_arm64ec.c); log only, off with MADEIRA_EC_PTR_ORIGIN=0 */
+#ifdef __arm64ec__
+extern LONG ios_po_mode;   /* 0 not read, 1 off, 2 on */
+extern void ios_po_heap( ULONG op, void *heap, SIZE_T size, void *ptr, void *caller );
+#endif
 extern void ios_xp_nt_init(void);
 
 #endif

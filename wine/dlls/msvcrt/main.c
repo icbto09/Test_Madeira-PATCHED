@@ -84,6 +84,48 @@ static inline void msvcrt_free_tls_mem(void)
   HeapFree(GetProcessHeap(), 0, tls);
 }
 
+/* Madeira pvz-msvcrt: heap, TLS index, locks and the default locale are set up
+ * here instead of straight in DllMain, so msvcrt_get_thread_data() can run
+ * the same steps on first use when a DLL (advapi32 here) calls into msvcrt
+ * before msvcrt's DLL_PROCESS_ATTACH. Off switch: MADEIRA_MSVCRT_EARLY_LOCALE=0. */
+static volatile LONG msvcrt_core_state;  /* 0 not started, 1 running, 2 ready */
+
+static BOOL msvcrt_early_enabled(void)
+{
+    WCHAR buf[4];
+    DWORD len = GetEnvironmentVariableW( L"MADEIRA_MSVCRT_EARLY_LOCALE", buf, ARRAY_SIZE(buf) );
+    return !(len == 1 && buf[0] == '0');
+}
+
+BOOL msvcrt_init_core(BOOL early)
+{
+    if (msvcrt_core_state == 2) return TRUE;
+    if (early && !msvcrt_early_enabled()) return FALSE;
+    if (InterlockedCompareExchange( &msvcrt_core_state, 1, 0 ) != 0)
+        return msvcrt_core_state == 2;  /* 1: re-entered while starting, keep old behaviour */
+
+    if(!msvcrt_init_heap())
+        goto fail;
+    if(!msvcrt_init_tls()) {
+        msvcrt_destroy_heap();
+        goto fail;
+    }
+    msvcrt_init_mt_locks();
+    if(!msvcrt_init_locale()) {
+        msvcrt_free_locks();
+        msvcrt_free_tls_mem();
+        msvcrt_destroy_heap();
+        goto fail;
+    }
+    if (early)
+        ERR( "[msvcrt-early-locale] msvcrt used before DLL_PROCESS_ATTACH; heap, TLS, locks and locale created on first use\n" );
+    InterlockedExchange( &msvcrt_core_state, 2 );
+    return TRUE;
+fail:
+    InterlockedExchange( &msvcrt_core_state, 0 );
+    return FALSE;
+}
+
 /*********************************************************************
  *                  Init
  */
@@ -98,19 +140,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
   {
   case DLL_PROCESS_ATTACH:
     msvcrt_init_exception(hinstDLL);
-    if(!msvcrt_init_heap())
+    if(!msvcrt_init_core(FALSE))
         return FALSE;
-    if(!msvcrt_init_tls()) {
-      msvcrt_destroy_heap();
-      return FALSE;
-    }
-    msvcrt_init_mt_locks();
-    if(!msvcrt_init_locale()) {
-        msvcrt_free_locks();
-        msvcrt_free_tls_mem();
-        msvcrt_destroy_heap();
-        return FALSE;
-    }
 #if defined(__x86_64__) && _MSVCR_VER>=140
     if(!msvcrt_init_handler4()) {
         msvcrt_free_locks();
@@ -135,11 +166,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 #endif
     msvcrt_init_clock();
     TRACE("finished process init\n");
-    break;
-  case DLL_THREAD_ATTACH:
-#if defined(__x86_64__) && _MSVCR_VER>=140
-    msvcrt_attach_handler4();
-#endif
     break;
   case DLL_PROCESS_DETACH:
     _flushall();

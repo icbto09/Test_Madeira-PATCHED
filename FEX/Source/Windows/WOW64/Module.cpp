@@ -560,6 +560,17 @@ namespace Context {
 // in the JIT. `Context` itself is a HOST pointer (ntdll's CPU area, or a caller stack temporary);
 // WowTEB is the GUEST TEB32 address, see GetWowTEB(). Applies to both directions and therefore to
 // BTCpuGetContext/BTCpuSetContext, which only move whole WOW64_CONTEXTs through ntdll.
+// madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT)
+// The WoW64 context conversion carries all eight x87 exception flags (IE..ES), not only IE. Same switch as the JIT
+// (MADEIRA_FEX_X87_FLAGS = 0 turns it off), which logs it; read once per process.
+static bool MadeiraWowX87Flags() {
+  static const bool On = [] {
+    const char* E = getenv("MADEIRA_FEX_X87_FLAGS");
+    return !(E && E[0] == '0' && E[1] == '\0');
+  }();
+  return On;
+}
+
 void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_t WowTEB, WOW64_CONTEXT* Context) {
   auto& State = Thread->CurrentFrame->State;
 
@@ -607,6 +618,11 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_
   State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (XSave->StatusWord >> 10) & 1;
   State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (XSave->StatusWord >> 14) & 1;
   State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (XSave->StatusWord >> 11) & 0b111;
+  if (MadeiraWowX87Flags()) { // madeira [x87-flags]: DE..ES (FSW bits 1-7)
+    for (int i = 1; i < 8; i++) {
+      State.flags[FEXCore::X86State::X87FLAG_IE_LOC + i] = (XSave->StatusWord >> i) & 1;
+    }
+  }
   State.AbridgedFTW = XSave->TagWord;
 
   // If any of the debug register state changed then we need to invalidate.
@@ -701,6 +717,11 @@ void StoreWowContextFromState(FEXCore::Core::InternalThreadState* Thread, WOW64_
   XSave->StatusWord = (State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
                       (State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
                       (State.flags[FEXCore::X86State::X87FLAG_C3_LOC] << 14) | State.flags[FEXCore::X86State::X87FLAG_IE_LOC];
+  if (MadeiraWowX87Flags()) { // madeira [x87-flags]: DE..ES (FSW bits 1-7)
+    for (int i = 1; i < 8; i++) {
+      XSave->StatusWord |= (State.flags[FEXCore::X86State::X87FLAG_IE_LOC + i] & 1) << i;
+    }
+  }
   XSave->TagWord = State.AbridgedFTW;
 
   Context->FloatSave.ControlWord = XSave->ControlWord;
@@ -2067,6 +2088,11 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     }
   }
 
+  if (Context->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
+  }
+
   if (!Thread || !IsAddressInJit(Context->Pc)) {
     return false;
   }
@@ -2253,14 +2279,6 @@ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr) {
   return Addr;
 }
 extern "C" int IosSubfloorWindowForCode(uint64_t, uint64_t*, uint64_t*, uint64_t*) {
-  return 0;
-}
-/* madeira kuser-remap: the 32-bit view keeps KUSER_SHARED_DATA mapped at 0x7ffe0000 inside its
- * own window, so there is nothing to learn or translate here. */
-extern "C" int IosKuserWindow(uint64_t*, uint64_t*, uint64_t*) {
-  return 0;
-}
-extern "C" int IosKuserWantsInsn(uint64_t) {
   return 0;
 }
 #endif

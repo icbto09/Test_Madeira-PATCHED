@@ -1,0 +1,174 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 7a4b728..1a3af76 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -6,6 +6,7 @@ desc: Implements the ARM64EC BT module API using FEXCore
+ $end_info$
+ */
+ 
++#include <bit> // madeira [getctx-guest]: std::popcount
+ #include "../Common/ArenaManager.h"
+ #include <FEXCore/fextl/fmt.h>
+ #include <FEXCore/Core/X86Enums.h>
+@@ -2827,6 +2828,149 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
+  * every branch is reported, so silence never has to be interpreted.
+  */
+ #ifdef FEX_IOS_HOST
++/* madeira [getctx-guest] (env MADEIRA_GETCTX_GUEST = 0 turns it off; on by default). rev=getctx-guest-2. Ours.
++ *
++ * NtGetContextThread on ANOTHER thread of this process whose native pc is in FEX's translated code. ntdll's
++ * ARM64EC wrapper converts the native ARM64 context with the ARM64EC register mapping, which is right for EC code
++ * but not for the JIT: there Pc is a code-buffer address, the guest RSP lives in x23 (SRA mapping) and the flags are
++ * FEX's compacted ones (CF inverted in NZCV, PF/AF deferred in x9/x24). This rebuilds the guest view of that
++ * snapshot. It is READ ONLY: nothing of the target is written (review-2 must-fix 1: on iOS a "suspended" thread can
++ * still be running unless MADEIRA_REAL_SUSPEND=1, so its State must not be touched).
++ * - Every read of the target (its TEB, CPU area, CpuStateFrame, block header) is a checked NtReadVirtualMemory, so a
++ *   target that exits meanwhile gives "no answer" instead of a fault.
++ * - RIP: the block header is read ONCE and ios_fex_rip_from_hostpc walks that block's RIP table. It returns 0 when
++ *   the host pc is not inside that block (the target moved on, is in a block's first two instructions, or in a
++ *   linked block): then the caller keeps its old answer (review-2 must-fix 2).
++ * - Flags: NZCV from the snapshot's Cpsr (CF un-inverted), PF/AF computed locally from the snapshot's x9/x24 the way
++ *   ReconstructCompactedEFLAGS does, TF/DF read from State.flags.
++ * - GPRs through the SRA table (RSP is x23), the non-SRA ones from State.gregs; XMM0-15 are already at v0-v15.
++ *   x87/MMX from State.mm, as StoreStateToPackedECContext packs them (the same approximation as the exception path:
++ *   the x87 stack pass can leave State.mm stale in the middle of a block).
++ * Teb: the target's TEB (ntdll passes the snapshot's x18; checked here against Tib.Self at 0x30 and
++ * ClientId.UniqueProcess at 0x40, and refused when it is the caller's). Context: a COPY the caller may discard.
++ * Returns 1 when Context was rewritten, 0 otherwise. Op must be 1 (op 0, the review-2 SHOULD probe, is gone). */
++extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC); // Core.cpp (ml549)
++
++extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*); // madeira [getctx-guest]: the earlier declaration is inside namespace Exception
++template<typename T>
++static bool IosGcRead(uint64_t Addr, T* Out, size_t Len = sizeof(T)) {
++  SIZE_T Got = 0;
++  return Addr && NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Addr), Out, Len, &Got) == 0 && Got == Len;
++}
++
++extern "C" uint32_t BTCpu64IosGuestContext(void* Teb, ARM64_NT_CONTEXT* Context, uint32_t Op) {
++  static const bool Enabled = [] {
++    const char* E = getenv("MADEIRA_GETCTX_GUEST");
++    return !(E && E[0] == '0' && E[1] == '\0');
++  }();
++  if (!Enabled || Op != 1 || !Teb || !Context || !CTX) {
++    return 0;
++  }
++  using FEXCore::Core::CpuStateFrame;
++  const uint64_t TebAddr = reinterpret_cast<uint64_t>(Teb);
++  uint64_t Area = 0, FrameAddr = 0, BlockBegin = 0, TebSelf = 0, TebPid = 0;
++  // Teb comes from the snapshot's x18: accept it only if it is a TEB of this process (Tib.Self, ClientId).
++  if (TebAddr == reinterpret_cast<uint64_t>(NtCurrentTeb()) || !IosGcRead(TebAddr + 0x30, &TebSelf) || TebSelf != TebAddr ||
++      !IosGcRead(TebAddr + 0x40, &TebPid) || TebPid != *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(NtCurrentTeb()) + 0x40)) {
++    return 0;
++  }
++  if (!IosGcRead(TebAddr + ThreadCPUArea::TEBCPUAreaOffset, &Area) ||
++      !IosGcRead(Area + offsetof(CHPE_V2_CPU_AREA_INFO, EmulatorData), &FrameAddr) || !FrameAddr) { // EmulatorData[0] = StateFrame
++    return 0;
++  }
++  const uint64_t StateAddr = FrameAddr + offsetof(CpuStateFrame, State);
++  uint64_t Gregs[16];
++  uint64_t Mm[8][2];
++  uint8_t Flags[FEXCore::Core::CPUState::NUM_EFLAG_BITS];
++  if (!IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader), &BlockBegin) || !BlockBegin ||
++      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, gregs), &Gregs) ||
++      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, mm), &Mm) ||
++      !IosGcRead(StateAddr + offsetof(FEXCore::Core::CPUState, flags), &Flags)) {
++    return 0;
++  }
++  // The block must be readable and contain the host pc before ios_fex_rip_from_hostpc walks it.
++  uint32_t OffsetToTail = 0;
++  uint64_t BlockSize = 0;
++  if (!IosGcRead(BlockBegin, &OffsetToTail) || !IosGcRead(BlockBegin + OffsetToTail, &BlockSize) ||
++      Context->Pc < BlockBegin || Context->Pc >= BlockBegin + BlockSize) {
++    return 0;
++  }
++  {
++    uint8_t Probe[1];
++    if (!IosGcRead(BlockBegin + BlockSize - 1, &Probe)) {
++      return 0;
++    }
++  }
++  const uint64_t Rip = ios_fex_rip_from_hostpc(BlockBegin, Context->Pc);
++  if (!Rip) {
++    return 0;
++  }
++
++  // Flags of the snapshot, computed here (no write to the target).
++  const uint32_t HostCpsr = Context->Cpsr;
++  const uint32_t PFByte = static_cast<uint32_t>(Context->X9) & 0xff; // REG_PF under ARM64EC
++  const uint32_t PF = std::popcount(PFByte ^ 1) & 1;
++  const uint32_t AF = ((static_cast<uint32_t>(Context->X24) ^ PFByte) >> 4) & 1; // REG_AF under ARM64EC
++  const uint32_t TF = Flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] & 1;
++  const uint32_t DF = (Flags[FEXCore::X86State::RFLAG_DF_RAW_LOC] & 0x80) ? 1 : 0;
++
++  const auto& Config = SignalDelegator->GetConfig();
++  uint64_t G[16];
++  for (size_t i = 0; i < 16; i++) {
++    G[i] = Gregs[i];
++  }
++  for (size_t i = 0; i < Config.SRAGPRCount && i < 16; i++) {
++    G[i] = Context->X[Config.SRAGPRMapping[i]];
++  }
++  Context->X8 = G[FEXCore::X86State::REG_RAX];
++  Context->X0 = G[FEXCore::X86State::REG_RCX];
++  Context->X1 = G[FEXCore::X86State::REG_RDX];
++  Context->X27 = G[FEXCore::X86State::REG_RBX];
++  Context->Sp = G[FEXCore::X86State::REG_RSP];
++  Context->Fp = G[FEXCore::X86State::REG_RBP];
++  Context->X25 = G[FEXCore::X86State::REG_RSI];
++  Context->X26 = G[FEXCore::X86State::REG_RDI];
++  Context->X2 = G[FEXCore::X86State::REG_R8];
++  Context->X3 = G[FEXCore::X86State::REG_R9];
++  Context->X4 = G[FEXCore::X86State::REG_R10];
++  Context->X5 = G[FEXCore::X86State::REG_R11];
++  Context->X19 = G[FEXCore::X86State::REG_R12];
++  Context->X20 = G[FEXCore::X86State::REG_R13];
++  Context->X21 = G[FEXCore::X86State::REG_R14];
++  Context->X22 = G[FEXCore::X86State::REG_R15];
++  Context->Pc = Rip;
++
++  Context->Lr = Mm[0][0];
++  Context->X6 = Mm[1][0];
++  Context->X7 = Mm[2][0];
++  Context->X9 = Mm[3][0];
++  Context->X16 = (Mm[3][1] & 0xffff) << 48 | (Mm[2][1] & 0xffff) << 32 | (Mm[1][1] & 0xffff) << 16 | (Mm[0][1] & 0xffff);
++  Context->X10 = Mm[4][0];
++  Context->X11 = Mm[5][0];
++  Context->X12 = Mm[6][0];
++  Context->X15 = Mm[7][0];
++  Context->X17 = (Mm[7][1] & 0xffff) << 48 | (Mm[6][1] & 0xffff) << 32 | (Mm[5][1] & 0xffff) << 16 | (Mm[4][1] & 0xffff);
++  Context->X13 = 0;
++  Context->X14 = 0;
++  Context->X18 = 0;
++  Context->X23 = 0;
++  Context->X24 = 0;
++  Context->X28 = 0;
++
++  // ARM64EC Cpsr convention (what ntdll's cpsr_to_eflags reads): N=SF, Z=ZF, C=CF (not inverted), V=OF.
++  uint32_t Cpsr = (HostCpsr & 0xd0000000) | ((~HostCpsr) & (1U << 29));
++  Cpsr |= TF ? (1U << 21) : 0;
++  if (Exception::IosPfAfKeep) { // same RES0 bits as StoreStateToPackedECContext ([pfaf-keep])
++    Cpsr |= PF ? (1U << 26) : 0;
++    Cpsr |= AF ? (1U << 27) : 0;
++  }
++  if (Exception::IosDfCtx) { // [df-ctx]
++    Cpsr |= DF ? (1U << 16) : 0;
++  }
++  Context->Cpsr = Cpsr;
++  return 1;
++}
++
+ /* madeira [dr-pass] (env MADEIRA_EC_DEBUG_REGS = 0 turns it off; ntdll reads the same switch and
+  * then never calls this). rev=dr-pass-1.
+  *
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+index 9b46ff7..89358c8 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+@@ -8,6 +8,7 @@ EXPORTS
+   BTCpu64IosAddAliasMapping
+   BTCpu64IosCrashMailerData
+   BTCpu64IosDebugRegs
++  BTCpu64IosGuestContext
+   BTCpu64IosRipFromHostPC
+   BTCpu64IosSetMonoBridge
+   BTCpu64IosReleaseThreadHolds

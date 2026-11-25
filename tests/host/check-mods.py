@@ -96,6 +96,28 @@ check('dlopen("/usr/lib/libarchive.2.dylib"' in archive and 'throw ModError.rar(
 check('confirmationDialog(Text("Remove \\(removingName)?")' in view, 'Remove asks first')
 check(not re.search(r'^import (SwiftUI|UIKit)', core, re.M), 'ModsCore.swift is Foundation only')
 
+# 4b. The one-tap BepInEx card (Nov 17).
+catalog = (app / 'ConfigCatalog.generated.swift').read_text(encoding='utf-8')
+check('MadeiraConfig.flag("MADEIRA_BEPINEX_BUTTON")' in view and 'env.MADEIRA_BEPINEX_BUTTON' in catalog,
+      'the BepInEx card has its off switch, env.MADEIRA_BEPINEX_BUTTON = 0, and it is in the config catalog')
+check(view.index('bepinexCard') < view.index('Text("Installed")') and view.index('if showsBepInExCard {') < view.index('listed.isEmpty'),
+      'the card sits at the top of the Mods page, above the installed mods')
+check('Text("Add BepInEx")' in view and '.buttonStyle(.borderedProminent).tint(.blue)' in view
+      and 'removing = loader' in view and '.buttonStyle(.bordered).tint(.gray)' in view,
+      'blue Add BepInEx; grey Remove that asks first (the Remove dialog)')
+check('mods.filter { !BepInExLoader.isLoader($0) }' in view, 'the loader is not repeated in the mods list while the card shows')
+check('static let sha256 = "' in core and 'releases/download/v' in core and re.search(r'static let sha256 = "[0-9a-f]{64}"', core),
+      'one pinned official release with its sha256')
+check(archive.index('try BepInExLoader.verify(zip)') < archive.index('try prepare(zip'), 'the download is checked (size and sha256) before anything is unpacked')
+check('try prepare(zip' in archive and 'try install(prepared, choices: nil, game: game, store: store' in archive.replace('_ = ', ''),
+      'it installs through the Mods install path (backups, manifest, byte-exact Remove)')
+check('.bepinexDownload' in view and '.bepinexHash' in view and 'case bepinexHash' in core, 'plain errors for offline and for a wrong file')
+
+check('final class BepInExBusy' in view and 'busy.steps[game.id]' in view and 'bepinexStep != nil' in view,
+      'the card install goes on when the page is left, and nothing else on the page runs beside it')
+check('BepInExLoader.loader(in: ModStore(folder: store, game: game).mods) != nil { return }' in archive, 'a second BepInEx is never installed')
+check('looksLikeMonoUnity' in view and 'gameassembly.dll' in view, "a game that does not look like a 64-bit Mono Unity game gets a plain warning")
+
 # 5. Every new text has six languages.
 pattern = re.compile(r'\b(?:Text|Button|Label|Toggle|Section|navigationTitle|confirmationDialog|L)\(\s*"((?:[^"\\]|\\.)*)"')
 keys = {re.sub(r'\\\([^()"]*\)', '%@', m.group(1)) for m in pattern.finditer(view)}

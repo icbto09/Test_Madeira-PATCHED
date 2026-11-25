@@ -1,0 +1,82 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 8dd1bc5..2b00d83 100755
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -928,6 +928,67 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+ }
+ 
++#ifdef FEX_IOS_HOST
++/* madeira [assert-dump] (Overwatch 2, 0.2.84 log 61524411): LOG ONLY. Overwatch_loader.dll raises
++ * STATUS_ASSERTION_FAILURE (int 0x2c, C0000420 at loader+0x441960) on its int3-stepping thread when one of its
++ * checks fails; nothing in the log says which. On each such raise (first 8), log the x86 registers, flags, the
++ * code around RIP and the top of the guest stack. Memory is read with NtReadVirtualMemory, so a locked page
++ * reads as "??" instead of faulting inside the exception path. MADEIRA_EC_ASSERT_DUMP=0 turns it off. */
++extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
++
++static void IosAssertHex(const char* What, uint64_t Base, size_t Len) {
++  uint8_t Buf[64] {};
++  SIZE_T Got = 0;
++  if (Len > sizeof(Buf)) {
++    Len = sizeof(Buf);
++  }
++  const NTSTATUS Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Base), Buf, Len, &Got);
++  char Hex[sizeof(Buf) * 3 + 1] {};
++  size_t o = 0;
++  for (size_t i = 0; i < Len; i++) {
++    static const char Digits[] = "0123456789abcdef";
++    if (i < Got) {
++      Hex[o++] = Digits[Buf[i] >> 4];
++      Hex[o++] = Digits[Buf[i] & 15];
++    } else {
++      Hex[o++] = '?';
++      Hex[o++] = '?';
++    }
++    Hex[o++] = (i % 8 == 7) ? '|' : ' ';
++  }
++  Hex[o] = 0;
++  LogMan::Msg::EFmt("[assert-dump]   {} {:#x} (status {:#x}): {}", What, Base, static_cast<uint32_t>(Status), Hex);
++}
++
++static void IosAssertDump(FEXCore::Core::InternalThreadState* Thread, uint64_t Rip, uint32_t EFlags) {
++  static std::atomic<int8_t> On {-1};
++  int8_t V = On.load(std::memory_order_relaxed);
++  if (V < 0) {
++    const char* E = getenv("MADEIRA_EC_ASSERT_DUMP");
++    V = (E && E[0] == '0') ? 0 : 1;
++    On.store(V, std::memory_order_relaxed);
++  }
++  static std::atomic<uint32_t> Count {0};
++  if (!V || Count.fetch_add(1, std::memory_order_relaxed) >= 8) {
++    return;
++  }
++  const auto& R = Thread->CurrentFrame->State.gregs;
++  using namespace FEXCore::X86State;
++  LogMan::Msg::EFmt("[assert-dump] rev=assert-dump-1 STATUS_ASSERTION_FAILURE rip={:#x} eflags={:#x} tid={:x}", Rip, EFlags,
++                    GetCurrentThreadId());
++  LogMan::Msg::EFmt("[assert-dump]   rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}", R[REG_RAX],
++                    R[REG_RBX], R[REG_RCX], R[REG_RDX], R[REG_RSI], R[REG_RDI], R[REG_RBP], R[REG_RSP]);
++  LogMan::Msg::EFmt("[assert-dump]   r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}", R[REG_R8],
++                    R[REG_R9], R[REG_R10], R[REG_R11], R[REG_R12], R[REG_R13], R[REG_R14], R[REG_R15]);
++  LogMan::Msg::EFmt("[assert-dump]   dr0={:#x} dr1={:#x} dr2={:#x} dr3={:#x} dr6={:#x} dr7={:#x}", Thread->CurrentFrame->State.Dr[0],
++                    Thread->CurrentFrame->State.Dr[1], Thread->CurrentFrame->State.Dr[2], Thread->CurrentFrame->State.Dr[3],
++                    Thread->CurrentFrame->State.Dr6, Thread->CurrentFrame->State.Dr7);
++  IosAssertHex("code rip-32", Rip - 32, 64);
++  IosAssertHex("stack rsp", R[REG_RSP], 64);
++  IosAssertHex("stack rsp+64", R[REG_RSP] + 64, 64);
++}
++#endif // FEX_IOS_HOST (assert-dump)
++
+ #ifdef FEX_IOS_HOST
+ // MADEIRA (local fork): keep the dispatch Madeira has run on device. The guest context and record
+ // are laid out below the guest stack and the handler returns into KiUserExceptionDispatcher.
+@@ -964,6 +1025,9 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
+ 
+   BOOL FirstChance = TRUE; // KiUserExceptionDispatcher takes no second-chance input
+   Args->Rec = FEX::Windows::HandleGuestException(Fault, Rec, Args->Context.Pc, Args->Context.X8, Args->Context.X0, FirstChance);
++  if (Args->Rec.ExceptionCode == STATUS_ASSERTION_FAILURE) {
++    IosAssertDump(Thread, Args->Context.Pc, EFlags); // madeira [assert-dump]
++  }
+   if (Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     Args->Context.Cpsr &= ~(1 << 21); // PSTATE.SS
+   } else if (Args->Rec.ExceptionCode == EXCEPTION_BREAKPOINT) {

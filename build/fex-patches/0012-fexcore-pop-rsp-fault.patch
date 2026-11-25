@@ -1,0 +1,68 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 6e70300..df6e2fb 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -403,6 +403,32 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
+ }
+ 
+ void OpDispatchBuilder::POPOp(OpcodeArgs) {
++  // madeira [pop-rsp-fault] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0003 (MIT)
++  // x86 leaves RSP unchanged when the store of POP r/m faults. Pop() commits the new RSP first (through _Pop's RMW
++  // stack pointer operand, which is the guest RSP register itself), so a handler that skips the faulting
++  // instruction resumed with RSP off by the operand size. MADEIRA_FEX_POP_RSP_FAULT=0: the old single path.
++  if (MadeiraPopRspFault()) {
++    const auto& Dest = Op->Dest;
++    // The Relocation operand types share their Data layout with the plain ones.
++    const bool DestIndirect = Dest.IsGPRIndirect() || Dest.IsGPRIndirectRelocation();
++    const bool DestSIB = Dest.IsSIB() || Dest.IsSIBRelocation();
++    const bool DestUsesRSP = (DestIndirect && Dest.Data.GPRIndirect.GPR == X86State::REG_RSP) ||
++                             (DestSIB && (Dest.Data.SIB.Base == X86State::REG_RSP || Dest.Data.SIB.Index == X86State::REG_RSP));
++
++    if (!Dest.IsGPR() && !DestUsesRSP) {
++      // Memory destination: if the store faults the instruction must not have completed, so only commit the new
++      // RSP once the store is done (pop (%rax) with a bad rax must preserve RSP). Not using _Pop: the new RSP is
++      // computed after the store so the register allocator can't write it to RSP early.
++      const auto Size = OpSizeFromSrc(Op);
++      Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
++      Ref Value = _LoadMemGPRAutoTSO(Size, OldSP, Size);
++      StoreResultGPR(Op, Value);
++      StoreGPRRegister(X86State::REG_RSP, Add(GetGPROpSize(), OldSP, IR::OpSizeToSize(Size)));
++      return;
++    }
++    // Register destination can't fault; an RSP-relative destination address is computed with the incremented
++    // RSP, so update it first (below).
++  }
+   Ref Value = Pop(OpSizeFromSrc(Op));
+   StoreResultGPR(Op, Value);
+ }
+@@ -4869,6 +4895,7 @@ OpDispatchBuilder::OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx, FEXCore
+   : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9 != 0}
+   , CTX {ctx}
+   , Thread {Thread} {
++  (void)MadeiraPopRspFault(); // madeira [pop-rsp-fault]: read the switch (and log it) at thread init, not at the first POP r/m
+   if (CTX->HostFeatures.SupportsAVX() && CTX->HostFeatures.SupportsSVE256()) {
+     SaveAVXStateFunc = &OpDispatchBuilder::SaveAVXState;
+     RestoreAVXStateFunc = &OpDispatchBuilder::RestoreAVXState;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 193d414..f55a7e1 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -2836,6 +2836,18 @@ private:
+     return _StoreMemPairAutoTSO(RegClass::FPR, Size, A, Value1, Value2, Align);
+   }
+ 
++  // madeira [pop-rsp-fault] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0003 (MIT)
++  // env MADEIRA_FEX_POP_RSP_FAULT = 0 turns it off; on by default. Affects code generation: read once per process.
++  static bool MadeiraPopRspFault() {
++    static const bool On = [] {
++      const char* E = getenv("MADEIRA_FEX_POP_RSP_FAULT");
++      const bool V = !(E && E[0] == '0' && E[1] == '\0');
++      LogMan::Msg::EFmt("[pop-rsp-fault] rev=pop-rsp-fault-1 {}", V ? "on" : "off (MADEIRA_FEX_POP_RSP_FAULT=0)");
++      return V;
++    }();
++    return On;
++  }
++
+   Ref Pop(IR::OpSize Size, Ref SP_RMW) {
+     Ref Value = _AllocateGPR(false);
+     _Pop(Size, SP_RMW, Value);

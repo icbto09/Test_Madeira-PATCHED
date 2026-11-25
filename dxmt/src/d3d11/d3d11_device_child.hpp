@@ -1,5 +1,7 @@
 #pragma once
 
+#include "util_mullion_fix.hpp"
+
 #include "Metal.hpp"
 #include "d3d11_device.hpp"
 #include "com/com_object.hpp"
@@ -109,8 +111,22 @@ public:
   }
 
   ULONG STDMETHODCALLTYPE Release() {
-    D3D11_ASSERT(m_refCount > 0u && "try to release a 0 reference object");
-    uint32_t refCount = --this->m_refCount;
+    // a release the application has no reference for changes nothing: the count stays 0, so a later AddRef holds the
+    // object again (Wine's test_sample_attached_rtv releases its bound sampler twice, which Windows lets pass)
+    // Ported from Mullion af5ac59 (LGPL-2.1+). Off: MADEIRA_DXMT_MULLION_RELEASE_ZERO=0 (old: plain decrement).
+    static const bool release_zero_fix = mullionFix("RELEASE_ZERO");
+    uint32_t refCount;
+    if (release_zero_fix) {
+      refCount = this->m_refCount.load();
+      do {
+        if (unlikely(!refCount))
+          return 0;
+      } while (!this->m_refCount.compare_exchange_weak(refCount, refCount - 1));
+      --refCount;
+    } else {
+      D3D11_ASSERT(m_refCount > 0u && "try to release a 0 reference object");
+      refCount = --this->m_refCount;
+    }
     if (unlikely(!refCount)) {
       this->ReleasePrivate();
       this->m_parent->Release();

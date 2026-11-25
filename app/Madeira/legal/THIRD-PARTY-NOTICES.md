@@ -207,3 +207,55 @@ into a signed app.
 `LiveContainer/` and `research/LiveContainer/` are AGPL-3.0 reference copies
 used for local research. Both are gitignored, untracked, and no part of them is
 linked into or shipped with the app. They form no part of the combined work.
+
+## Code from MetalSharp (AGPL-3.0)
+
+Nightly 0.2.83 and later contain code ported from **MetalSharp** (patches `fex/0025`, `fex/0026` and `fex/0031`,
+and MetalSharp-Wine), written by **BOR1NG (Avery Felts, <https://github.com/aaf2tbz>)** and licensed **AGPL-3.0**.
+Madeira thanks BOR1NG for this work. It is used in these fixes:
+
+| Fix | Where | What |
+|---|---|---|
+| Overwatch 2 "section views" (`env.MADEIRA_EC_SECTION_VIEWS = 0` off) | `build/fex-patches/0005-windows-ios-section-views.patch` (FEX `Core.cpp`, `Module.cpp`, `InvalidationTracker.cpp/.h`) and `wine/dlls/ntdll/signal_arm64ec.c` | Several views of one file mapping are tracked so a write through one view invalidates translated code in the others; the changed-code block is placed right after the current block (MetalSharp `fex/0025`, `fex/0026`). |
+| Overwatch 2 debug registers (`env.MADEIRA_EC_DEBUG_REGS = 0` off) | `wine/dlls/ntdll/signal_arm64ec.c`, FEX `Module.cpp` | The x86 debug registers pass through a thread's context (the idea is cited from MetalSharp-Wine `4614051`). |
+| Overwatch 2 XSAVE state revert (`env.MADEIRA_EC_XSTATE_REVERT = 0` off) | `wine/dlls/ntdll/signal_arm64ec.c`, `wine/dlls/ntdll/unix/system.c` | Credit in the source comments: BOR1NG, MetalSharp-Wine. |
+| Intel flag behaviour (`env.MADEIRA_FEX_INTEL_FLAGS = 1` on, off by default) | `build/fex-patches/0010-fexcore-intel-flags.patch` (FEXCore `ALUOps.cpp`, `OpcodeDispatcher.cpp/.h`, `OpcodeDispatcher/Flags.cpp`) | Where x86 leaves a flag undefined, the emulator gives what Intel hardware gives (MetalSharp `fex/0031`). |
+| Overwatch 2 clock and CPU speed (`env.MADEIRA_EC_TSC_MHZ = 0` off; MetalSharp-Wine patch 0134, LGPL) | `wine/dlls/ntdll/unix/system.c`, `wine/programs/wineboot/wineboot.c` | The CPU speed the system reports follows the timer's own frequency. Credit: BOR1NG (Avery Felts). |
+| Overwatch 2 x64 context fields (`env.MADEIRA_EC_CTX_X64_FIELDS = 0` off; MetalSharp-Wine d100ac4215, LGPL) | `wine/dlls/ntdll/signal_arm64ec.c` | The x64 fields of a thread context are carried through. Credit: BOR1NG (Avery Felts). |
+
+As that code is AGPL-3.0, the complete corresponding source of every build that contains it is published with that
+build's release at <https://github.com/camhoc/Madeira> (AGPL-3.0 section 13). Madeira's own code remains
+GPL-3.0-or-later (GPL-3.0 section 13 and AGPL-3.0 section 13 let the two be combined).
+
+## Code from MetalSharp-Wine (LGPL-2.1) and MetalSharp's FEX patches (MIT)
+
+Nightlies 0.2.91 and 0.2.92 contain fourteen Overwatch 2 items (nine in 0.2.91, four more in 0.2.92, one opt-in in 0.2.93) ported from MetalSharp-Wine (<https://github.com/metalsharp/MetalSharp-Wine>)
+and MetalSharp's FEX patches, written by **BOR1NG (Avery Felts, <https://github.com/aaf2tbz>)**. The Wine changes are
+**LGPL-2.1**, the FEX changes **MIT**. Madeira thanks BOR1NG for all of them.
+
+| Fix (off switch) | MetalSharp source | Where |
+|---|---|---|
+| bsd-sockets (`env.MADEIRA_BSD_SOCKETS = 0`) | MetalSharp-Wine 0155 (LGPL-2.1) | `wine/dlls/ntdll/unix/socket.c`, `virtual.c`, `unix_private.h`, `wine/dlls/ws2_32/unixlib.c`, `wine/server/fd.c`, `file.h`, `sock.c`, `build/wineserver/fd_ios.c`, `build/ntdll-unix/virtual_ios.c` |
+| isec-bound (`env.MADEIRA_EC_ISEC_BOUND = 0`) | MetalSharp-Wine 554d343543 (LGPL-2.1) | `wine/dlls/ntdll/signal_arm64ec.c` |
+| ro-view-cow (opt-in `env.MADEIRA_EC_RO_VIEW_COW = 1`) | MetalSharp-Wine (LGPL-2.1) | `build/ntdll-unix/virtual_ios.c` |
+| selector-answer (`env.MADEIRA_EC_SELECTOR_ANSWER = 0`) | MetalSharp-Wine (LGPL-2.1) | `build/ntdll-unix/signal_arm64_ios.c` |
+| partial-copy (`env.MADEIRA_SRV_PARTIAL_COPY = 0`) | MetalSharp-Wine 9df1933a57 (LGPL-2.1) | `build/wineserver/mach_ios.c` |
+| pop-rsp-fault (`env.MADEIRA_FEX_POP_RSP_FAULT = 0`) | FEX patch 0003 (MIT) | `build/fex-patches/0012-fexcore-pop-rsp-fault.patch` |
+| x87-flags (`env.MADEIRA_FEX_X87_FLAGS = 0`) | FEX patch 0006 (MIT) | `build/fex-patches/0013-fexcore-x87-flags.patch` |
+| x87-ctx (`env.MADEIRA_EC_X87_CTX = 0`) | FEX patch 0033 (MIT) | `build/fex-patches/0014-windows-ios-x87-ctx.patch` |
+| df-ctx (`env.MADEIRA_EC_DF_CTX = 0`) | FEX patch 0004 (MIT) | `build/fex-patches/0015-windows-ios-df-ctx.patch`, `wine/dlls/ntdll/signal_arm64ec.c`, `unwind.h` |
+| kuser-rebase (`env.MADEIRA_FEX_KUSER_REBASE = 0`) | FEX patch 0001 (MIT) | `build/fex-patches/0017-fexcore-kuser-rebase.patch` |
+| cpu-identity (`env.MADEIRA_CPU_IDENTITY = 0`) | FEX patch 0028 (MIT) and a Wine idea from 198a71f8fa (LGPL-2.1) | `build/fex-patches/0018-fexcore-cpu-identity.patch`, `build/ntdll-unix/server_ios.c`, `hw_registry_ios.h` |
+| code-buffer-big (opt-in `env.MADEIRA_FEX_CODE_BUFFER_MB = 256`) | idea from FEX patch 0045 (MIT) | `build/fex-patches/0019-fexcore-code-buffer-big.patch`, `build/ntdll-unix/virtual_ios.c` |
+| hard-error-log (`env.MADEIRA_HARD_ERROR_LOG = 0`) | MetalSharp-Wine 0084 (LGPL-2.1) | `wine/dlls/ntdll/unix/system.c` |
+| globalroot (`env.MADEIRA_GLOBALROOT = 0`) | MetalSharp-Wine 0085 (LGPL-2.1) | `wine/dlls/ntdll/unix/file.c` |
+
+## Code from Mullion (LGPL-2.1-or-later)
+
+Nightly 0.2.89 and later contain six Direct3D 11 fixes ported from **Mullion** (<https://github.com/dttdrv/mullion>, by
+dttdrv and contributors, a DXMT fork under **LGPL-2.1-or-later**, the same license as the DXMT files they touch): a null
+FinishCommandList, illegal constant-buffer ranges, releasing an object already at zero, a draw with no vertex shader,
+fences on video-support devices, and fence events. The change is `src/d3d11` and `src/util/util_mullion_fix.hpp` in the
+`dxmt` folder; each call site names the Mullion commit it came from. Off switch: `env.MADEIRA_DXMT_MULLION_FIXES = 0`
+(and one switch per fix). Thank you, dttdrv.
+

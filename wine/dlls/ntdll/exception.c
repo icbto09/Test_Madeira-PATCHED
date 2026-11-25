@@ -140,6 +140,55 @@ static ULONG remove_vectored_handler( LIST_ENTRY *handler_list, VECTORED_HANDLER
     return ret;
 }
 
+#if defined(__x86_64__) && !defined(__arm64ec__)
+/*
+ * Some vectored exception handlers restore nonvolatile registers before
+ * returning. Preserve the caller state across the callback.
+ */
+extern LONG WINAPI call_vectored_handler( EXCEPTION_POINTERS *ptr, PVECTORED_EXCEPTION_HANDLER func );
+__ASM_GLOBAL_FUNC( call_vectored_handler,
+                    "pushq %rbx\n\t"
+                    __ASM_SEH(".seh_pushreg %rbx\n\t")
+                    "pushq %rsi\n\t"
+                    __ASM_SEH(".seh_pushreg %rsi\n\t")
+                    "pushq %rdi\n\t"
+                    __ASM_SEH(".seh_pushreg %rdi\n\t")
+                    "pushq %rbp\n\t"
+                    __ASM_SEH(".seh_pushreg %rbp\n\t")
+                    "pushq %r12\n\t"
+                    __ASM_SEH(".seh_pushreg %r12\n\t")
+                    "pushq %r13\n\t"
+                    __ASM_SEH(".seh_pushreg %r13\n\t")
+                    "pushq %r14\n\t"
+                    __ASM_SEH(".seh_pushreg %r14\n\t")
+                    "pushq %r15\n\t"
+                    __ASM_SEH(".seh_pushreg %r15\n\t")
+                    "subq $0x28,%rsp\n\t"
+                    __ASM_SEH(".seh_stackalloc 0x28\n\t")
+                    __ASM_SEH(".seh_endprologue\n\t")
+                    "callq *%rdx\n\t"
+                    "addq $0x28,%rsp\n\t"
+                    "popq %r15\n\t"
+                    "popq %r14\n\t"
+                    "popq %r13\n\t"
+                    "popq %r12\n\t"
+                    "popq %rbp\n\t"
+                    "popq %rdi\n\t"
+                    "popq %rsi\n\t"
+                    "popq %rbx\n\t"
+                    "ret" )
+#else
+static inline LONG call_vectored_handler( EXCEPTION_POINTERS *ptr, PVECTORED_EXCEPTION_HANDLER func )
+{
+    return func( ptr );
+}
+#endif
+
+#ifdef __arm64ec__
+/* madeira [crashmailer-dump] (signal_arm64ec.c): which handler took each exception */
+extern LONG ios_cmd_handler( const EXCEPTION_RECORD *rec, ULONG kind, const void *handler, LONG ret, int phase );
+extern void ios_cmd_internal_leave( LONG old );
+#endif
 
 /**********************************************************************
  *           call_vectored_handlers
@@ -164,7 +213,6 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
     while (entry != mark)
     {
         handler = CONTAINING_RECORD( entry, VECTORED_HANDLER, entry );
-        entry = entry->Flink;
         ++*handler->count;
         func = RtlDecodePointer( handler->func );
         RtlLeaveCriticalSection( &vectored_handlers_section );
@@ -207,7 +255,16 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
          * 0xf8 an ARM64_NT_CONTEXT holds Lr, and at Rsp's 0x98 it holds X19). */
         CONTEXT veh_saved = *context;
 #endif
-        ret = func( &except_ptrs );
+#ifdef __arm64ec__
+        {
+            LONG cmd_saved = ios_cmd_handler( rec, 1, func, 0, 0 );   /* madeira [crashmailer-dump] */
+            ret = call_vectored_handler( &except_ptrs, func );
+            ios_cmd_handler( rec, 1, func, ret, 1 );
+            ios_cmd_internal_leave( cmd_saved );
+        }
+#else
+        ret = call_vectored_handler( &except_ptrs, func );
+#endif
 #ifdef __arm64ec__
         if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
         {
@@ -261,6 +318,7 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( "handler at %p returned %lx\n", func, ret );
 
         RtlEnterCriticalSection( &vectored_handlers_section );
+        entry = entry->Flink;
         if (!--*handler->count)  /* removed during execution */
         {
             RemoveEntryList( &handler->entry );
@@ -316,6 +374,24 @@ static BOOL unconverted_guest_ptr( ULONG_PTR val )
 static BOOL unconverted_guest_ptr( ULONG_PTR val ) { return FALSE; }
 #endif
 
+static const char *debugstr_addr( const void *addr )
+{
+    void *buffer[128];
+    MEMORY_SECTION_NAME *name = (MEMORY_SECTION_NAME *)buffer;
+    MEMORY_IMAGE_INFORMATION info;
+
+    if (!NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryImageInformation,
+                               &info, sizeof(info), NULL ) &&
+        !NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryMappedFilenameInformation,
+                               name, sizeof(buffer), NULL ))
+    {
+        WCHAR *p = wcsrchr( name->SectionFileName.Buffer, '\\' );
+        if (!p) p = name->SectionFileName.Buffer;
+        else p++;
+        return wine_dbg_sprintf( "%p (%ls+%08Ix)", addr, p, (char *)addr - (char *)info.ImageBase );
+    }
+    return wine_dbg_sprintf( "%p", addr );
+}
 
 /*******************************************************************
  *		dispatch_exception
@@ -332,13 +408,13 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         if (rec->ExceptionInformation[1] >> 16)
         {
             if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%s, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%s, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (char *)rec->ExceptionInformation[1] );
         }
         else
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%u, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%u, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (USHORT)rec->ExceptionInformation[1] );
         break;
 
@@ -377,9 +453,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
     }
 
-    TRACE( "code=%lx (%s) flags=%lx addr=%p\n",
+    TRACE( "code=%lx (%s) flags=%lx addr=%s\n",
            rec->ExceptionCode, debugstr_exception_code(rec->ExceptionCode),
-           rec->ExceptionFlags, rec->ExceptionAddress );
+           rec->ExceptionFlags, debugstr_addr( rec->ExceptionAddress ));
     for (i = 0; i < min( EXCEPTION_MAXIMUM_PARAMETERS, rec->NumberParameters ); i++)
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
@@ -719,14 +795,6 @@ void WINAPI RtlGetCallersAddress( void **caller, void **parent )
     *parent = count > 1 ? buffer[1] : NULL;
 }
 
-
-/**********************************************************************
- *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
- */
-ULONG64 WINAPI RtlGetEnabledExtendedFeatures(ULONG64 feature_mask)
-{
-    return user_shared_data->XState.EnabledFeatures & feature_mask;
-}
 
 struct context_copy_range
 {
@@ -1161,9 +1229,6 @@ NTSTATUS WINAPI RtlCopyExtendedContext( CONTEXT_EX *dst, ULONG context_flags, CO
     dst_xs->Mask = (src_xs->Mask & ~(ULONG64)3) & feature_mask;
     dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled
             ? ((ULONG64)1 << 63) | (src_xs->CompactionMask & feature_mask) : 0;
-
-
-    if (dst_xs->CompactionMask) feature_mask &= dst_xs->CompactionMask;
     feature_mask = dst_xs->Mask >> 2;
 
     i = 2;

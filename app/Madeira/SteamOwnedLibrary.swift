@@ -372,6 +372,8 @@ final class SteamOwnedLibrary: ObservableObject {
     }
     /// The library a download of `appID` goes to.
     func library(for appID: Int) -> String { targets[appID] ?? Self.installLibrary }
+    /// The library picked for this game's download, nil when it follows Settings › External drives.
+    func chosenLibrary(for appID: Int) -> String? { targets[appID] }
     func installMoved(_ appID: Int, to library: String) { setTarget(appID, library) }
     func steamApps(for appID: Int) -> URL { Self.drive.appendingPathComponent(library(for: appID), isDirectory: true) }
     private static var supportFolder: URL {
@@ -837,8 +839,20 @@ final class SteamOwnedLibrary: ObservableObject {
         let steamID = session.steamID
         guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
         let drive = Self.drive
-        let external = try ExternalDrives.externalRoot(for: game.library)
-        let install = try ExternalDrives.nativeURL(game.library + "/common/" + game.installDir)
+        // The drive check reads the disk, so it runs off the main thread and may
+        // reuse a 30 s pass (env.MADEIRA_EXTERNAL_VERIFY_CACHE = 0: the old in-line calls).
+        let library = game.library, installDir = game.installDir
+        let external: (root: URL, identity: String?)?
+        let install: URL
+        if MadeiraConfig.flag("MADEIRA_EXTERNAL_VERIFY_CACHE") {
+            (external, install) = try await Task.detached(priority: .utility) {
+                (try ExternalDrives.externalRoot(for: library, cached: true),
+                 try ExternalDrives.nativeURL(library + "/common/" + installDir, cached: true))
+            }.value
+        } else {
+            external = try ExternalDrives.externalRoot(for: library)
+            install = try ExternalDrives.nativeURL(library + "/common/" + installDir)
+        }
         let paths = SteamCloudPaths(
             drive: drive, userFolder: user.url,
             installFolder: install,
@@ -860,6 +874,54 @@ final class SteamOwnedLibrary: ObservableObject {
     var hasStorageWork: Bool {
         hasActiveDownload || !cloudBusy.isEmpty || !deleting.isEmpty || cloud.values.contains { $0.phase == .checking }
     }
+
+    /// `env.MADEIRA_MOVE_IGNORE_STALE_CLOUD = 0`: moving a game (and removing a
+    /// drive) waits for all cloud work of every game, as before. On, moving a
+    /// game waits only for its own cloud work (another game's check or sync
+    /// reads and writes only that game's files; the launch-time check of every
+    /// installed game used to refuse a move for as long as it ran), and a
+    /// check left at .checking with no check running no longer blocks.
+    static var moveIgnoresStaleCloud: Bool { SteamSignIn.flag("MADEIRA_MOVE_IGNORE_STALE_CLOUD", default: true) }
+    /// Cloud checks that are running now (checkCloud), by App ID.
+    private var checkingSince: [Int: Date] = [:]
+
+    /// What stops a game move or a drive removal, for the log line when one is refused.
+    struct StorageBlockers {
+        var download = false
+        var cloudBusy: [Int] = []
+        var deleting: [Int] = []
+        var checking: [Int] = []
+        var isEmpty: Bool { !download && cloudBusy.isEmpty && deleting.isEmpty && checking.isEmpty }
+        var summary: String {
+            func ids(_ list: [Int]) -> String { list.isEmpty ? "-" : list.map(String.init).joined(separator: ",") }
+            return "download=\(download) cloudBusy=\(ids(cloudBusy)) deleting=\(ids(deleting)) checking=\(ids(checking))"
+        }
+    }
+
+    /// `scoped`: a game move, which cares about cloud work of `appID` only
+    /// (nil for a game that is not from Steam). Not scoped: every game's.
+    func storageBlockers(scoped: Bool = false, appID: Int? = nil) -> StorageBlockers {
+        let relaxed = Self.moveIgnoresStaleCloud
+        func relevant(_ id: Int) -> Bool { !(relaxed && scoped) || id == appID }
+        var result = StorageBlockers()
+        result.download = hasActiveDownload
+        result.deleting = deleting.sorted()
+        // A running transfer (cloudBusy) always counts for the game it belongs to.
+        result.cloudBusy = cloudBusy.filter(relevant).sorted()
+        result.checking = cloud.keys.filter { id in
+            guard relevant(id), cloud[id]?.phase == .checking else { return false }
+            return !relaxed || checkingSince[id] != nil     // .checking but not running: stale
+        }.sorted()
+        return result
+    }
+
+    /// A game move or drive removal is refused while this returns something; logs why.
+    func moveBlocker(_ what: String, scoped: Bool = false, appID: Int? = nil) -> StorageBlockers? {
+        let blockers = storageBlockers(scoped: scoped, appID: appID)
+        guard !blockers.isEmpty else { return nil }
+        LogStore.shared.log("[\(what)] blocked: \(blockers.summary)")
+        return blockers
+    }
     func externalStorageReconnected() {
         for (id, var state) in cloud where SteamGamesModel.shared.games.contains(where: { $0.id == id && ExternalDrives.driveName(library: $0.library) != nil }) {
             state.retryFailedCheck(); cloud[id] = state
@@ -875,6 +937,8 @@ final class SteamOwnedLibrary: ObservableObject {
         var state = cloud[appID] ?? SteamCloudState()
         state.phase = .checking
         cloud[appID] = state
+        checkingSince[appID] = Date()
+        defer { checkingSince[appID] = nil }
         do {
             guard let context = try await cloudContext(appID) else {
                 state.phase = .failed(Self.cloudNoFolders); cloud[appID] = state; return nil
@@ -1397,12 +1461,23 @@ final class SteamOwnedLibrary: ObservableObject {
         DepotDownloader.hasPartialDownload(appID: UInt32(appID), steamApps: steamApps(for: appID))
     }
 
+    /// Same answer, read off the main thread: the downloading folder can be on a
+    /// drive busy with a download (iOS killed Madeira for a main-thread read
+    /// there, Nov 17). Off with `env.MADEIRA_PARTIAL_ASYNC = 0` (reads in line).
+    func hasPartialDownloadAsync(_ appID: Int) async -> Bool {
+        guard SteamSignIn.flag("MADEIRA_PARTIAL_ASYNC", default: true) else { return hasPartialDownload(appID) }
+        let apps = steamApps(for: appID)
+        return await Task.detached(priority: .utility) {
+            DepotDownloader.hasPartialDownload(appID: UInt32(appID), steamApps: apps)
+        }.value
+    }
+
     /// Installs or updates a game: queues it and starts when nothing else downloads.
     /// `library` picks where a new download goes; nil keeps the earlier choice
     /// (or the default from Settings › External drives).
     func install(_ appID: Int, library: String? = nil) {
         guard Self.enabled else { return }
-        guard !deleting.contains(appID), GameMover.shared.moving == nil else { error = "Wait for the file operation to finish."; return }
+        guard !deleting.contains(appID), !retargeting.contains(appID), GameMover.shared.moving == nil else { error = "Wait for the file operation to finish."; return }
         guard signedIn else { error = "Sign in to Steam to download games."; return }
         if active?.id == appID || queue.contains(appID) { return }
         let installed = SteamGamesModel.shared.games.first(where: { $0.id == appID })?.library
@@ -1429,6 +1504,82 @@ final class SteamOwnedLibrary: ObservableObject {
     }
     private static var restartHintShown = false
 
+    /// (install-on-retarget, Nov 22 2026) A download that has not finished moves to another library
+    /// (the install sheet's Install on). Cameron's Fallout 4 was aimed at a drive that was unplugged:
+    /// every Try Again failed with "<drive> is not connected", and install(library:) keeps the earlier
+    /// target first (ExternalInstallTarget.select), so the sheet could not change it.
+    /// - The old place is reachable: the game's folder (steamapps/common/<folder>) moves first, and its
+    ///   journal (steamapps/downloading/<id>) only after the folder moved in full (or there was none):
+    ///   the journal marks chunks as done without checking them, so a journal without its files would
+    ///   finish with empty files. Without the journal, files already there are checked by SHA-1.
+    ///   If either already exists at the new place, nothing is moved and the download starts over there.
+    /// - The old place is an unplugged drive: nothing can be moved; the download starts over on the
+    ///   new place, and the parts stay on that drive.
+    /// Then the download starts again. env.MADEIRA_INSTALL_ON_RETARGET = 0: no retarget (as in 0.2.84).
+    static var retargetEnabled: Bool { enabled && SteamSignIn.flag("MADEIRA_INSTALL_ON_RETARGET", default: true) }
+    /// Games whose parts are being moved by retarget: Install, Cancel and Uninstall wait for it.
+    @Published private(set) var retargeting: Set<Int> = []
+    /// `connected`: whether the old place's drive is mounted, from ExternalDrives' list of this launch
+    /// (no drive read on the main thread: the Nov 17 watchdog kill).
+    func retarget(_ appID: Int, to library: String, oldConnected connected: Bool) {
+        guard Self.retargetEnabled else { return }
+        let old = self.library(for: appID)
+        guard library != old || targets[appID] == nil, SteamInstallPaths.isManaged(library: library) else { return }
+        if inSession { error = "Close the game first."; return }
+        guard active?.id != appID, !queue.contains(appID), !deleting.contains(appID), !retargeting.contains(appID),
+              GameMover.shared.moving == nil else { error = "Pause the download and wait for the file operation to finish."; return }
+        guard !SteamGamesModel.shared.games.contains(where: { $0.id == appID }) else { return }   // installed: Move, not this
+        let folder = game(appID)?.folderName
+        resumeAfterSession.remove(appID)
+        setTarget(appID, library)
+        guard connected, library != old else {
+            SteamLog.event("[install-on] app=\(appID) retarget old=\(connected ? "same" : "unreachable") parts-moved=0")
+            install(appID)
+            return
+        }
+        retargeting.insert(appID)
+        Task { @MainActor in
+            let moved = await Task.detached(priority: .utility) { () -> String in
+                let fm = FileManager.default
+                // Each path through nativeURL (its per-part checks), as GameMover does.
+                func url(_ base: String, _ part: String) -> URL? { try? ExternalDrives.nativeURL(base + "/" + part, write: true) }
+                let journal = "downloading/\(appID)"
+                let common = folder.map { "common/" + $0 }
+                guard let jFrom = url(old, journal), let jTo = url(library, journal) else { return "unreadable" }
+                let cFrom = common.flatMap { url(old, $0) }, cTo = common.flatMap { url(library, $0) }
+                if fm.fileExists(atPath: jTo.path) || (cTo.map { fm.fileExists(atPath: $0.path) } ?? false) { return "target-exists" }
+                var folderMoved = false
+                if let cFrom, let cTo, fm.fileExists(atPath: cFrom.path) {
+                    do {
+                        try fm.createDirectory(at: cTo.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try fm.moveItem(at: cFrom, to: cTo)
+                        folderMoved = true
+                    } catch {
+                        // Files already copied are kept as a head start (no journal: checked by SHA-1).
+                        return "files-failed"
+                    }
+                }
+                // The journal only goes with its files: no folder moved (none found under this name, or
+                // unreadable) leaves it behind, and the download starts over at the new place.
+                guard folderMoved else { return "none" }
+                guard fm.fileExists(atPath: jFrom.path) else { return "files" }
+                do {
+                    try fm.createDirectory(at: jTo.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fm.moveItem(at: jFrom, to: jTo)
+                    return "files+journal"
+                } catch {
+                    try? fm.removeItem(at: jTo)   // never a part-copied journal
+                    return "files"
+                }
+            }.value
+            retargeting.remove(appID)
+            SteamLog.event("[install-on] app=\(appID) retarget old=reachable moved=\(moved)")
+            // Cancelled meanwhile (its target was cleared): stay cancelled.
+            guard targets[appID] == library else { return }
+            install(appID)
+        }
+    }
+
     func pause(_ appID: Int) {
         if let current = active, current.id == appID {
             current.task.cancel()
@@ -1442,7 +1593,7 @@ final class SteamOwnedLibrary: ObservableObject {
     /// Stops a download. A first-time install also loses its partial files;
     /// an update of an installed game is only paused, never deleted.
     func cancelInstall(_ appID: Int, installed: Bool) {
-        guard !deleting.contains(appID), !cloudBusy.contains(appID), cloud[appID]?.phase != .checking,
+        guard !deleting.contains(appID), !retargeting.contains(appID), !cloudBusy.contains(appID), cloud[appID]?.phase != .checking,
               GameMover.shared.moving == nil else { error = "Wait for the file operation to finish."; return }
         let running = active?.id == appID ? active?.task : nil
         pause(appID)
@@ -1472,14 +1623,25 @@ final class SteamOwnedLibrary: ObservableObject {
 
     /// Removes an install that Madeira's downloads own (its library folder is
     /// Madeira Dock's own), with its library entry (its per-game settings).
-    func uninstall(_ game: DockGame) {
-        guard SteamInstallPaths.isManaged(library: game.library), !inSession else { return }
+    func uninstall(_ game: DockGame) { _ = beginUninstall(game) }
+
+    /// The one uninstall path (the game's page and the batch uninstall use it): its
+    /// guards run now, and the returned task ends true once the install is removed,
+    /// false when it could not be (`error` says why). nil: refused, nothing started.
+    /// `report: false` (the batch uninstall) keeps the reason in `lastUninstallError` and leaves `error` (the Steam alert) alone.
+    func beginUninstall(_ game: DockGame, report: Bool = true) -> Task<Bool, Never>? {
+        lastUninstallError = nil
+        guard SteamInstallPaths.isManaged(library: game.library), !inSession else { return nil }
         guard !deleting.contains(game.id), !cloudBusy.contains(game.id), cloud[game.id]?.phase != .checking,
-              GameMover.shared.moving == nil else { error = "Wait for the file operation to finish."; return }
+              GameMover.shared.moving == nil else {
+            lastUninstallError = "Wait for the file operation to finish."
+            if report { error = lastUninstallError }
+            return nil
+        }
         let running = active?.id == game.id ? active?.task : nil
         pause(game.id); downloads[game.id] = nil
         deleting.insert(game.id)
-        Task { @MainActor in
+        return Task { @MainActor in
             defer { deleting.remove(game.id) }
             await running?.value
             do {
@@ -1492,8 +1654,21 @@ final class SteamOwnedLibrary: ObservableObject {
                 setTarget(game.id, nil)
                 SteamGamesModel.shared.refresh()
                 SteamLog.event("[steam-depot] uninstalled app=\(game.id)")
-            } catch { self.error = "The install could not be removed: " + error.localizedDescription }
+                return true
+            } catch {
+                let why = "The install could not be removed: " + error.localizedDescription
+                self.lastUninstallError = why
+                if report { self.error = why }
+                return false
+            }
         }
+    }
+
+    private(set) var lastUninstallError: String?
+
+    /// A delete, a cloud sync or a cloud check of this game is running (the batch uninstall waits for it).
+    func storageBusy(_ appID: Int) -> Bool {
+        deleting.contains(appID) || cloudBusy.contains(appID) || cloud[appID]?.phase == .checking
     }
 
     private func pump() {

@@ -28,6 +28,8 @@ $end_info$
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <atomic> // madeira [kuser-rebase]
 
 namespace FEXCore::IR {
 
@@ -402,6 +404,32 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
 }
 
 void OpDispatchBuilder::POPOp(OpcodeArgs) {
+  // madeira [pop-rsp-fault] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0003 (MIT)
+  // x86 leaves RSP unchanged when the store of POP r/m faults. Pop() commits the new RSP first (through _Pop's RMW
+  // stack pointer operand, which is the guest RSP register itself), so a handler that skips the faulting
+  // instruction resumed with RSP off by the operand size. MADEIRA_FEX_POP_RSP_FAULT=0: the old single path.
+  if (MadeiraPopRspFault()) {
+    const auto& Dest = Op->Dest;
+    // The Relocation operand types share their Data layout with the plain ones.
+    const bool DestIndirect = Dest.IsGPRIndirect() || Dest.IsGPRIndirectRelocation();
+    const bool DestSIB = Dest.IsSIB() || Dest.IsSIBRelocation();
+    const bool DestUsesRSP = (DestIndirect && Dest.Data.GPRIndirect.GPR == X86State::REG_RSP) ||
+                             (DestSIB && (Dest.Data.SIB.Base == X86State::REG_RSP || Dest.Data.SIB.Index == X86State::REG_RSP));
+
+    if (!Dest.IsGPR() && !DestUsesRSP) {
+      // Memory destination: if the store faults the instruction must not have completed, so only commit the new
+      // RSP once the store is done (pop (%rax) with a bad rax must preserve RSP). Not using _Pop: the new RSP is
+      // computed after the store so the register allocator can't write it to RSP early.
+      const auto Size = OpSizeFromSrc(Op);
+      Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+      Ref Value = _LoadMemGPRAutoTSO(Size, OldSP, Size);
+      StoreResultGPR(Op, Value);
+      StoreGPRRegister(X86State::REG_RSP, Add(GetGPROpSize(), OldSP, IR::OpSizeToSize(Size)));
+      return;
+    }
+    // Register destination can't fault; an RSP-relative destination address is computed with the incremented
+    // RSP, so update it first (below).
+  }
   Ref Value = Pop(OpSizeFromSrc(Op));
   StoreResultGPR(Op, Value);
 }
@@ -426,6 +454,22 @@ void OpDispatchBuilder::POPAOp(OpcodeArgs) {
 
   // Store the new stack pointer
   StoreGPRRegister(X86State::REG_RSP, SP);
+}
+
+// MADEIRA fex-seg64-selector: MOV to FS/GS and POP FS/GS in 64-bit mode.
+// On x86-64 these load only the 16-bit selector; the FS/GS bases live in MSRs and the OS keeps GS
+// pointing at the TEB (the comment in MOVSegOp below says the same, tested on hardware). FEX
+// refused the MOV form with a decode failure (the guest then gets an illegal-instruction exception
+// on every run of it) and the POP form reloaded the cached base from the emulated GDT, which drops
+// the TEB base. Overwatch 2's loader runs the MOV form: bnettest19 log ccc98a0a has 141
+// "We don't support modifying GS/FS selector in 64bit mode!" lines from its thread.
+// Default on. MADEIRA_FEX_SEG64=0 restores the old behaviour. Read once per process.
+static bool Seg64SelectorOnly() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("MADEIRA_FEX_SEG64");
+    return !(Env && Env[0] == '0' && Env[1] == '\0');
+  }();
+  return Enabled;
 }
 
 void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
@@ -458,6 +502,11 @@ void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
   default: break; // Do nothing
   }
 
+  // MADEIRA fex-seg64-selector: in 64-bit mode POP FS/GS keeps the base (see Seg64SelectorOnly).
+  if (Is64BitMode && Seg64SelectorOnly() &&
+      (SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX || SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
+    return;
+  }
   UpdatePrefixFromSegment(NewSegment, SegmentReg);
 }
 
@@ -1009,7 +1058,7 @@ void OpDispatchBuilder::TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     CalculatePF(_AndWithFlags(Size, Dest, Src));
   }
 
-  InvalidateAF();
+  ZeroAF(); // madeira [intel-flags]
   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
@@ -1281,6 +1330,9 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       if (!Is64BitMode) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+      } else if (Seg64SelectorOnly()) {
+        // MADEIRA fex-seg64-selector: 64-bit mode loads the selector only; the base stays.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
       } else {
         LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
         DecodeFailure = true;
@@ -1291,6 +1343,9 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       if (!Is64BitMode) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+      } else if (Seg64SelectorOnly()) {
+        // MADEIRA fex-seg64-selector: 64-bit mode loads the selector only; the base stays.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
       } else {
         LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
         DecodeFailure = true;
@@ -1320,17 +1375,19 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
       break;
     case FEXCore::X86State::REG_RBP: // GS
     case FEXCore::X86State::REG_R13: // GS
-      if (Is64BitMode) {
+      if (Is64BitMode && !Seg64SelectorOnly()) {
         Segment = Constant(0);
       } else {
+        // MADEIRA fex-seg64-selector: 64-bit mode reads back the stored selector (Windows: GS 0x2B, FS 0x53).
         Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, gs_idx));
       }
       break;
     case FEXCore::X86State::REG_RSP: // FS
     case FEXCore::X86State::REG_R12: // FS
-      if (Is64BitMode) {
+      if (Is64BitMode && !Seg64SelectorOnly()) {
         Segment = Constant(0);
       } else {
+        // MADEIRA fex-seg64-selector: 64-bit mode reads back the stored selector (Windows: GS 0x2B, FS 0x53).
         Segment = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, fs_idx));
       }
       break;
@@ -1748,7 +1805,7 @@ void OpDispatchBuilder::BEXTRBMIOp(OpcodeArgs) {
   // ZF is set properly. CF and OF are defined as being set to zero. SF, PF, and
   // AF are undefined.
   SetNZ_ZeroCV(GetOpSize(Dest), Dest);
-  InvalidatePF_AF();
+  UndefPF_ZeroAF(Dest); // madeira [intel-flags]
 
   AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
@@ -1770,7 +1827,7 @@ void OpDispatchBuilder::BLSIBMIOp(OpcodeArgs) {
   //
   // ZF/SF/OF set as usual.
   SetNZ_ZeroCV(Size, Result);
-  InvalidatePF_AF();
+  UndefPF_ZeroAF(Result); // madeira [intel-flags]
   SetCFInverted(GetRFLAG(X86State::RFLAG_ZF_RAW_LOC));
 
   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
@@ -1785,7 +1842,7 @@ void OpDispatchBuilder::BLSMSKBMIOp(OpcodeArgs) {
   auto Result = _Xor(Size, Sub(Size, Src, 1), Src);
 
   StoreResultGPR(Op, Result);
-  InvalidatePF_AF();
+  UndefPF_ZeroAF(Result); // madeira [intel-flags]
 
   // CF set according to the Src
   auto CFInv = To01(Size, Src);
@@ -1812,7 +1869,7 @@ void OpDispatchBuilder::BLSRBMIOp(OpcodeArgs) {
 
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
-  InvalidatePF_AF();
+  UndefPF_ZeroAF(Result); // madeira [intel-flags]
 
   AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
@@ -1871,7 +1928,7 @@ void OpDispatchBuilder::BZHI(OpcodeArgs) {
 
   auto CFInv = _NZCVSelect01(CondClass::EQ);
 
-  InvalidatePF_AF();
+  UndefPF_ZeroAF(Result); // madeira [intel-flags]
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
 
@@ -3964,6 +4021,12 @@ void OpDispatchBuilder::BSFOp(OpcodeArgs) {
   // ZF is set to 1 if the source was zero
   SetZ_InvalidateNCV(OpSizeFromSrc(Op), Src);
 
+  // madeira [intel-flags]: Intel hardware and Rosetta 2 give the source's parity and a clear AF.
+  if (MadeiraIntelFlags()) {
+    CalculatePF(Src);
+    ZeroAF();
+  }
+
   // If Src was zero then the destination doesn't get modified.
   //
   // Although Intel does not guarantee that semantic, AMD does and Intel
@@ -3988,6 +4051,12 @@ void OpDispatchBuilder::BSROp(OpcodeArgs) {
   // OF, SF, AF, PF, CF all undefined
   // ZF is set to 1 if the source was zero
   SetZ_InvalidateNCV(OpSizeFromSrc(Op), Src);
+
+  // madeira [intel-flags]: Intel hardware and Rosetta 2 give the source's parity and a clear AF.
+  if (MadeiraIntelFlags()) {
+    CalculatePF(Src);
+    ZeroAF();
+  }
 
   // If Src was zero then the destination doesn't get modified
   auto SelectOp = NZCVSelect(GPRSize, CondClass::EQ, Dest, Result);
@@ -4163,7 +4232,6 @@ void OpDispatchBuilder::CreateJumpBlocks(const fextl::vector<FEXCore::Frontend::
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 }  // namespace FEXCore::IR
 extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64_t* Real);
-extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real);   // madeira kuser-remap
 namespace FEXCore::IR {
 #endif
 void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore::Frontend::Decoder::DecodedBlocks>* Blocks,
@@ -4175,12 +4243,6 @@ void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore:
     IosXl.On = false;
     if (IosSubfloorWindowForCode(RIP, &Low, &Sz, &Real) && Sz && Sz < (1ull << 40)) {
       IosXl.On = true; IosXl.Low = Low; IosXl.Size = Sz; IosXl.Delta = Real - Low;
-    }
-    // madeira kuser-remap: the window's numbers; Core.cpp switches it on per learned instruction.
-    IosKu.On = false;
-    IosKu.Known = false;
-    if (IosKuserWindow(&Low, &Sz, &Real) && Sz && Sz < (1ull << 32) && Real > Low) {
-      IosKu.Known = true; IosKu.Low = Low; IosKu.Size = Sz; IosKu.Delta = Real - Low;
     }
   }
 #endif
@@ -4620,6 +4682,68 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
 }
 
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+}  // namespace FEXCore::IR
+extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);  // ml951/ml954, Source/Windows/ARM64EC/IosJitAlias.cpp
+namespace FEXCore::IR {
+
+/* madeira [kuser-rebase] (env MADEIRA_FEX_KUSER_REBASE = 0 turns it off; on by default). rev=kuser-rebase-1.
+ *
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0001
+ * "Windows: Rebase constant loads from a relocated KUSER_SHARED_DATA at JIT time"
+ * (LGPL-2.1 for Wine parts, MIT for FEX parts).
+ *
+ * iOS's 4GB __PAGEZERO keeps KUSER_SHARED_DATA from its architectural address 0x7ffe0000. ntdll maps it
+ * high and registers guest [0x7ffe0000, +page) as a sub-floor window onto the real page (ml952), which
+ * ntdll pushes into FEX's window table (ml951). Until now every guest read of the constant address took a
+ * Mach exception and was emulated by [subfloor] ml956 (over 45,000 of them in an Overwatch run, mostly
+ * TickCount/InterruptTime). His change: "Rebase constant-address 64-bit guest loads from 0x7ffe0000 by
+ * that delta instead of taking a fault per access (1.7us -> 0.3ns per read)". The delta here is the one
+ * FEX already holds, IosSubfloorToReal(0x7ffe0000); his reads Wine's __wine_user_shared_data export.
+ *
+ * Scope, as his: loads only, 64-bit address size, no base, index or segment (moffs A0/A1 and SIB
+ * disp32 forms), the whole access inside the page. Ours, in addition, rebases only real loads (not LEA,
+ * which goes through the same DecodeAddress in his patch), and nothing while code is compiled for a
+ * cache that is kept across processes (the real address differs per run). Anything this misses (register
+ * bases, RIP-relative, 0x67 32-bit addressing, string ops, stores) still faults into ml956, unchanged.
+ * Affects code generation: the switch is read once per process. */
+static bool MadeiraKuserRebase() {
+  static const bool On = [] {
+    const char* E = getenv("MADEIRA_FEX_KUSER_REBASE");
+    const bool V = !(E && E[0] == '0' && E[1] == '\0');
+    LogMan::Msg::EFmt("[kuser-rebase] rev=kuser-rebase-1 {}", V ? "on" : "off (MADEIRA_FEX_KUSER_REBASE=0)");
+    return V;
+  }();
+  return On;
+}
+
+void OpDispatchBuilder::IosKuserRebase(AddressMode& A, IR::OpSize Size) {
+  constexpr uint64_t KuserGuest = 0x7ffe0000ULL;
+  constexpr uint64_t KuserSize = 0x1000;
+  if (A.Base || A.Index || A.Segment || A.AddrSize != OpSize::i64Bit) {
+    return;
+  }
+  const uint64_t Off = static_cast<uint64_t>(A.Offset) - KuserGuest;
+  const uint64_t Bytes = Size == OpSize::iInvalid ? 1 : IR::OpSizeToSize(Size);
+  if (Off >= KuserSize || Bytes > KuserSize - Off) {
+    return;
+  }
+  if (!MadeiraKuserRebase() || CTX->RequiresRelocatableConstants()) {
+    return;
+  }
+  const uint64_t Real = IosSubfloorToReal(KuserGuest);
+  if (Real == KuserGuest) {
+    return; // no window registered yet: ml956 serves the access as before
+  }
+  static std::atomic<uint32_t> Said {0};
+  if (Said.fetch_add(1, std::memory_order_relaxed) < 4) {
+    LogMan::Msg::EFmt("[kuser-rebase] block {:#x}: {}-byte load of guest {:#x} -> real {:#x}", Entry, Bytes,
+                      static_cast<uint64_t>(A.Offset), Real + Off);
+  }
+  A.Offset = static_cast<int64_t>(Real + Off);
+}
+#endif
+
 Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
                                              IR::OpSize OpSize, uint32_t Flags, const LoadSourceOptions& Options) {
   auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage] = Options;
@@ -4657,6 +4781,9 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
 
   const bool ShouldLoad = (IsOperandMem(Operand, true) && LoadData) || ForceLoad;
   if (ShouldLoad) {
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+    IosKuserRebase(A, OpSize); // [kuser-rebase]: real loads only, never LEA's address
+#endif
     if (OpSize == OpSize::f80Bit) {
       Ref MemSrc = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
       if (CTX->HostFeatures.SupportsSVE()) {
@@ -4834,15 +4961,17 @@ OpDispatchBuilder::OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx, FEXCore
   : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9 != 0}
   , CTX {ctx}
   , Thread {Thread} {
-  if (CTX->HostFeatures.SupportsAVX && CTX->HostFeatures.SupportsSVE256) {
+  (void)MadeiraPopRspFault(); // madeira [pop-rsp-fault]: read the switch (and log it) at thread init, not at the first POP r/m
+  if (CTX->HostFeatures.SupportsAVX() && CTX->HostFeatures.SupportsSVE256()) {
     SaveAVXStateFunc = &OpDispatchBuilder::SaveAVXState;
     RestoreAVXStateFunc = &OpDispatchBuilder::RestoreAVXState;
     DefaultAVXStateFunc = &OpDispatchBuilder::DefaultAVXState;
-  } else if (CTX->HostFeatures.SupportsAVX) {
+  } else if (CTX->HostFeatures.SupportsAVX()) {
     SaveAVXStateFunc = &OpDispatchBuilder::AVX128_SaveAVXState;
     RestoreAVXStateFunc = &OpDispatchBuilder::AVX128_RestoreAVXState;
     DefaultAVXStateFunc = &OpDispatchBuilder::AVX128_DefaultAVXState;
   }
+  (void)MadeiraX87Flags(); // madeira [x87-flags]: read the switch (and log it) at thread init, not at the first x87 status op
 }
 
 void OpDispatchBuilder::ResetWorkingList() {
@@ -4884,8 +5013,13 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
     // encodable. This is optimal and works regardless of the opsize.
     auto Zero = LoadGPR(Op->Dest.Data.GPR.GPR);
     HandleNZ00Write();
-    InvalidateAF();
+    if (!MadeiraIntelFlags()) {
+      InvalidateAF();
+    }
     CalculatePF(SubWithFlags(OpSize::i32Bit, Zero, Zero));
+    if (MadeiraIntelFlags()) {
+      ZeroAF(); // madeira [intel-flags]: after PF
+    }
     CFInverted = true;
     FlushRegisterCache();
 
@@ -4969,7 +5103,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
   case FEXCore::IR::IROps::OP_ANDWITHFLAGS: {
     HandleNZ00Write();
     CalculatePF(Result);
-    InvalidateAF();
+    ZeroAF(); // madeira [intel-flags]
     AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
     break;
   }

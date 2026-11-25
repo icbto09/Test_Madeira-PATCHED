@@ -322,6 +322,10 @@ struct sock
     }
     icmp_fixup_data[MAX_ICMP_HISTORY_LENGTH]; /* Sent ICMP packets history used to fixup reply id. */
     struct bound_addr  *bound_addr[2]; /* Links to the entries in bound addresses tree. */
+    /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+    struct list         listen_entry; /* entry in the list of listening TCP sockets (macOS) */
+    union unix_sockaddr dropped_addr; /* address of a binding given up, to take again (macOS) */
+    socklen_t           dropped_addr_len;
     unsigned int        icmp_fixup_data_len;  /* Sent ICMP packets history length. */
     unsigned int        rd_shutdown : 1; /* is the read end shut down? */
     unsigned int        wr_shutdown : 1; /* is the write end shut down? */
@@ -333,11 +337,82 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+#ifdef WINE_IOS
+    struct timeout_user *connect_timeout; /* madeira: MADEIRA_CONNECT_TIMEOUT_MS timer */
+    timeout_t           connect_start;    /* madeira: when the pending connect began */
+#endif
 };
 
 static int is_tcp_socket( struct sock *sock )
 {
     return sock->type == WS_SOCK_STREAM && (sock->family == WS_AF_INET || sock->family == WS_AF_INET6);
+}
+
+/* madeira [bsd-sockets]: one switch for the BSD-socket fixes taken from MetalSharp-Wine
+ * patches 0149-0157 (wineserver, ntdll and ws2_32 each read it).
+ * env MADEIRA_BSD_SOCKETS=0 restores the previous behaviour; default on.
+ * On iOS the server runs again in the same process for every session of the app run (see
+ * mach_ios.c ios_real_suspend_enabled), so the value is read again on every call and the log
+ * line is printed when it changes; callers test it last, after the cheap socket checks.
+ * Elsewhere it is read once per process.
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine (LGPL-2.1) */
+static int madeira_bsd_sockets(void)
+{
+#ifdef WINE_IOS
+    static int logged = -1;
+    const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+    int mode = !(e && e[0] == '0' && !e[1]);
+
+    if (__atomic_exchange_n( &logged, mode, __ATOMIC_RELAXED ) != mode)
+        fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (server)\n", mode ? "on" : "off" );
+    return mode;
+#else
+    static int mode = -1;   /* -1 not read, 0 off, 1 on; the server is single-threaded */
+
+    if (mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+        mode = !(e && e[0] == '0' && !e[1]);
+        fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (server)\n", mode ? "on" : "off" );
+    }
+    return mode;
+#endif
+}
+
+/* madeira [tcp-rcvbuf-keep] (env MADEIRA_TCP_RCVBUF_KEEP = 0 turns it off).
+ *
+ * On Windows SO_RCVBUF sizes the application's buffer and the TCP receive
+ * window still scales by itself.  On Darwin a setsockopt(SO_RCVBUF) on a TCP
+ * socket pins the socket buffer at that size and stops the kernel growing it,
+ * so a downloader that asks for a small buffer is held to a few MB/s on a fast
+ * line.  For a TCP (stream, IPv4/IPv6) socket the request is therefore only
+ * remembered and reported back by SO_RCVBUF queries; the system buffer is not
+ * touched.  Datagram and other sockets are set as before, and so is the
+ * minimum applied when a socket is created.  Returns 1 when the request was
+ * kept back. */
+static int madeira_tcp_rcvbuf_keep( struct sock *sock, unsigned int asked )
+{
+#ifdef __APPLE__
+    static int mode = -1;   /* -1 not read, 0 off, 1 on */
+    static unsigned int logged;
+
+    if (mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_TCP_RCVBUF_KEEP" );
+        mode = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!mode) return 0;
+    if (!is_tcp_socket( sock )) return 0;
+    if (logged < 8)
+    {
+        logged++;
+        fprintf( stderr, "[tcp-rcvbuf-keep] a program asked SO_RCVBUF=%u on a TCP socket: remembered, "
+                 "system buffer left to grow (MADEIRA_TCP_RCVBUF_KEEP=0 sets it as before)\n", asked );
+    }
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 static int addr_compare( const void *key, const struct wine_rb_entry *entry )
@@ -508,49 +583,272 @@ static void sock_reselect_async( struct fd *fd, struct async_queue *queue );
 static int accept_into_socket( struct sock *sock, struct sock *acceptsock );
 static struct sock *accept_socket( struct sock *sock );
 static int sock_get_ntstatus( int err );
+static void sock_reselect( struct sock *sock );
+static const struct fd_ops sock_fd_ops;
+
+#ifdef __APPLE__
+/* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1)
+ * Off (MADEIRA_BSD_SOCKETS=0): no socket enters listening_tcp_socks and no binding is dropped,
+ * so every helper below is a no-op and bind/listen/connect behave as before. */
+/* Winsock's SO_REUSEADDR is SO_REUSEPORT here (see IOCTL_AFD_WINE_SET_SO_REUSEADDR). With it,
+ * BSD lets a second TCP socket listen on an address another one listens on, and hands it the
+ * new connections. Windows keeps giving them to the first socket, and Linux refuses the second
+ * listen(); refuse it as Linux does, so that the first socket keeps its connections. */
+static struct list listening_tcp_socks = LIST_INIT( listening_tcp_socks );
+
+static unsigned short sockaddr_port( const union unix_sockaddr *addr )
+{
+    if (addr->addr.sa_family == AF_INET) return ntohs( addr->in.sin_port );
+    if (addr->addr.sa_family == AF_INET6) return ntohs( addr->in6.sin6_port );
+    return 0;
+}
+
+static int addrs_overlap( const union unix_sockaddr *a, const union unix_sockaddr *b )
+{
+    if (a->addr.sa_family != b->addr.sa_family) return 0;
+    if (a->addr.sa_family == AF_INET)
+        return a->in.sin_port == b->in.sin_port &&
+               (a->in.sin_addr.s_addr == b->in.sin_addr.s_addr ||
+                a->in.sin_addr.s_addr == htonl( INADDR_ANY ) ||
+                b->in.sin_addr.s_addr == htonl( INADDR_ANY ));
+    if (a->addr.sa_family == AF_INET6)
+        return a->in6.sin6_port == b->in6.sin6_port &&
+               (IN6_ARE_ADDR_EQUAL( &a->in6.sin6_addr, &b->in6.sin6_addr ) ||
+                IN6_IS_ADDR_UNSPECIFIED( &a->in6.sin6_addr ) ||
+                IN6_IS_ADDR_UNSPECIFIED( &b->in6.sin6_addr ));
+    return 0;
+}
+
+static int is_address_listened_on( struct sock *sock, const union unix_sockaddr *addr )
+{
+    union unix_sockaddr other_addr;
+    struct sock *other;
+    socklen_t len;
+    int other_fd;
+
+    LIST_FOR_EACH_ENTRY( other, &listening_tcp_socks, struct sock, listen_entry )
+    {
+        if (other == sock) continue;
+        if ((other_fd = get_unix_fd( other->fd )) == -1)
+        {
+            clear_error();
+            continue;
+        }
+        len = sizeof(other_addr);
+        if (!getsockname( other_fd, &other_addr.addr, &len ) && addrs_overlap( addr, &other_addr ))
+            return 1;
+    }
+    return 0;
+}
+
+static int is_unix_socket_listened_on( struct sock *sock, int unix_fd )
+{
+    union unix_sockaddr addr;
+    socklen_t len = sizeof(addr);
+
+    if (getsockname( unix_fd, &addr.addr, &len )) return 0;
+    return is_address_listened_on( sock, &addr );
+}
+
+/* A TCP socket bound with SO_REUSEPORT that is not listening still holds its address in
+ * the kernel: BSD gives it the connections meant for a socket listening there, and drops
+ * them, where Linux gives them to the listening socket or refuses them. Such a socket gets
+ * a new, unbound kernel socket with the same options; the address is taken again when it
+ * listens or connects. */
+static void drop_kernel_binding( struct sock *sock, int unix_fd )
+{
+    static const struct { int level, name; } int_options[] =
+    {
+        { SOL_SOCKET, SO_REUSEADDR }, { SOL_SOCKET, SO_REUSEPORT }, { SOL_SOCKET, SO_KEEPALIVE },
+        { SOL_SOCKET, SO_OOBINLINE }, { SOL_SOCKET, SO_DONTROUTE }, { SOL_SOCKET, SO_RCVBUF },
+        { SOL_SOCKET, SO_SNDBUF }, { SOL_SOCKET, SO_RCVLOWAT }, { IPPROTO_TCP, TCP_NODELAY },
+        /* madeira [bsd-sockets]: keep an interface binding set with IP_UNICAST_IF (0157) */
+#ifdef IP_BOUND_IF
+        { IPPROTO_IP, IP_BOUND_IF },
+#endif
+#ifdef IPV6_BOUND_IF
+        { IPPROTO_IPV6, IPV6_BOUND_IF },
+#endif
+#ifdef TCP_KEEPALIVE
+        { IPPROTO_TCP, TCP_KEEPALIVE },
+#endif
+#ifdef TCP_KEEPINTVL
+        { IPPROTO_TCP, TCP_KEEPINTVL },
+#endif
+#ifdef TCP_KEEPCNT
+        { IPPROTO_TCP, TCP_KEEPCNT },
+#endif
+    };
+    union unix_sockaddr addr;
+    socklen_t len = sizeof(addr), optlen;
+    struct linger linger;
+    struct fd *newfd;
+    unsigned int i;
+    int fd, value, fresh;
+
+    /* madeira [bsd-sockets]: once a client holds this fd in its cache (a socket made cacheable by a
+     * connect that went EINPROGRESS, then used by the client), a new kernel socket would leave that
+     * client sending and receiving on the old, cached one. Keep the old socket then: the caller
+     * gets the error it got before these patches (upstream 0150/0156 replace it regardless). */
+    if (is_fd_client_cached( sock->fd )) return;
+    if (getsockname( unix_fd, &addr.addr, &len )) return;
+    if ((fd = socket( addr.addr.sa_family, SOCK_STREAM, IPPROTO_TCP )) == -1) return;
+    fcntl( fd, F_SETFL, O_NONBLOCK );
+    for (i = 0; i < ARRAY_SIZE(int_options); i++)
+    {
+        optlen = sizeof(value);
+        if (getsockopt( unix_fd, int_options[i].level, int_options[i].name, &value, &optlen )) continue;
+        /* madeira [bsd-sockets]: on Darwin a setsockopt() of SO_RCVBUF or SO_SNDBUF pins the buffer and
+         * stops the kernel growing it (see madeira_tcp_rcvbuf_keep). Copy a buffer size only when it is
+         * not the new socket's own default, i.e. when it was set on purpose (upstream copies it always). */
+        if (int_options[i].level == SOL_SOCKET &&
+            (int_options[i].name == SO_RCVBUF || int_options[i].name == SO_SNDBUF))
+        {
+            socklen_t freshlen = sizeof(fresh);
+            if (!getsockopt( fd, SOL_SOCKET, int_options[i].name, &fresh, &freshlen ) && fresh == value)
+                continue;
+        }
+        setsockopt( fd, int_options[i].level, int_options[i].name, &value, optlen );
+    }
+    optlen = sizeof(linger);
+    if (!getsockopt( unix_fd, SOL_SOCKET, SO_LINGER, &linger, &optlen ))
+        setsockopt( fd, SOL_SOCKET, SO_LINGER, &linger, optlen );
+    if (addr.addr.sa_family == AF_INET6)
+    {
+        optlen = sizeof(value);
+        if (!getsockopt( unix_fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, &optlen ))
+            setsockopt( fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, optlen );
+        optlen = sizeof(value);
+        if (!getsockopt( unix_fd, IPPROTO_IPV6, IPV6_TCLASS, &value, &optlen ))
+            setsockopt( fd, IPPROTO_IPV6, IPV6_TCLASS, &value, optlen );
+    }
+    else
+    {
+        optlen = sizeof(value);
+        if (!getsockopt( unix_fd, IPPROTO_IP, IP_TOS, &value, &optlen ))
+            setsockopt( fd, IPPROTO_IP, IP_TOS, &value, optlen );
+    }
+    if (!(newfd = create_anonymous_fd( &sock_fd_ops, fd, &sock->obj, get_fd_options( sock->fd ) )))
+    {
+        clear_error();
+        return;
+    }
+    fd_copy_completion( sock->fd, newfd );
+    release_object( sock->fd );
+    sock->fd = newfd;
+    sock->dropped_addr = addr;
+    sock->dropped_addr_len = len;
+    sock_reselect( sock );
+}
+
+/* take back the address given up by drop_kernel_binding() */
+static int restore_kernel_binding( struct sock *sock, int unix_fd )
+{
+    if (!sock->dropped_addr_len) return 1;
+    if (is_address_listened_on( sock, &sock->dropped_addr ) ||
+        bind( unix_fd, &sock->dropped_addr.addr, sock->dropped_addr_len ))
+    {
+        set_error( sock_get_ntstatus( EADDRINUSE ) );
+        return 0;
+    }
+    sock->dropped_addr_len = 0;
+    return 1;
+}
+#endif
 static unsigned int sock_get_error( int err );
 static void poll_socket( struct sock *poll_sock, struct async *async, int exclusive, timeout_t timeout,
                          unsigned int count, const struct afd_poll_socket_64 *sockets );
 
+#ifdef WINE_IOS
+/* madeira: a bound on how long a TCP connect may stay pending.
+ *
+ * Darwin gives up on a peer that never answers the SYN after about 75 s and
+ * Windows after about 21 s; a Windows program that waits for the answer with a
+ * timeout of its own waits that long either way. Valve's client checks the
+ * connection to test.steampowered.com before it logs on and waits 60 s for an
+ * address that does not answer (a device log, 2026-11-15: 218.38.137.28:80,
+ * logon 61 s instead of 1 s). MADEIRA_CONNECT_TIMEOUT_MS = N (1000-120000)
+ * fails a connect still pending after N ms the way a refused SYN fails it:
+ * select reports the connect error, SO_ERROR and ConnectEx give
+ * WSAETIMEDOUT. Unset or 0: no bound, as before. Read once, when the first
+ * connect starts. The app sets it for Madeira Dock sessions. */
+static int madeira_connect_timeout_ms( void )
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        const char *e = getenv( "MADEIRA_CONNECT_TIMEOUT_MS" );
+        long v = e ? strtol( e, NULL, 10 ) : 0;
+        ms = (v >= 1000 && v <= 120000) ? (int)v : 0;
+        if (ms) fprintf( stderr, "[srv-conn-timeout] a TCP connect pending %d ms fails with WSAETIMEDOUT (MADEIRA_CONNECT_TIMEOUT_MS)\n", ms );
+    }
+    return ms;
+}
+
+static void madeira_connect_timeout_cancel( struct sock *sock )
+{
+    if (!sock->connect_timeout) return;
+    remove_timeout_user( sock->connect_timeout );
+    sock->connect_timeout = NULL;
+}
+
+static void madeira_connect_timed_out( void *private )
+{
+    static int logged;
+    struct sock *sock = private;
+    unsigned short dport = 0;
+
+    sock->connect_timeout = NULL;
+    if (sock->state != SOCK_CONNECTING || !sock->fd) return;
+
+    if (sock->peer_addr.addr.sa_family == WS_AF_INET) dport = ntohs( sock->peer_addr.in.sin_port );
+    else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) dport = ntohs( sock->peer_addr.in6.sin6_port );
+    if (logged < 32)
+    {
+        logged++;
+        fprintf( stderr, "[srv-conn-timeout] dport=%u still connecting after %ld ms: WSAETIMEDOUT to the program\n",
+                 dport, (long)((current_time - sock->connect_start) / 10000) );
+    }
+
+    /* sock_error() finds no SO_ERROR on a socket still connecting and takes
+     * this one, so the event below is the kernel's own failure path. */
+    sock->errors[AFD_POLL_BIT_CONNECT_ERR] = ETIMEDOUT;
+    sock_poll_event( sock->fd, POLLERR );
+}
+
+static void madeira_connect_timeout_start( struct sock *sock )
+{
+    int ms = madeira_connect_timeout_ms();
+
+    madeira_connect_timeout_cancel( sock );
+    if (!ms) return;
+    sock->connect_start = current_time;
+    sock->connect_timeout = add_timeout_user( -(timeout_t)ms * 10000, madeira_connect_timed_out, sock );
+}
+#endif
+
 static const struct object_ops sock_ops =
 {
-    sizeof(struct sock),          /* size */
-    &file_type,                   /* type */
-    sock_dump,                    /* dump */
-    NULL,                         /* add_queue */
-    NULL,                         /* remove_queue */
-    NULL,                         /* signaled */
-    NULL,                         /* satisfied */
-    no_signal,                    /* signal */
-    sock_get_fd,                  /* get_fd */
-    default_fd_get_sync,          /* get_sync */
-    default_map_access,           /* map_access */
-    default_get_sd,               /* get_sd */
-    default_set_sd,               /* set_sd */
-    no_get_full_name,             /* get_full_name */
-    no_lookup_name,               /* lookup_name */
-    no_link_name,                 /* link_name */
-    NULL,                         /* unlink_name */
-    no_open_file,                 /* open_file */
-    no_kernel_obj_list,           /* get_kernel_obj_list */
-    sock_close_handle,            /* close_handle */
-    sock_destroy                  /* destroy */
+    .size         = sizeof(struct sock),
+    .type         = &file_type,
+    .dump         = sock_dump,
+    .get_fd       = sock_get_fd,
+    .get_sync     = default_fd_get_sync,
+    .close_handle = sock_close_handle,
+    .destroy      = sock_destroy,
 };
 
 static const struct fd_ops sock_fd_ops =
 {
-    sock_get_poll_events,         /* get_poll_events */
-    sock_poll_event,              /* poll_event */
-    sock_get_fd_type,             /* get_fd_type */
-    no_fd_read,                   /* read */
-    no_fd_write,                  /* write */
-    no_fd_flush,                  /* flush */
-    default_fd_get_file_info,     /* get_file_info */
-    no_fd_get_volume_info,        /* get_volume_info */
-    sock_ioctl,                   /* ioctl */
-    sock_cancel_async,            /* cancel_async */
-    no_fd_queue_async,            /* queue_async */
-    sock_reselect_async           /* reselect_async */
+    .get_poll_events = sock_get_poll_events,
+    .poll_event      = sock_poll_event,
+    .get_fd_type     = sock_get_fd_type,
+    .get_file_info   = default_fd_get_file_info,
+    .set_file_info   = default_fd_set_file_info,
+    .ioctl           = sock_ioctl,
+    .cancel_async    = sock_cancel_async,
+    .reselect_async  = sock_reselect_async,
 };
 
 static int sockaddr_from_unix( const union unix_sockaddr *uaddr, struct WS_sockaddr *wsaddr, socklen_t wsaddrlen )
@@ -1524,6 +1822,9 @@ static void sock_poll_event( struct fd *fd, int event )
             sock->connect_time = current_time;
             sock->errors[AFD_POLL_BIT_CONNECT_ERR] = 0;
         }
+#ifdef WINE_IOS
+        if (sock->state != SOCK_CONNECTING) madeira_connect_timeout_cancel( sock );
+#endif
         break;
 
     case SOCK_LISTENING:
@@ -1851,7 +2152,13 @@ static void sock_destroy( struct object *obj )
 
     assert( obj->ops == &sock_ops );
 
+#ifdef WINE_IOS
+    madeira_connect_timeout_cancel( sock );
+#endif
+
     /* FIXME: special socket shutdown stuff? */
+
+    list_remove( &sock->listen_entry ); /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
 
     for (i = 0; i < 2; ++i)
     {
@@ -1899,6 +2206,10 @@ static struct sock *create_socket(void)
     sock->ifchange_obj = NULL;
     sock->accept_recv_req = NULL;
     sock->connect_req = NULL;
+#ifdef WINE_IOS
+    sock->connect_timeout = NULL;
+    sock->connect_start = 0;
+#endif
     sock->main_poll = NULL;
     memset( &sock->addr, 0, sizeof(sock->addr) );
     sock->addr_len = 0;
@@ -1920,6 +2231,8 @@ static struct sock *create_socket(void)
     sock->sndtimeo = 0;
     sock->icmp_fixup_data_len = 0;
     sock->bound_addr[0] = sock->bound_addr[1] = NULL;
+    list_init( &sock->listen_entry ); /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+    sock->dropped_addr_len = 0;
     init_async_queue( &sock->read_q );
     init_async_queue( &sock->write_q );
     init_async_queue( &sock->ifchange_q );
@@ -2775,12 +3088,32 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             return;
         }
 
+#ifdef __APPLE__
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+        /* restore_kernel_binding() does nothing unless a binding was given up (never with the switch off) */
+        if (is_tcp_socket( sock ) && sock->state != SOCK_LISTENING)
+        {
+            if (!restore_kernel_binding( sock, unix_fd )) return;
+            if (madeira_bsd_sockets() && is_unix_socket_listened_on( sock, unix_fd ))
+            {
+                drop_kernel_binding( sock, unix_fd );
+                set_error( sock_get_ntstatus( EADDRINUSE ) );
+                return;
+            }
+        }
+#endif
+
         if (listen( unix_fd, params->backlog ) < 0)
         {
             set_error( sock_get_ntstatus( errno ) );
             return;
         }
 
+#ifdef __APPLE__
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+        if (is_tcp_socket( sock ) && list_empty( &sock->listen_entry ) && madeira_bsd_sockets())
+            list_add_tail( &listening_tcp_socks, &sock->listen_entry );
+#endif
         sock->state = SOCK_LISTENING;
 
         /* a listening socket can no longer be accepted into */
@@ -2854,10 +3187,20 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             set_error( STATUS_INVALID_ADDRESS );
             return;
         }
+        if (sock->state == SOCK_UNCONNECTED) /* clear events */
+        {
+            sock->pending_events &= ~AFD_POLL_CONNECT_ERR;
+            sock->reported_events &= ~AFD_POLL_CONNECT_ERR;
+        }
         if (unix_addr.addr.sa_family == AF_INET && !memcmp( &unix_addr.in.sin_addr, magic_loopback_addr, 4 ))
             unix_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
 
         memcpy( &peer_addr, &unix_addr, sizeof(unix_addr) );
+#ifdef __APPLE__
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+        /* a no-op unless a binding was given up (never with the switch off) */
+        if (is_tcp_socket( sock ) && !restore_kernel_binding( sock, unix_fd )) return;
+#endif
         ret = connect( unix_fd, &unix_addr.addr, unix_len );
         if (ret < 0 && errno == ECONNABORTED)
         {
@@ -2869,6 +3212,23 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
              * sufficient. */
             ret = connect( unix_fd, &unix_addr.addr, unix_len );
         }
+
+#ifdef __APPLE__
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0156 (LGPL-2.1) */
+        if (ret < 0 && (errno == EISCONN || errno == EINVAL) && sock->state == SOCK_UNCONNECTED &&
+            is_tcp_socket( sock ) && madeira_bsd_sockets() && !is_fd_client_cached( sock->fd ))
+        {
+            /* BSD does not take a TCP socket whose connect() failed for another connect(); Linux
+             * and Windows do. Give it a new kernel socket with the same options and binding. */
+            int bound = sock->bound;
+
+            drop_kernel_binding( sock, unix_fd );
+            if (!bound) sock->dropped_addr_len = 0;
+            if ((unix_fd = get_unix_fd( sock->fd )) == -1) return;
+            if (!restore_kernel_binding( sock, unix_fd )) return;
+            ret = connect( unix_fd, &unix_addr.addr, unix_len );
+        }
+#endif
 
         if (ret < 0 && errno == EACCES && sock->state == SOCK_CONNECTIONLESS && unix_addr.addr.sa_family == AF_INET)
         {
@@ -2940,6 +3300,10 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (sock->type != WS_SOCK_DGRAM)
             sock->state = SOCK_CONNECTING;
+#ifdef WINE_IOS
+        if (sock->state == SOCK_CONNECTING && is_tcp_socket( sock ))
+            madeira_connect_timeout_start( sock );
+#endif
 
         if (params->synchronous && sock->nonblocking)
         {
@@ -3134,7 +3498,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
     {
         const struct afd_message_select_params *params = get_req_data();
 
-        if (get_req_data_size() < sizeof(params))
+        if (get_req_data_size() < sizeof(*params))
         {
             set_error( STATUS_BUFFER_TOO_SMALL );
             return;
@@ -3227,6 +3591,16 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         if (check_addr_usage( sock, &bind_addr, v6only ))
             return;
 
+#ifdef __APPLE__
+        /* as on Linux, an address a TCP socket listens on cannot be bound again.
+         * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+        if (is_tcp_socket( sock ) && madeira_bsd_sockets() && is_address_listened_on( sock, &bind_addr ))
+        {
+            set_error( sock_get_ntstatus( sock->reuseaddr ? EACCES : EADDRINUSE ) );
+            return;
+        }
+#endif
+
 #ifdef HAS_BLUETOOTH
         if (unix_addr.rfcomm.rc_family == AF_BLUETOOTH
             && !(unix_addr.rfcomm.rc_channel >= 1 && unix_addr.rfcomm.rc_channel <= 30))
@@ -3286,6 +3660,11 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (get_reply_max_size() >= sock->addr_len)
             set_reply_data( &sock->addr, sock->addr_len );
+#ifdef __APPLE__
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0150 (LGPL-2.1) */
+        if (is_tcp_socket( sock ) && sock->reuseaddr && sockaddr_port( &unix_addr ) && madeira_bsd_sockets())
+            drop_kernel_binding( sock, unix_fd );
+#endif
         return;
     }
 
@@ -3443,6 +3822,12 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         }
         rcvbuf = *(DWORD *)get_req_data();
         set_rcvbuf = max( rcvbuf, MIN_RCVBUF );
+
+        if (madeira_tcp_rcvbuf_keep( sock, rcvbuf ))
+        {
+            sock->rcvbuf = rcvbuf;
+            return;
+        }
 
         if (!setsockopt( unix_fd, SOL_SOCKET, SO_RCVBUF, (char *)&set_rcvbuf, sizeof(set_rcvbuf) ))
             sock->rcvbuf = rcvbuf;
@@ -3833,43 +4218,17 @@ struct ifchange
 
 static const struct object_ops ifchange_ops =
 {
-    sizeof(struct ifchange), /* size */
-    &no_type,                /* type */
-    ifchange_dump,           /* dump */
-    no_add_queue,            /* add_queue */
-    NULL,                    /* remove_queue */
-    NULL,                    /* signaled */
-    no_satisfied,            /* satisfied */
-    no_signal,               /* signal */
-    ifchange_get_fd,         /* get_fd */
-    default_get_sync,        /* get_sync */
-    default_map_access,      /* map_access */
-    default_get_sd,          /* get_sd */
-    default_set_sd,          /* set_sd */
-    no_get_full_name,        /* get_full_name */
-    no_lookup_name,          /* lookup_name */
-    no_link_name,            /* link_name */
-    NULL,                    /* unlink_name */
-    no_open_file,            /* open_file */
-    no_kernel_obj_list,      /* get_kernel_obj_list */
-    no_close_handle,         /* close_handle */
-    ifchange_destroy         /* destroy */
+    .size    = sizeof(struct ifchange),
+    .type    = &no_type,
+    .dump    = ifchange_dump,
+    .get_fd  = ifchange_get_fd,
+    .destroy = ifchange_destroy,
 };
 
 static const struct fd_ops ifchange_fd_ops =
 {
-    ifchange_get_poll_events, /* get_poll_events */
-    ifchange_poll_event,      /* poll_event */
-    NULL,                     /* get_fd_type */
-    no_fd_read,               /* read */
-    no_fd_write,              /* write */
-    no_fd_flush,              /* flush */
-    no_fd_get_file_info,      /* get_file_info */
-    no_fd_get_volume_info,    /* get_volume_info */
-    no_fd_ioctl,              /* ioctl */
-    NULL,                     /* cancel_async */
-    NULL,                     /* queue_async */
-    NULL                      /* reselect_async */
+    .get_poll_events = ifchange_get_poll_events,
+    .poll_event      = ifchange_poll_event,
 };
 
 static void ifchange_dump( struct object *obj, int verbose )
@@ -4055,27 +4414,11 @@ static struct object *socket_device_open_file( struct object *obj, unsigned int 
 
 static const struct object_ops socket_device_ops =
 {
-    sizeof(struct object),      /* size */
-    &device_type,               /* type */
-    socket_device_dump,         /* dump */
-    no_add_queue,               /* add_queue */
-    NULL,                       /* remove_queue */
-    NULL,                       /* signaled */
-    no_satisfied,               /* satisfied */
-    no_signal,                  /* signal */
-    no_get_fd,                  /* get_fd */
-    default_get_sync,           /* get_sync */
-    default_map_access,         /* map_access */
-    default_get_sd,             /* get_sd */
-    default_set_sd,             /* set_sd */
-    default_get_full_name,      /* get_full_name */
-    socket_device_lookup_name,  /* lookup_name */
-    directory_link_name,        /* link_name */
-    default_unlink_name,        /* unlink_name */
-    socket_device_open_file,    /* open_file */
-    no_kernel_obj_list,         /* get_kernel_obj_list */
-    no_close_handle,            /* close_handle */
-    no_destroy                  /* destroy */
+    .size        = sizeof(struct object),
+    .type        = &device_type,
+    .dump        = socket_device_dump,
+    .lookup_name = socket_device_lookup_name,
+    .open_file   = socket_device_open_file,
 };
 
 static void socket_device_dump( struct object *obj, int verbose )
@@ -4104,10 +4447,24 @@ static struct object *socket_device_open_file( struct object *obj, unsigned int 
     return &sock->obj;
 }
 
-struct object *create_socket_device( struct object *root, const struct unicode_str *name,
+struct object *create_socket_device( struct object *root, struct unicode_str name,
                                      unsigned int attr, const struct security_descriptor *sd )
 {
-    return create_named_object( root, &socket_device_ops, name, attr, sd );
+    struct object_params params = { .ops = &socket_device_ops, .root = root,
+                                    .name = name, .attr = attr, .sd = sd };
+
+    return create_named_object( &params );
+}
+
+/* poll() on Linux reports an unconnected stream socket as writable and hung up, so a send or
+ * receive on it is tried at once and fails with ENOTCONN, as on Windows. macOS reports nothing,
+ * and the request would wait for an event that never comes.
+ * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0151 (LGPL-2.1)
+ * Off (MADEIRA_BSD_SOCKETS=0): always 0, the request waits on poll() as before. */
+static int is_unconnected_stream( struct sock *sock )
+{
+    return sock->type == WS_SOCK_STREAM &&
+           (sock->state == SOCK_UNCONNECTED || sock->state == SOCK_LISTENING) && madeira_bsd_sockets();
 }
 
 DECL_HANDLER(recv_socket)
@@ -4134,7 +4491,8 @@ DECL_HANDLER(recv_socket)
          * asyncs will not consume all available data; if there's no data
          * available, the current request won't be immediately satiable.
          */
-        if ((!req->force_async && sock->nonblocking) ||
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0151 (LGPL-2.1) */
+        if ((!req->force_async && sock->nonblocking) || is_unconnected_stream( sock ) ||
             check_fd_events( sock->fd, req->oob && !is_oobinline( sock ) ? POLLPRI : POLLIN ))
         {
             /* Give the client opportunity to complete synchronously.
@@ -4157,7 +4515,7 @@ DECL_HANDLER(recv_socket)
     sock->pending_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
     sock->reported_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
 
-    if ((async = create_request_async( fd, get_fd_comp_flags( fd ), &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
         set_error( status );
 
@@ -4239,7 +4597,9 @@ DECL_HANDLER(send_socket)
          * asyncs will not consume all available space; if there's no space
          * available, the current request won't be immediately satiable.
          */
-        if ((!force_async && sock->nonblocking) || check_fd_events( sock->fd, POLLOUT ))
+        /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0151 (LGPL-2.1) */
+        if ((!force_async && sock->nonblocking) || is_unconnected_stream( sock ) ||
+            check_fd_events( sock->fd, POLLOUT ))
         {
             /* Give the client opportunity to complete synchronously.
              * If it turns out that the I/O request is not actually immediately satiable,
@@ -4267,8 +4627,7 @@ DECL_HANDLER(send_socket)
     if (status == STATUS_PENDING && !force_async && sock->nonblocking)
         status = STATUS_DEVICE_NOT_READY;
 
-    if ((async = create_request_async( fd, get_fd_comp_flags( fd ), &req->async,
-                                       req->flags & SERVER_SOCKET_IO_SYSTEM )))
+    if ((async = create_request_async( fd, &req->async, req->flags & SERVER_SOCKET_IO_SYSTEM )))
     {
         struct send_req *send_req;
         struct iosb *iosb = async_get_iosb( async );

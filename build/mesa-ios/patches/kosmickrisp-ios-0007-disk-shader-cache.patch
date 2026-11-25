@@ -1,0 +1,64 @@
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -20,6 +20,9 @@
+ #include "kosmickrisp/compiler/nir_to_msl.h"
+ 
+ #include "util/disk_cache.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "util/mesa-blake3.h"
+ #include "git_sha1.h"
+ 
+@@ -979,6 +982,43 @@
+    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
++
++#ifdef ENABLE_SHADER_CACHE
++   /* Madeira: keep compiled shaders (SPIR-V -> MSL) on disk so a game's
++    * first-launch shader compile is not lost when the app is closed, and a
++    * second launch skips what was already done. Upstream KosmicKrisp frees
++    * pdev->vk.disk_cache but never creates it. Off: MADEIRA_KK_DISK_CACHE=0
++    * (Mesa's own MESA_SHADER_CACHE_DISABLE=true also works). */
++   const char *kk_dc = getenv("MADEIRA_KK_DISK_CACHE");
++   if (kk_dc && !strcmp(kk_dc, "0")) {
++      fprintf(stderr, "[kk-disk-cache] off (MADEIRA_KK_DISK_CACHE=0)\n");
++      return;
++   }
++
++   /* iOS: $HOME is the app container, where $HOME/.cache can't be made.
++    * Use Library/Caches unless the app already chose a folder. */
++   const char *home = getenv("HOME");
++   if (!getenv("MESA_SHADER_CACHE_DIR") && !getenv("XDG_CACHE_HOME") && home) {
++      char dir[1024];
++      if (snprintf(dir, sizeof(dir), "%s/Library/Caches", home) <
++          (int)sizeof(dir))
++         setenv("MESA_SHADER_CACHE_DIR", dir, 0);
++   }
++   /* Detroit-sized games build ~100k pipelines; Mesa's default cap is 1G. */
++   setenv("MESA_SHADER_CACHE_MAX_SIZE", "4G", 0);
++
++   /* Key on the 32-byte digest made above (driver_build_sha is only
++    * VK_UUID_SIZE bytes, too short for _mesa_blake3_format). */
++   char timestamp[BLAKE3_HEX_LEN];
++   _mesa_blake3_format(timestamp, blake3);
++
++   pdev->vk.disk_cache = disk_cache_create("kosmickrisp", timestamp, 0);
++   fprintf(stderr, "[kk-disk-cache] %s dir=%s max=%s\n",
++           pdev->vk.disk_cache ? "on" : "FAILED (no cache this run)",
++           getenv("MESA_SHADER_CACHE_DIR") ? getenv("MESA_SHADER_CACHE_DIR")
++                                           : "(default)",
++           getenv("MESA_SHADER_CACHE_MAX_SIZE"));
++#endif
+ }
+ 
+ static void
+@@ -1223,6 +1263,7 @@
+    return VK_SUCCESS;
+ 
+ fail_disk_cache:
++   kk_physical_device_free_disk_cache(pdev);
+    vk_physical_device_finish(&pdev->vk);
+ fail_mtl_dev:
+    mtl_release(pdev->mtl_dev_handle);

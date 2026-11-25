@@ -71,7 +71,9 @@ require(detail.count('.padNoSystemFocus()') >= 2, "the game's page and its pages
 # The game's page: A on Play plays, A on a row opens it, the FPS row steps (PadHighlight items).
 page = library[library.index('// MARK: - New look game page'):library.index('// MARK: - New look: the starting screen')]
 require('.padItem("gp-play", capsule: true) { start() }' in page
-        and '.padItem("gp-fps", cornerRadius: 12, inset: -6) { entry.fpsMode = FPSChoice.next(after: entry.fpsMode) }' in page
+        # (stock-apple) the FPS row also takes D-pad left/right (adjust); A still steps it.
+        and '.padItem("gp-fps", cornerRadius: 12, inset: -6,' in page
+        and 'entry.fpsMode = FPSChoice.next(after: entry.fpsMode)' in page
         and 'static func next(after current: Int)' in library, 'A plays only on Play; A steps the FPS limit')
 require('.padLayer("game", start: lookReturn ?? "gp-play", back: { lookBack() }, play: { start() }, page: true)' in detail,
         "the game's page is a layer of its tab: B goes back, X is Play")

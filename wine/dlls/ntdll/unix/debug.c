@@ -33,6 +33,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <sys/statvfs.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -55,7 +58,6 @@ struct debug_info
 
 C_ASSERT( sizeof(struct debug_info) == 0x800 );
 
-static BOOL init_done;
 static struct debug_info initial_info;  /* debug info for initial thread */
 static unsigned char default_flags = (1 << __WINE_DBCL_ERR) | (1 << __WINE_DBCL_FIXME);
 static int nb_debug_options = -1;
@@ -64,36 +66,51 @@ static struct __wine_debug_channel *debug_options;
 
 static const char * const debug_classes[] = { "fixme", "err", "warn", "trace" };
 
-/* get the debug info pointer for the current thread */
-static inline struct debug_info *get_info(void)
+/* iOS-Madeira (flight-recorder, Cameron Nov 21: "is there like an ultimate perfect log ... you always
+ * have to add stuff to it"): extra trace channels that are formatted as usual but NOT written to the
+ * log (fd 2). Each line goes into a fixed ring of 512-byte slots in a shared file mapping,
+ * $HOME/Library/Caches/flight-recorder.bin (not Documents: no Files app, no backup; mode 0600; real
+ * blocks allocated before it is mapped, so a full disk can't SIGBUS a game), which outlives a crash or an iOS kill. The app copies the
+ * last 60 s of it into madeira-log.txt when a game run ends (LogTrail.swift, FlightRecorder).
+ * Channels: MADEIRA_FLIGHT_CHANNELS, WINEDEBUG syntax (default below). Lines WINEDEBUG itself asks
+ * for still go to the log as before. Size: MADEIRA_FLIGHT_MB (1-64, default 8).
+ * Off switch: MADEIRA_FLIGHT=0 (no channels added, nothing else changes).
+ * File layout (read by the app; keep both in step): a 4096-byte header, then slots. */
+#define FLIGHT_MAGIC   0x3152464dU   /* "MFR1" */
+#define FLIGHT_SLOT    512
+/* Cheap by default (review 1): DLL loads plus the warn class of the loader, process and thread code.
+ * trace+seh / trace+module / trace+process / trace+thread are hot in some games: opt in per game. */
+#define FLIGHT_DEFAULT "trace+loaddll,warn+loaddll,warn+module,warn+process,warn+thread"
+struct flight_header
 {
-    if (!init_done) return &initial_info;
-#ifdef WINE_IOS
-    /* iOS-Madeira ml379: a thread with NO TEB must not crash the logger.
-     *
-     * NtCurrentTeb() resolves through a pthread key on this port, and threads
-     * created outside wine (CEF/FEX worker threads, and any thread faulting
-     * before its TEB is registered) have no value for it. This function then
-     * computes NULL + teb_offset + sizeof(TEB32) = 0x3000 and
-     * __wine_dbg_header's `ldr w8,[x25,#4]` faults at 0x3004 — which raises
-     * another SIGSEGV at the SAME pc inside the handler that was reporting the
-     * first one, so it repeats until the debugger script kills the whole app.
-     *
-     * That single bug ate FOUR runs (ml370/374/375/376) and cost two wrong
-     * diagnoses, because the thread that does the logging is the thread that
-     * dies — the log just stops with no explanation. Fixing it at the source is
-     * what makes every ERR/WARN/TRACE in the port safe, rather than auditing
-     * call sites forever.
-     *
-     * initial_info is the same fallback used before init_done; concurrent use
-     * can interleave output, which is strictly better than a crash. */
-    if (!NtCurrentTeb()) return &initial_info;
-#endif
-#ifdef _WIN64
-    return (struct debug_info *)((TEB32 *)((char *)NtCurrentTeb() + teb_offset) + 1);
-#else
-    return (struct debug_info *)(NtCurrentTeb() + 1);
-#endif
+    unsigned int       magic;
+    unsigned int       slot_size;
+    unsigned int       slots;
+    unsigned int       version;     /* 1 */
+    unsigned long long next;        /* sequence number of the next line (lines ever written) */
+    unsigned long long opened_ms;   /* wall clock when this launch mapped it */
+};
+struct flight_slot
+{
+    unsigned long long seq;         /* line number + 1; 0 while being written */
+    unsigned long long ms;          /* wall clock, ms since 1970 */
+    unsigned short     len;
+    unsigned short     reserved;
+    char               text[FLIGHT_SLOT - 20];
+};
+C_ASSERT( sizeof(struct flight_slot) == FLIGHT_SLOT );
+static struct flight_header *flight;
+static struct flight_slot *flight_slots;
+static unsigned int flight_count;
+/* What WINEDEBUG alone asked for: lines it covers keep going to the log. */
+static struct __wine_debug_channel *print_options;
+static int nb_print_options;
+static unsigned char print_default;
+
+/* get the debug info pointer for the current thread */
+static inline struct debug_info *get_info( struct thread_data *data )
+{
+    return data ? (struct debug_info *)data->debug_info : &initial_info;
 }
 
 /* add a string to the output buffer */
@@ -217,6 +234,179 @@ static void debug_usage(void)
     exit(1);
 }
 
+/* iOS-Madeira (flight-recorder): only "trace+name" / "warn+name" entries (review 10): the ring's
+ * channel list can never turn a normal log class off or touch "all", pid or timestamp. */
+static void flight_parse_channels( const char *list )
+{
+    char *copy, *opt, *next;
+
+    if (!(copy = strdup( list ))) return;
+    for (opt = copy; opt; opt = next)
+    {
+        unsigned char set;
+        const char *name;
+
+        if ((next = strchr( opt, ',' ))) *next++ = 0;
+        if (!strncmp( opt, "trace+", 6 )) { set = 1 << __WINE_DBCL_TRACE; name = opt + 6; }
+        else if (!strncmp( opt, "warn+", 5 )) { set = 1 << __WINE_DBCL_WARN; name = opt + 5; }
+        else continue;
+        if (!name[0] || !strcmp( name, "all" ) || !strcmp( name, "pid" ) || !strcmp( name, "timestamp" )) continue;
+        add_option( name, set, 0 );
+    }
+    free( copy );
+}
+
+/* iOS-Madeira (flight-recorder): map the ring and add its channels on top of WINEDEBUG's. */
+static void flight_init( const char *app_name )
+{
+    const char *on = getenv( "MADEIRA_FLIGHT" ), *home = getenv( "HOME" );
+    const char *channels = getenv( "MADEIRA_FLIGHT_CHANNELS" ), *mb_text = getenv( "MADEIRA_FLIGHT_MB" );
+    const char *verbose = getenv( "MADEIRA_DEBUG_VERBOSE" );
+    static const char zeros[65536];
+    char path[1024];
+    unsigned int mb = mb_text ? atoi( mb_text ) : 8, slots;
+    size_t size, done;
+    struct stat st;
+    struct statvfs vfs;
+    void *map;
+    int fd, n;
+
+    if (on && (on[0] == '0' || !strcasecmp( on, "off" ) || !strcasecmp( on, "false" ) || !strcasecmp( on, "no" ))) return;
+    if (verbose && verbose[0] && verbose[0] != '0') return;   /* everything goes to the log already */
+    if (!home || !home[0]) return;
+    if (mb < 1 || mb > 64) mb = 8;
+    slots = (mb << 20) / FLIGHT_SLOT;
+    size = 4096 + (size_t)slots * FLIGHT_SLOT;
+    n = snprintf( path, sizeof(path), "%s/Library/Caches/flight-recorder.bin", home );
+    if (n < 0 || n >= (int)sizeof(path)) return;
+    /* Review 3: never map a sparse or shrinking file. A file of another size is replaced (a new inode,
+     * so a reader that still has the old one open is not cut short); a new file gets real blocks. */
+    if (!stat( path, &st ) && (size_t)st.st_size != size) unlink( path );
+    if ((fd = open( path, O_RDWR | O_CREAT | O_CLOEXEC, 0600 )) == -1) return;
+#ifdef F_SETPROTECTIONCLASS
+    fcntl( fd, F_SETPROTECTIONCLASS, 4 );   /* class D (none): readable while the phone is locked */
+#endif
+    if (fstat( fd, &st ) == -1) { close( fd ); return; }
+    if ((size_t)st.st_size != size)
+    {
+        /* keep 256 MB free for the game: no ring on a nearly full phone */
+        if (fstatvfs( fd, &vfs ) == -1 || (unsigned long long)vfs.f_bavail * vfs.f_frsize < size + (256ull << 20))
+        {
+            close( fd ); unlink( path ); return;
+        }
+        for (done = 0; done < size; )
+        {
+            size_t chunk = size - done < sizeof(zeros) ? size - done : sizeof(zeros);
+            ssize_t w = pwrite( fd, zeros, chunk, done );
+            if (w <= 0) { close( fd ); unlink( path ); return; }   /* ENOSPC or a short write: no ring */
+            done += w;
+        }
+        if (fsync( fd ) == -1) { close( fd ); unlink( path ); return; }
+    }
+    map = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+    close( fd );
+    if (map == MAP_FAILED) return;
+
+    /* Snapshot what WINEDEBUG prints before the ring's channels are added. */
+    if (!(print_options = malloc( (nb_debug_options + 1) * sizeof(*print_options) ))) { munmap( map, size ); return; }
+    if (nb_debug_options) memcpy( print_options, debug_options, nb_debug_options * sizeof(*print_options) );
+    nb_print_options = nb_debug_options;
+    print_default = default_flags;
+
+    flight_slots = (struct flight_slot *)((char *)map + 4096);
+    {
+        struct flight_header *h = map;
+        struct timeval tv;
+
+        if (h->magic != FLIGHT_MAGIC || h->slot_size != FLIGHT_SLOT || h->slots != slots || h->version != 1)
+        {
+            memset( map, 0, 4096 );   /* a new file: every slot's seq is 0 */
+            h->slot_size = FLIGHT_SLOT;
+            h->slots = slots;
+            h->version = 1;
+            __atomic_store_n( &h->magic, FLIGHT_MAGIC, __ATOMIC_RELEASE );
+        }
+        gettimeofday( &tv, NULL );
+        h->opened_ms = (unsigned long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    }
+    flight_count = slots;
+    flight_parse_channels( channels && channels[0] ? channels : FLIGHT_DEFAULT );
+    __atomic_store_n( &flight, (struct flight_header *)map, __ATOMIC_RELEASE );
+    (void)app_name;
+}
+
+/* iOS-Madeira (flight-recorder): the print flags WINEDEBUG alone gave `name`. */
+static unsigned char flight_print_flags( const char *name )
+{
+    int min = 0, max = nb_print_options - 1, pos, res;
+
+    while (min <= max)
+    {
+        pos = (min + max) / 2;
+        res = strcmp( name, print_options[pos].name );
+        if (!res) return print_options[pos].flags;
+        if (res < 0) max = pos - 1;
+        else min = pos + 1;
+    }
+    return print_default;
+}
+
+/* iOS-Madeira (flight-recorder): one line into the next slot. Lock-free: one atomic add. */
+static void flight_put( const char *str, size_t len )
+{
+    struct flight_slot *slot;
+    unsigned long long seq;
+    struct timeval tv;
+    size_t n = len;
+
+    gettimeofday( &tv, NULL );
+    seq = __atomic_fetch_add( &flight->next, 1, __ATOMIC_RELAXED );
+    slot = &flight_slots[seq % flight_count];
+    __atomic_store_n( &slot->seq, 0, __ATOMIC_RELAXED );
+    __atomic_thread_fence( __ATOMIC_RELEASE );
+    while (n && (str[n - 1] == '\n' || str[n - 1] == '\r')) n--;
+    if (n > sizeof(slot->text)) n = sizeof(slot->text);
+    memcpy( slot->text, str, n );
+    slot->len = n;
+    slot->ms = (unsigned long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    __atomic_store_n( &slot->seq, seq + 1, __ATOMIC_RELEASE );
+}
+
+/* iOS-Madeira (flight-recorder): a trace or warn line that only the ring asked for goes into the
+ * ring instead of fd 2; decided from the line's own "class:channel:" header, because the PE side's
+ * lines arrive here as text. Returns 1 when it took the line. A "\1" line (no header) goes to the
+ * log as before (review 4: the debug_info area is shared with the PE side, so no per-thread flag). */
+static int flight_take( const char *str, size_t len )
+{
+    const char *p = str, *end = str + len, *name;
+    unsigned char flags;
+    int i, cls;
+    char channel[16];
+
+    if (!flight || len < 8) return 0;
+    /* "123.456:" timestamp, "0024:" pid, "0028:" tid, each optional */
+    for (i = 0; i < 3; i++)
+    {
+        const char *q = p;
+        while (q < end && ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') || *q == '.' || *q == ' ')) q++;
+        if (q > p && q < end && *q == ':') p = q + 1;
+        else break;
+    }
+    if (end - p > 6 && !memcmp( p, "trace:", 6 )) { cls = __WINE_DBCL_TRACE; p += 6; }
+    else if (end - p > 5 && !memcmp( p, "warn:", 5 )) { cls = __WINE_DBCL_WARN; p += 5; }
+    else return 0;   /* err and fixme lines always go to the log */
+    name = p;
+    while (p < end && *p != ':' && p - name < 15) p++;
+    if (p >= end || *p != ':' || p == name) return 0;
+    memcpy( channel, name, p - name );
+    channel[p - name] = 0;
+
+    flags = flight_print_flags( channel );
+    if (flags & (1 << cls)) return 0;   /* WINEDEBUG asked for it: the log, as before */
+    flight_put( str, len );
+    return 1;
+}
+
 /* initialize all options at startup */
 static void init_options(void)
 {
@@ -234,6 +424,9 @@ static void init_options(void)
         default_flags = 0;
         return;
     }
+    setbuf( stdout, NULL );
+    setbuf( stderr, NULL );
+
     if (!wine_debug) return;
     if (!strcmp( wine_debug, "help" )) debug_usage();
 
@@ -241,6 +434,7 @@ static void init_options(void)
     while ((p = strpbrk( app_name, "/\\" ))) app_name = p + 1;
 
     parse_options( wine_debug, app_name );
+    flight_init( app_name );   /* iOS-Madeira (flight-recorder) */
 }
 
 /***********************************************************************
@@ -282,7 +476,7 @@ unsigned char __cdecl __wine_dbg_get_channel_flags( struct __wine_debug_channel 
  */
 const char * __cdecl __wine_dbg_strdup( const char *str )
 {
-    struct debug_info *info = get_info();
+    struct debug_info *info = get_info( get_thread_data() );
     unsigned int pos = info->str_pos;
     size_t n = strlen( str ) + 1;
 
@@ -299,6 +493,7 @@ NTSTATUS unixcall_wine_dbg_write( void *args )
 {
     struct wine_dbg_write_params *params = args;
 
+    if (flight_take( params->str, params->len )) return params->len;   /* iOS-Madeira (flight-recorder) */
     return write( 2, params->str, params->len );
 }
 
@@ -316,6 +511,7 @@ NTSTATUS wow64_wine_dbg_write( void *args )
 
     /* `args` is a host pointer (the WoW64 module converts
      * the outer one), but the string it points at is still a GUEST address. */
+    if (flight_take( ios_wow_host_ptr(params32->str), params32->len )) return params32->len;   /* iOS-Madeira (flight-recorder) */
     return write( 2, ios_wow_host_ptr(params32->str), params32->len );
 }
 #endif
@@ -325,14 +521,15 @@ NTSTATUS wow64_wine_dbg_write( void *args )
  */
 int __cdecl __wine_dbg_output( const char *str )
 {
-    struct debug_info *info = get_info();
+    struct debug_info *info = get_info( get_thread_data() );
     const char *end = strrchr( str, '\n' );
     int ret = 0;
 
     if (end)
     {
         ret += append_output( info, str, end + 1 - str );
-        write( 2, info->output, info->out_pos );
+        if (!flight_take( info->output, info->out_pos ))   /* iOS-Madeira (flight-recorder) */
+            write( 2, info->output, info->out_pos );
         info->out_pos = 0;
         str = end + 1;
     }
@@ -347,36 +544,31 @@ int __cdecl __wine_dbg_header( enum __wine_debug_class cls, struct __wine_debug_
                                const char *function )
 {
     static const char * const classes[] = { "fixme", "err", "warn", "trace" };
-    struct debug_info *info = get_info();
-    char *pos = info->output;
+    struct thread_data *data;
+    struct debug_info *info;
+    char *pos;
 
     if (!(__wine_dbg_get_channel_flags( channel ) & (1 << cls))) return -1;
+
+    data = get_thread_data();
+    info = get_info( data );
+    pos  = info->output;
 
     /* only print header if we are at the beginning of the line */
     if (info->out_pos) return 0;
 
-    if (init_done)
+    if (data)
     {
         if (TRACE_ON(timestamp))
         {
             UINT ticks = NtGetTickCount();
             pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%3u.%03u:", ticks / 1000, ticks % 1000 );
         }
-#ifdef WINE_IOS
-        /* ml379: GetCurrentProcessId/ThreadId read NtCurrentTeb()->ClientId
-         * (TEB+0x40/+0x48). On a TEB-less thread those are the SECOND and THIRD
-         * NULL derefs in this function — guarding get_info() alone still left
-         * the logger crashing here (verified in the disassembly: two more
-         * `bl _NtCurrentTeb; ldr x8,[x0,#0x40]` sites). Print a marker instead
-         * so such lines are still attributable. */
-        if (!NtCurrentTeb())
-            pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "no-teb:" );
-        else
-#endif
-        {
-        if (TRACE_ON(pid)) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", GetCurrentProcessId() );
-        pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", GetCurrentThreadId() );
-        }
+        if (TRACE_ON(pid)) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:",
+                                         /* Madeira: pseudo-processes share this unix lib, so the process-global pid is
+                                          * only right for the first one; read the caller's TEB when it has one. */
+                                         data->teb ? HandleToULong(data->teb->ClientId.UniqueProcess) : pid );
+        if (data->tid) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", data->tid );
     }
     if (function && cls < ARRAY_SIZE( classes ))
         pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%s:%s:%s ",
@@ -392,9 +584,6 @@ void dbg_init(void)
 {
     struct __wine_debug_channel *options, default_option = { default_flags };
 
-    setbuf( stdout, NULL );
-    setbuf( stderr, NULL );
-
     if (nb_debug_options == -1) init_options();
 
     options = (struct __wine_debug_channel *)((char *)peb + (is_win64 ? 2 : 1) * page_size);
@@ -402,7 +591,6 @@ void dbg_init(void)
     free( debug_options );
     debug_options = options;
     options[nb_debug_options] = default_option;
-    init_done = TRUE;
 }
 
 

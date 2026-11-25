@@ -525,19 +525,6 @@ static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static int g_lzlib = -1;   /* madeira-bcd pso-lazy-libs, see mad_lzlib_on */
 static volatile LONG g_lzlib_dropped, g_lzlib_kept, g_lzlib_restored, g_lzlib_failed;
-/* madeira pso-evict-idle / pso-mem-log (opt-in), see mad_ev_tick */
-struct mad_pso;
-static int g_ev = -1;                        /* pso-evict-idle seconds, 0 = off, -1 = not read yet */
-static int g_pml = -1;                       /* pso-mem-log */
-static volatile LONG g_ev_now = 1;           /* seconds since the first present + 1; stamped on a pipeline at each use */
-static SRWLOCK g_ev_replay = SRWLOCK_INIT;   /* every list replay holds it shared; a scan only TRIES it exclusive */
-static volatile LONG g_pm_psos, g_pm_rps, g_pm_var, g_pm_cps;   /* pipeline objects alive; built render / variant / compute states */
-static volatile LONG g_ev_evicted_r, g_ev_evicted_c, g_ev_evicted_libs, g_ev_rebuilt, g_ev_scans, g_ev_busy, g_ev_unshared;
-static void mad_ev_config(void);
-static void mad_ev_note_built(struct mad_pso *p);
-static void mad_ev_forget(struct mad_pso *p);
-static void mad_ev_tick(void);
-#define MAD_EV_STAMP(p_) do { if (g_ev > 0 && (p_)->ev_last != g_ev_now) (p_)->ev_last = g_ev_now; } while (0)
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
@@ -1144,12 +1131,6 @@ static void mad_acct_report(void) {
         d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), %ld read "
                   "them back at first use (%ld failed)\n", (long)g_lzlib_dropped, (long)g_lzlib_kept, (long)g_lzlib_restored,
                   (long)g_lzlib_failed);
-    if (g_ev > 0 || g_pml > 0)   /* madeira pso-evict-idle / pso-mem-log */
-        d3d12_log("[pso-evict] session: %ld render and %ld compute pipelines let go (%ld with their shader libraries, %ld shared-table "
-                  "entries), %ld built again; %ld scans, %ld waited for a replay. Alive now: %ld pipelines, %ld render + %ld variant "
-                  "+ %ld compute states built\n", (long)g_ev_evicted_r, (long)g_ev_evicted_c, (long)g_ev_evicted_libs,
-                  (long)g_ev_unshared, (long)g_ev_rebuilt, (long)g_ev_scans, (long)g_ev_busy, (long)g_pm_psos, (long)g_pm_rps,
-                  (long)g_pm_var, (long)g_pm_cps);
 }
 static void mad_smpdesc_put(UINT64 id, UINT filter, UINT au, UINT av, UINT aw, UINT aniso, UINT cmp, UINT border,
                             float minlod, float maxlod, float bias) {   /* madeira-bcd: see g_smpdesc */
@@ -1276,6 +1257,8 @@ static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource
 }
 
 DEFINE_GUID(IID_IMTLDXGIDevice, 0x6bfa1657, 0x9cb1, 0x471a, 0xa4, 0xfb, 0x7c, 0xac, 0xf8, 0xa8, 0x12, 0x07);
+/* swap-factory: DXMT v0.80's dxgi.dll asks the device for this instead of IMTLDXGIDevice (dxmt/src/dxgi/dxgi_interfaces.h) */
+DEFINE_GUID(IID_IMTLSwapChainFactory, 0x6c030003, 0x460a, 0x4b19, 0x90, 0x9b, 0x38, 0xf9, 0x7d, 0x20, 0x3e, 0x45);
 /* ml1300: not in the toolchain's d3d12.h (it ends at List7); value from Microsoft's DirectX-Headers d3d12.idl */
 DEFINE_GUID(IID_ID3D12GraphicsCommandList8, 0xee936ef9, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51);
 
@@ -1395,13 +1378,6 @@ struct mad_pso {
     struct madeira_ir_air_range *ps_air;
     struct mad_tess *tess;                          /* ml1083: hull/domain as an object/mesh pipeline, NULL if not built */
     struct mad_tess *tess_strip;                    /* ml1147b: a DXBC geometry pipeline's STRIP-topology variant */
-    /* madeira pso-evict-idle: on the list of built lazy pipelines while it holds a
-     * Metal pipeline (mad_ev_note_built); ev_last = g_ev_now at its last draw,
-     * dispatch or build; ev_count = times its Metal objects were let go.
-     * pm_r / pm_c: rps / cps is counted in the pso-mem-log census. */
-    struct mad_pso *ev_prev, *ev_next; int ev_in;
-    volatile LONG ev_last; LONG ev_count;
-    UINT8 pm_r, pm_c;
 };
 
 /* ml1083: TESSELLATION.
@@ -2174,8 +2150,14 @@ struct mad_queue {
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
+static HRESULT mad_queue_swapfactory_tearoff(struct mad_queue *q, void **out);
+static int mad_swapfactory_enabled(void);
 static HRESULT STDMETHODCALLTYPE queue_QI(ID3D12CommandQueue *This, REFIID riid, void **out) {
-    HRESULT hr = mad_qi((struct mad_obj *)This, riid, out, 1);
+    HRESULT hr;
+    /* checked before mad_qi so a working run doesn't log a "refused" line for it */
+    if (out && IsEqualGUID(riid, &IID_IMTLSwapChainFactory) && mad_swapfactory_enabled())
+        return mad_queue_swapfactory_tearoff((struct mad_queue *)This, out);
+    hr = mad_qi((struct mad_obj *)This, riid, out, 1);
     if (hr == E_NOINTERFACE && IsEqualGUID(riid, &IID_IMTLDXGIDevice))
         return mad_queue_dxgi_tearoff((struct mad_queue *)This, out);
     return hr;
@@ -6251,7 +6233,6 @@ static enum WMTPrimitiveType mad_prim(D3D12_PRIMITIVE_TOPOLOGY t) {
 static volatile LONG g_pso_lazy_built, g_pso_lazy_failed;
 static int mad_lzlib_restore(struct mad_pso *p);   /* madeira-bcd pso-lazy-libs */
 static obj_handle_t mad_pso_realize(struct mad_pso *p) {
-    int built_now = 0;   /* madeira pso-evict-idle */
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
     if (!p->rps && p->lazy) {
@@ -6261,7 +6242,6 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
             built = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
                               : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
         if (built) { MemoryBarrier(); p->rps = built; }   /* pso-async: draws on other threads read rps without the lock */
-        if (built) { built_now = 1; p->pm_r = 1; InterlockedIncrement(&g_pm_rps); }   /* madeira pso-mem-log */
         if (err) mad_log_nserror(p->vs_name, err);
         InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
@@ -6276,12 +6256,10 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
         }
     }
     ReleaseSRWLockExclusive(&p->rlock);
-    if (built_now) mad_ev_note_built(p);   /* madeira pso-evict-idle: on the list, stamped as just used */
     return p->rps;
 }
 
 static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
-    int built_now = 0;   /* madeira pso-evict-idle */
     if (p->cps || !p->lazy_cs) return p->cps;
     AcquireSRWLockExclusive(&p->rlock);
     if (!p->cps && p->lazy_cs) {
@@ -6296,10 +6274,9 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy_cs = 0;   /* dispatches with it are skipped from now on */
             if (n <= 8) d3d12_log("[madeira-d3d12] lazy compute pipeline failed at first dispatch (%s); its dispatches are skipped\n", p->vs_name);
-        } else { InterlockedIncrement(&g_pso_lazy_built); built_now = 1; p->pm_c = 1; InterlockedIncrement(&g_pm_cps); }
+        } else InterlockedIncrement(&g_pso_lazy_built);
     }
     ReleaseSRWLockExclusive(&p->rlock);
-    if (built_now) mad_ev_note_built(p);   /* madeira pso-evict-idle */
     return p->cps;
 }
 
@@ -6508,8 +6485,7 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides[16
                                   strides[0], p->vb_stride[0], strides[1]);
         LeaveCriticalSection(&p->var_lock); return p->rps;
     }
-    if (p->nvar < 8) { memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++;
-                       InterlockedIncrement(&g_pm_var); }   /* madeira pso-mem-log */
+    if (p->nvar < 8) { memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++; }
     else { NSObject_release(p->var[0].rps); memmove(&p->var[0], &p->var[1], sizeof p->var[0] * 7);
            memcpy(p->var[7].strides, strides, sizeof p->var[0].strides); p->var[7].rps = rps; }
     if (said < 8) { said++; d3d12_log("[madeira-d3d12] pipeline stride variant built (%u variants cached)\n", p->nvar); }
@@ -8635,7 +8611,6 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
-    MAD_EV_STAMP(e->pso);   /* madeira pso-evict-idle: in use */
     if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution */
         if (mad_fault_skip_pso(e->pso)) { MAD_SKIP(e); return; }
         mad_fault_note(e, e->pso);
@@ -10003,7 +9978,6 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
-    MAD_EV_STAMP(e->cpso);   /* madeira pso-evict-idle: in use */
     /* ml930: pre-dispatch captures FIRST. exec_capture_cs blits through
      * exec_begin_blit, which ends every open encoder; doing it after the
      * compute encoder was created left e->cenc = 0 and the dispatch encoded
@@ -10627,11 +10601,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         }
         if (rp_k.renc && l != rp_want) mad_rp_close(q);   /* madeira-bcd rp-carry: handed to a list that is not this one */
         q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next; q->rp_idx = i;
-        if (l) {   /* madeira pso-evict-idle: no pipeline is let go while a list is replayed (mad_ev_scan) */
-            AcquireSRWLockShared(&g_ev_replay);
-            mad_exec_list(q, l, q->open_cb);   /* times itself */
-            ReleaseSRWLockShared(&g_ev_replay);
-        }
+        if (l) mad_exec_list(q, l, q->open_cb);   /* times itself */
         if (rs) rs_t = mad_tick();
         q->open_lists++;
         q->executed++;
@@ -11719,25 +11689,13 @@ static D3D_FEATURE_LEVEL mad_fl_ceiling(void) {
  * Whether the converter takes every 6.7 shader is not known; one it refuses
  * fails its pipeline as any other conversion failure does. 0x67 is
  * D3D_SHADER_MODEL_6_7 (named by value: older headers stop at 6_6). */
-/* d3d12-sm-max = 60..67 (6.0..6.7) caps it lower instead, e.g. 62 for shader model 6.2,
- * for an engine that picks a simpler shader path when the device reports less.
- * It wins over d3d12-sm-6-7. Out-of-range values are ignored. */
 static D3D_SHADER_MODEL mad_sm_ceiling(void) {
     static int v = -1;
-    static D3D_SHADER_MODEL cap;
     if (v < 0) {
-        long long mx = mad_cfg_int_pe("d3d12-sm-max", 0);
         v = mad_cfg_int_pe("d3d12-sm-6-7", 0) ? 1 : 0;   /* 1: SHADER_MODEL reports up to 6.7 (6.6 otherwise); the converter may still refuse a 6.7 shader */
-        cap = v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
-        if (mx >= 60 && mx <= 67) {
-            cap = (D3D_SHADER_MODEL)(0x60 + (mx - 60));
-            d3d12_log("[d3d12-caps] sm-max=%lld (d3d12-sm-max): SHADER_MODEL reports up to %d.%d\n", mx, (int)(cap >> 4), (int)(cap & 0xf));
-        } else {
-            if (mx) d3d12_log("[d3d12-caps] d3d12-sm-max=%lld ignored (use 60..67)\n", mx);
-            if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
-        }
+        if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
     }
-    return cap;
+    return v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
 }
 
 /* env.MADEIRA_D3D12_CAPS_BY_FAMILY = 1 (opt-in, off by default). The
@@ -12480,7 +12438,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
         struct mad_device *md = (struct mad_device *)This;
         if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             bytes = d->Width;
-            MTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
+            MadeiraMTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
         } else {
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int isd;
             UINT subs = (d->MipLevels ? d->MipLevels : 1) *
@@ -12488,7 +12446,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
             if (mad_texinfo_from_desc(d, &ti, &pf, &isd) && ((ti.width && ti.height) || !mad_zero_extent_guard()))   /* d3d12-zero-extent-guard: Metal aborts on a zero extent */
-                MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
+                MadeiraMTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
         }
         /* ml1145: a placed resource is really placed now, so the application must
          * plan its heap with the size and alignment Metal needs, not the linear
@@ -15183,7 +15141,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if ((!ti.width || !ti.height) && mad_zero_extent_guard()) { free(r); mad_refuse_log(desc, heap_type, "zero-size texture (Metal aborts the process on it)"); return E_INVALIDARG; }
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
-            MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
+            MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
             if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
                 r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
             if (r->texture) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
@@ -15192,7 +15150,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->texture && !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             && ti.sample_count <= 1) {   /* ml1072 */
             UINT64 hsz = 0, hal = 0, hoff = 0; int hidx;
-            MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &hsz, &hal);
+            MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &hsz, &hal);
             if (hsz && hsz <= MAD_HP_MAX_TEX && (hidx = mad_hp_alloc(d, hsz, hal, &hoff)) >= 0) {
                 r->texture = MTLHeap_newTextureAtOffset(d->theaps[hidx].heap, &ti, hoff);
                 if (r->texture) { r->hp_used = 1; r->hp_heap = (unsigned)hidx; r->hp_off = hoff; r->hp_size = hsz; InterlockedIncrement(&d->hp_textures); }
@@ -15232,7 +15190,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? MAD_CAT_TEX_UAV : MAD_CAT_TEX_PLAIN, bytes, +1);
             if (!r->hp_used) {   /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it */
                 UINT64 msz = 0, mal = 0;
-                MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
+                MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
                 if (msz) {
                     r->metal_bytes = msz;
                     InterlockedExchangeAdd64(&g_sa_tex_bytes, (LONG64)msz);
@@ -15266,7 +15224,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         info.memory.ptr = NULL;
         if (ph && ph->mtl && heap_type == D3D12_HEAP_TYPE_DEFAULT) {   /* ml1145: inside the application's heap */
             UINT64 psz = 0, pal = 0;
-            MTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
+            MadeiraMTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
             if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
                 r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff);
             if (r->buffer) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
@@ -15607,11 +15565,6 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
     struct mad_pso *p = (struct mad_pso *)T;
     LONG n = InterlockedDecrement(&p->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
-        mad_ev_forget(p);   /* madeira pso-evict-idle: off the list before it goes */
-        InterlockedDecrement(&g_pm_psos);   /* madeira pso-mem-log */
-        if (p->pm_r) InterlockedDecrement(&g_pm_rps);
-        if (p->pm_c) InterlockedDecrement(&g_pm_cps);
-        if (p->nvar) InterlockedExchangeAdd(&g_pm_var, -(LONG)p->nvar);
         if (p->rps) NSObject_release(p->rps);
         { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
@@ -18169,288 +18122,6 @@ static int mad_lzlib_restore(struct mad_pso *p) {
     return 1;
 }
 
-/* madeira pso-evict-idle (madeira.cfg or the game's own file, off by default)
- * and pso-mem-log.
- *
- * pso-lazy builds a pipeline at its first draw and pso-lazy-libs keeps its
- * shader libraries out of memory until then, but once a pipeline has been drawn
- * its Metal pipeline state, its stride variants and its libraries stay until the
- * game releases the pipeline, which most engines never do: a game that streams
- * new areas and cutscenes keeps every pipeline it ever drew. This is the
- * Direct3D 12 counterpart of the MoltenVK patches 0001/0002 that got Detroit:
- * Become Human through its shader compile: with pso-evict-idle = N, a lazy
- * pipeline not drawn or dispatched for N seconds lets its Metal pipeline objects
- * go, and with pso-lazy-libs = 1 also its shader libraries when their
- * shader-cache files are still there; its next draw builds it again through
- * mad_pso_realize exactly as its first draw did (with pso-async, in the
- * background while its draws are skipped).
- *
- * Safety. A draw reads p->rps more than once without a lock, so pipelines are
- * let go only while no command list is replayed: every replay holds g_ev_replay
- * shared, and a scan (from Present) only TRIES it exclusive and waits for a
- * later frame when a replay is running. Nothing ever blocks on it exclusive, so
- * it cannot deadlock. The scan takes its own reference to each candidate first
- * and checks the shader-cache files with no lock held. The Metal objects it lets
- * go wait MAD_EV_RETIRE_MS on a retire list before they are released: command
- * buffers retain what they encode, and a pipeline idle for N seconds is in no
- * command buffer submitted in that time, so this is a second margin.
- * Only plain lazy pipelines (no geometry or tessellation emulation) qualify.
- * pso-evict-headroom-mb = M: scan only while iOS reports less than M MB left.
- * pso-mem-log = 1: a [pso-mem] census line every 10 s. */
-#define MAD_EV_SCAN_MS 2000
-#define MAD_EV_RETIRE_MS 5000
-#define MAD_EV_BUDGET 256
-static int g_ev_headroom;
-static SRWLOCK g_ev_list_lock = SRWLOCK_INIT;
-static struct mad_pso *g_ev_head;
-static LONG g_ev_listed;
-struct mad_ev_ret { obj_handle_t h; DWORD t; };
-static struct mad_ev_ret *g_ev_ret; static SIZE_T g_ev_ret_n, g_ev_ret_cap;
-static SRWLOCK g_ev_ret_lock = SRWLOCK_INIT;
-static void mad_ev_config(void) {
-    long long s, h; int pml;
-    if (g_ev >= 0) return;
-    s = mad_cfg_int_pe("pso-evict-idle", 0);   /* Default 0 (off). N seconds: a Direct3D 12 pipeline not drawn for N s lets its Metal pipeline go and is built again at its next draw; with pso-lazy-libs = 1 its shader libraries too. 5-3600. [pso-evict] lines */
-    h = mad_cfg_int_pe("pso-evict-headroom-mb", 0);   /* With pso-evict-idle: let idle pipelines go only while iOS reports less than this many MB left before the memory limit. 0 (default): whenever they are idle */
-    pml = mad_cfg_int_pe("pso-mem-log", 0) ? 1 : 0;   /* 1: every 10 s a [pso-mem] line counts the Direct3D 12 pipelines and shader libraries held, with the memory footprint. Default 0 */
-    if (s < 0) s = 0;
-    if (s > 0 && s < 5) s = 5;
-    if (s > 3600) s = 3600;
-    g_ev_headroom = h > 0 ? (int)h : 0;
-    g_pml = pml;
-    MemoryBarrier();
-    g_ev = (int)s;
-    if (s)
-        d3d12_log("[pso-evict] pso-evict-idle = %lld: pipelines idle for %lld s let their Metal pipelines go%s%s; "
-                  "built again at their next use\n", s, s,
-                  g_lzlib > 0 || mad_lzlib_on() ? " and their shader libraries (pso-lazy-libs)" : " (shader libraries kept: pso-lazy-libs is off)",
-                  g_ev_headroom ? "" : ", whatever the memory headroom");
-    if (s && g_ev_headroom) d3d12_log("[pso-evict] only while less than %d MB are left (pso-evict-headroom-mb)\n", g_ev_headroom);
-    if (s && !mad_pso_lazy_on()) d3d12_log("[pso-evict] pso-lazy = 0: pipelines are built at creation, so none can be let go\n");
-    if (pml) d3d12_log("[pso-mem] pso-mem-log = 1: a census of pipelines and shader libraries every 10 s\n");
-}
-/* phys_footprint and what iOS leaves before the limit, in MB (winemetal op 7). */
-static int mad_ev_mem(UINT64 *foot_mb, UINT64 *avail_mb) {
-    struct madeira_ctl_args a;
-    memset(&a, 0, sizeof a); a.op = 7;
-    MadeiraCtl(&a);
-    if (!a.ret) return 0;
-    *foot_mb = a.ptr >> 20; *avail_mb = a.len >> 20;
-    return 1;
-}
-static void mad_ev_unlink(struct mad_pso *p) {   /* g_ev_list_lock held exclusive */
-    if (!p->ev_in) return;
-    if (p->ev_prev) p->ev_prev->ev_next = p->ev_next; else g_ev_head = p->ev_next;
-    if (p->ev_next) p->ev_next->ev_prev = p->ev_prev;
-    p->ev_prev = p->ev_next = NULL; p->ev_in = 0; g_ev_listed--;
-}
-/* A lazy pipeline just got its Metal pipeline (mad_pso_realize / mad_cpso_realize). */
-static void mad_ev_note_built(struct mad_pso *p) {
-    p->ev_last = g_ev_now;
-    if (p->ev_count) InterlockedIncrement(&g_ev_rebuilt);
-    if (g_ev <= 0) return;
-    AcquireSRWLockExclusive(&g_ev_list_lock);
-    if (!p->ev_in) {
-        p->ev_prev = NULL; p->ev_next = g_ev_head;
-        if (g_ev_head) g_ev_head->ev_prev = p;
-        g_ev_head = p; p->ev_in = 1; g_ev_listed++;
-    }
-    ReleaseSRWLockExclusive(&g_ev_list_lock);
-}
-/* pso_Release, last reference: a scan that holds the list lock finishes with p first. */
-static void mad_ev_forget(struct mad_pso *p) {
-    if (g_ev <= 0) return;   /* nothing is listed unless the switch was on when it was built */
-    AcquireSRWLockExclusive(&g_ev_list_lock);
-    mad_ev_unlink(p);
-    ReleaseSRWLockExclusive(&g_ev_list_lock);
-}
-static void mad_ev_retire(obj_handle_t h, DWORD now) {
-    if (!h) return;
-    AcquireSRWLockExclusive(&g_ev_ret_lock);
-    if (g_ev_ret_n == g_ev_ret_cap) {
-        SIZE_T nc = g_ev_ret_cap ? g_ev_ret_cap * 2 : 1024;
-        struct mad_ev_ret *nw = realloc(g_ev_ret, nc * sizeof *nw);
-        if (nw) { g_ev_ret = nw; g_ev_ret_cap = nc; }
-    }
-    if (g_ev_ret_n < g_ev_ret_cap) { g_ev_ret[g_ev_ret_n].h = h; g_ev_ret[g_ev_ret_n].t = now; g_ev_ret_n++; h = 0; }
-    ReleaseSRWLockExclusive(&g_ev_ret_lock);
-    if (h) NSObject_release(h);   /* no room on the list: it was idle anyway */
-}
-/* Releases what waited MAD_EV_RETIRE_MS; logs the footprint around a large batch. */
-static void mad_ev_reap(DWORD now) {
-    static unsigned said;
-    SIZE_T i, k = 0; LONG n = 0;
-    UINT64 f0 = 0, a0 = 0, f1 = 0, a1 = 0;
-    int big, m0 = 0;
-    obj_handle_t pool;
-    AcquireSRWLockExclusive(&g_ev_ret_lock);
-    for (i = 0; i < g_ev_ret_n && now - g_ev_ret[i].t >= MAD_EV_RETIRE_MS; i++) n++;
-    big = n >= 64 && (said < 16 || !(said % 25));
-    if (big) m0 = mad_ev_mem(&f0, &a0);
-    pool = n ? NSAutoreleasePool_alloc_init() : 0;
-    for (i = 0; i < g_ev_ret_n; i++) {
-        if (now - g_ev_ret[i].t >= MAD_EV_RETIRE_MS) NSObject_release(g_ev_ret[i].h);
-        else g_ev_ret[k++] = g_ev_ret[i];
-    }
-    g_ev_ret_n = k;
-    if (pool) NSObject_release(pool);
-    ReleaseSRWLockExclusive(&g_ev_ret_lock);
-    if (n >= 64) said++;
-    if (big && m0 && mad_ev_mem(&f1, &a1))
-        d3d12_log("[pso-evict] released %ld Metal objects: footprint %llu -> %llu MB (%+lld MB), %llu MB left\n", (long)n,
-                  (unsigned long long)f0, (unsigned long long)f1, (long long)f1 - (long long)f0, (unsigned long long)a1);
-}
-static int mad_ev_cmp_h(const void *a, const void *b) {
-    obj_handle_t x = *(const obj_handle_t *)a, y = *(const obj_handle_t *)b;
-    return x < y ? -1 : x > y;
-}
-/* The shared-library table keeps one reference to every library it holds, so a
- * library an evicted pipeline let go is only freed once its entry goes too.
- * Entries are taken out in one pass and the table is rebuilt (linear probing has
- * no deletion of its own). A pipeline still using one keeps its own reference;
- * a later read-back of the same stage then makes a library of its own. */
-static LONG mad_ev_unshare(obj_handle_t *libs, SIZE_T n, DWORD now) {
-    SIZE_T i, cap; LONG removed = 0;
-    struct mad_libshare *old, *nw;
-    if (!n) return 0;
-    qsort(libs, n, sizeof *libs, mad_ev_cmp_h);
-    AcquireSRWLockExclusive(&g_libshare_lock);
-    old = g_libshare; cap = g_libshare_cap;
-    for (i = 0; old && i < cap; i++)
-        if (old[i].lib && bsearch(&old[i].lib, libs, n, sizeof *libs, mad_ev_cmp_h)) {
-            mad_ev_retire(old[i].fn, now); mad_ev_retire(old[i].lib, now);
-            old[i].lib = old[i].fn = 0; old[i].k0 = old[i].k1 = 0;
-            removed++;
-        }
-    if (removed && (nw = calloc(cap, sizeof *nw))) {   /* without memory the holes only turn later lookups into misses */
-        g_libshare = nw;
-        for (i = 0; i < cap; i++) if (old[i].lib) *mad_libshare_slot(old[i].k0, old[i].k1) = old[i];
-        free(old);
-    }
-    g_libshare_n -= (SIZE_T)removed;
-    ReleaseSRWLockExclusive(&g_libshare_lock);
-    return removed;
-}
-/* One pipeline, with g_ev_replay held exclusive and the list lock held: 1 let
- * go, 0 busy (another thread holds it; next scan), -1 not one this can let go. */
-static int mad_ev_evict(struct mad_pso *p, DWORD now, int libs_ok, obj_handle_t *libs, SIZE_T *nl) {
-    unsigned k;
-    if (!TryAcquireSRWLockExclusive(&p->rlock)) return 0;
-    if (p->is_compute ? (!p->lazy_cs || !p->cps)
-                      : (!p->lazy || !p->rps || p->tess || p->tess_strip || p->gs_emu || p->has_tess)) {
-        ReleaseSRWLockExclusive(&p->rlock);
-        return -1;
-    }
-    if (!p->is_compute && p->has_vd && !TryEnterCriticalSection(&p->var_lock)) { ReleaseSRWLockExclusive(&p->rlock); return 0; }
-    if (p->is_compute) {
-        mad_ev_retire(p->cps, now); p->cps = 0;
-        if (p->pm_c) { p->pm_c = 0; InterlockedDecrement(&g_pm_cps); }
-    } else {
-        mad_ev_retire(p->rps, now); p->rps = 0;
-        if (p->pm_r) { p->pm_r = 0; InterlockedDecrement(&g_pm_rps); }
-        for (k = 0; k < p->nvar; k++) { mad_ev_retire(p->var[k].rps, now); p->var[k].rps = 0; }
-        if (p->nvar) InterlockedExchangeAdd(&g_pm_var, -(LONG)p->nvar);
-        p->nvar = 0;
-        if (p->has_vd) LeaveCriticalSection(&p->var_lock);
-    }
-    InterlockedExchange(&p->async_q, 0);   /* pso-async: its next draw queues it again */
-    if (libs_ok && !p->lz && p->vs_fn && (!p->lz_has_ps || p->ps_fn)) {   /* pso-lazy-libs: back from the cache at the next use */
-        libs[(*nl)++] = p->vs_lib;
-        if (p->ps_lib) libs[(*nl)++] = p->ps_lib;
-        mad_ev_retire(p->vs_fn, now); mad_ev_retire(p->vs_lib, now);
-        mad_ev_retire(p->ps_fn, now); mad_ev_retire(p->ps_lib, now);
-        p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
-        if (!p->is_compute) p->rp.vertex_function = p->rp.fragment_function = 0;
-        p->lz = 1;
-        InterlockedIncrement(&g_ev_evicted_libs);
-    }
-    p->ev_count++;
-    InterlockedIncrement(p->is_compute ? &g_ev_evicted_c : &g_ev_evicted_r);
-    ReleaseSRWLockExclusive(&p->rlock);
-    return 1;
-}
-static void mad_ev_scan(DWORD now) {
-    static unsigned said;
-    struct mad_pso *cand[MAD_EV_BUDGET], *p;
-    UINT8 libs_ok[MAD_EV_BUDGET];
-    obj_handle_t libs[2 * MAD_EV_BUDGET];
-    SIZE_T nc = 0, nl = 0, i;
-    LONG cutoff = g_ev_now - g_ev, got = 0, got_libs = 0, unshared = 0, r;
-    UINT64 foot = 0, avail = 0;
-    int have_mem;
-    if (cutoff <= 0) return;
-    have_mem = mad_ev_mem(&foot, &avail);
-    if (g_ev_headroom > 0 && have_mem && avail >= (UINT64)g_ev_headroom) return;
-    /* 1: candidates, each with a reference of ours; a pipeline whose last
-     * reference is going (refs 0, pso_Release waiting for this lock) is left alone */
-    AcquireSRWLockShared(&g_ev_list_lock);
-    for (p = g_ev_head; p && nc < MAD_EV_BUDGET; p = p->ev_next) {
-        if (p->ev_last > cutoff) continue;
-        do r = p->refs; while (r > 0 && InterlockedCompareExchange(&p->refs, r + 1, r) != r);
-        if (r > 0) cand[nc++] = p;
-    }
-    ReleaseSRWLockShared(&g_ev_list_lock);
-    if (!nc) return;
-    InterlockedIncrement(&g_ev_scans);
-    /* 2: can the libraries be read back? File system, no lock held */
-    for (i = 0; i < nc; i++) {
-        p = cand[i];
-        libs_ok[i] = g_lzlib > 0 && !p->lz && (p->lz_vs_key[0] | p->lz_vs_key[1]) && mad_sc_exists(p->lz_vs_key) &&
-                     (!p->lz_has_ps || mad_sc_exists(p->lz_ps_key));
-    }
-    /* 3: only while no list is replayed */
-    if (TryAcquireSRWLockExclusive(&g_ev_replay)) {
-        AcquireSRWLockExclusive(&g_ev_list_lock);
-        for (i = 0; i < nc; i++) {
-            p = cand[i];
-            if (!p->ev_in || p->ev_last > cutoff) continue;   /* drawn since step 1 */
-            {
-                SIZE_T nl0 = nl;
-                r = mad_ev_evict(p, now, libs_ok[i], libs, &nl);
-                if (nl != nl0) got_libs++;
-            }
-            if (r) mad_ev_unlink(p);
-            if (r > 0) got++;
-        }
-        ReleaseSRWLockExclusive(&g_ev_list_lock);
-        ReleaseSRWLockExclusive(&g_ev_replay);
-        if (nl) { unshared = mad_ev_unshare(libs, nl, now); InterlockedExchangeAdd(&g_ev_unshared, unshared); }
-    } else InterlockedIncrement(&g_ev_busy);
-    for (i = 0; i < nc; i++) pso_Release((ID3D12PipelineState *)cand[i]);   /* ours; may be the last */
-    if (got && (said++ < 8 || !(said % 50)))
-        d3d12_log("[pso-evict] t+%lds: let go of %ld pipelines idle %d s or more (%ld with libraries, %ld shared-table entries); "
-                  "%ld others still built; so far %ld render + %ld compute let go, %ld built again; footprint %llu MB, %llu MB left\n",
-                  (long)g_ev_now - 1, (long)got, g_ev, (long)got_libs, (long)unshared,
-                  (long)g_ev_listed, (long)g_ev_evicted_r, (long)g_ev_evicted_c, (long)g_ev_rebuilt,
-                  (unsigned long long)foot, (unsigned long long)avail);
-}
-static void mad_pm_log(void) {
-    UINT64 foot = 0, avail = 0;
-    int have = mad_ev_mem(&foot, &avail);
-    LONG64 lib_mb = g_lib_count ? (LONG64)((g_lib_bytes / g_lib_count) * (LONG64)g_libshare_n) >> 20 : 0;
-    d3d12_log("[pso-mem] t+%lds: %ld pipelines, built: %ld render + %ld stride variants + %ld compute; shared libraries %lu "
-              "(~%lld MB metallib); created so far %ld libraries (%lld MB); let go %ld, built again %ld; footprint %s%llu MB, %llu MB left\n",
-              (long)g_ev_now - 1, (long)g_pm_psos, (long)g_pm_rps, (long)g_pm_var, (long)g_pm_cps, (unsigned long)g_libshare_n,
-              (long long)lib_mb, (long)g_lib_count, (long long)(g_lib_bytes >> 20), (long)(g_ev_evicted_r + g_ev_evicted_c),
-              (long)g_ev_rebuilt, have ? "" : "? ", (unsigned long long)foot, (unsigned long long)avail);
-}
-/* Once a frame, from mad_present_run. */
-static void mad_ev_tick(void) {
-    static SRWLOCK tick = SRWLOCK_INIT;
-    static DWORD t0, last_scan, last_log;
-    DWORD now;
-    mad_ev_config();
-    if (g_ev <= 0 && g_pml <= 0) return;
-    if (!TryAcquireSRWLockExclusive(&tick)) return;   /* another swapchain's present is here */
-    now = GetTickCount();
-    if (!t0) { t0 = now; last_scan = now; last_log = now; }
-    g_ev_now = (LONG)((now - t0) / 1000) + 1;
-    if (g_ev > 0 && now - last_scan >= MAD_EV_SCAN_MS) { last_scan = now; mad_ev_scan(now); }
-    if (g_ev_ret_n) mad_ev_reap(now);
-    if (g_pml > 0 && now - last_log >= 10000) { last_log = now; mad_pm_log(); }
-    ReleaseSRWLockExclusive(&tick);
-}
-
 /* madeira-bcd msc-unbounded-retry (madeira.cfg or the game's own file, off by
  * default). Horizon Zero Dawn's build 475 run (2026-10-09 16:20) lost ~4,900
  * DXIL vertex and pixel shaders to the converter's code 4
@@ -19504,10 +19175,8 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     rs = (struct mad_rootsig *)desc->pRootSignature;
     mad_resolve_target(d);
 
-    mad_ev_config();   /* madeira pso-evict-idle / pso-mem-log */
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
-    InterlockedIncrement(&g_pm_psos);   /* madeira pso-mem-log */
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState";
     p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
     if (mad_skin_on()) {   /* madeira-bcd skin-check: the vertex shader's bytecode, by hash */
@@ -19980,7 +19649,6 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     /* madeira-bcd pso-lazy-libs: built at its first draw, so its libraries can go
      * until then (pso-warm, above, holds its own references to the functions) */
     if (lz_on && p->lazy && !p->rps && mad_lzlib_can_drop(p, &lzv, &lzp)) mad_lzlib_drop(p, &lzv, &lzp);
-    if (p->rps && !p->pm_r) { p->pm_r = 1; InterlockedIncrement(&g_pm_rps); }   /* madeira pso-mem-log: built at creation */
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -20045,10 +19713,8 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     memset(&lzc, 0, sizeof lzc);
     lz_on = mad_lzlib_on() && mad_pso_lazy_on();   /* built at its first dispatch */
     mad_resolve_target(d);
-    mad_ev_config();   /* madeira pso-evict-idle / pso-mem-log */
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
-    InterlockedIncrement(&g_pm_psos);   /* madeira pso-mem-log */
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "ComputePipelineState";
     p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
     p->is_compute = 1;
@@ -20161,7 +19827,6 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         said++;
         d3d12_log("[madeira-d3d12] compute pipeline: threadgroup %ux%ux%u\n", p->tg[0], p->tg[1], p->tg[2]);
     }
-    p->pm_c = 1; InterlockedIncrement(&g_pm_cps);   /* madeira pso-mem-log: built at creation */
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -21371,21 +21036,6 @@ static HRESULT STDMETHODCALLTYPE device_EnqueueMakeResident(ID3D12Device10 *This
     if (!fence) return E_INVALIDARG;
     return fence_Signal(fence, value);   /* resident already; complete the request at once */
 }
-/* PRAGMATA (RE Engine) calls Evict about a minute in, once its first frames are
- * up; the stub's E_NOTIMPL made it raise its error box (TaskDialogIndirect,
- * which this prefix's comctl32 can't show), and the process ended with
- * 0xC000001D. Unified memory: nothing is ever paged out, so both residency
- * calls succeed at once, like SetResidencyPriority / EnqueueMakeResident. */
-static HRESULT STDMETHODCALLTYPE device_MakeResident(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
-    (void)This;
-    if (n && !objs) return E_INVALIDARG;
-    return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE device_Evict(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
-    (void)This;
-    if (n && !objs) return E_INVALIDARG;
-    return S_OK;
-}
 static void STDMETHODCALLTYPE device_RemoveDevice(ID3D12Device10 *This) {
     struct mad_device *d = (struct mad_device *)This;
     d3d12_log("[madeira-d3d12] RemoveDevice requested by the application\n");
@@ -21639,29 +21289,6 @@ static HRESULT mad_child_get_device(struct mad_device *d, REFIID riid, void **ou
 static HRESULT STDMETHODCALLTYPE res_GetDevice(ID3D12Resource2 *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_resource *)This)->owner, riid, out);
 }
-/* Was the E_NOTIMPL stub (PRAGMATA asks for it while it builds its first
- * frame). Placed resources answer with their heap's properties; committed ones
- * with their heap type. Reserved (tiled) resources have no heap: E_INVALIDARG,
- * as on Windows. */
-static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource2 *This, D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS *flags) {
-    struct mad_resource *r = (struct mad_resource *)This;
-    if (r->placed_heap) {
-        if (props) *props = r->placed_heap->desc.Properties;
-        if (flags) *flags = r->placed_heap->desc.Flags;
-        return S_OK;
-    }
-    if (r->reserved_bytes) return E_INVALIDARG;
-    if (props) {
-        memset(props, 0, sizeof *props);
-        props->Type = r->heap ? r->heap : D3D12_HEAP_TYPE_DEFAULT;
-        props->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-        props->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-        props->CreationNodeMask = 1;
-        props->VisibleNodeMask = 1;
-    }
-    if (flags) *flags = D3D12_HEAP_FLAG_NONE;
-    return S_OK;
-}
 static HRESULT STDMETHODCALLTYPE list_GetDevice(ID3D12GraphicsCommandList *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_list *)This)->device, riid, out);
 }
@@ -21682,388 +21309,6 @@ static HRESULT STDMETHODCALLTYPE pso_GetDevice(ID3D12PipelineState *This, REFIID
 }
 static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, REFIID riid, void **out) {
     (void)This; return mad_child_get_device(NULL, riid, out);
-}
-
-/* ---- device call log (fork diagnostic) -----------------------------------
- * env.MADEIRA_D3D12_CALL_LOG in the game config. Unset or 0: off, nothing is installed.
- * 1: every ID3D12Device call that returns a failure, and the first call of each method.
- * 2: every call as well (methods a game calls every frame are still failures-only).
- * One line each: "[d3d12-call] #<n> tid=<thread> Device::<method> -> 0x<HRESULT>", in call
- * order across threads, so the last lines before a crash show what the game had just asked
- * for and what it was told. QueryInterface and CheckFeatureSupport have logs of their own
- * ("[d3d12-caps]"). Signatures are those of madeira_d3d12_stubs.h. */
-static ID3D12Device10Vtbl g_calllog_orig;
-static int g_calllog_level;
-static LONG g_calllog_seq, g_calllog_lines, g_calllog_fail_lines;
-enum {
-    CALLLOG_CreateCommandQueue,
-    CALLLOG_CreateCommandAllocator,
-    CALLLOG_CreateGraphicsPipelineState,
-    CALLLOG_CreateComputePipelineState,
-    CALLLOG_CreateCommandList,
-    CALLLOG_CreateDescriptorHeap,
-    CALLLOG_CreateRootSignature,
-    CALLLOG_CreateCommittedResource,
-    CALLLOG_CreateHeap,
-    CALLLOG_CreatePlacedResource,
-    CALLLOG_CreateReservedResource,
-    CALLLOG_CreateSharedHandle,
-    CALLLOG_OpenSharedHandle,
-    CALLLOG_OpenSharedHandleByName,
-    CALLLOG_MakeResident,
-    CALLLOG_Evict,
-    CALLLOG_CreateFence,
-    CALLLOG_GetDeviceRemovedReason,
-    CALLLOG_CreateQueryHeap,
-    CALLLOG_SetStablePowerState,
-    CALLLOG_CreateCommandSignature,
-    CALLLOG_CreatePipelineLibrary,
-    CALLLOG_SetEventOnMultipleFenceCompletion,
-    CALLLOG_SetResidencyPriority,
-    CALLLOG_CreatePipelineState,
-    CALLLOG_OpenExistingHeapFromAddress,
-    CALLLOG_OpenExistingHeapFromFileMapping,
-    CALLLOG_EnqueueMakeResident,
-    CALLLOG_CreateCommandList1,
-    CALLLOG_CreateProtectedResourceSession,
-    CALLLOG_CreateCommittedResource1,
-    CALLLOG_CreateHeap1,
-    CALLLOG_CreateReservedResource1,
-    CALLLOG_CreateLifetimeTracker,
-    CALLLOG_EnumerateMetaCommands,
-    CALLLOG_EnumerateMetaCommandParameters,
-    CALLLOG_CreateMetaCommand,
-    CALLLOG_CreateStateObject,
-    CALLLOG_SetBackgroundProcessingMode,
-    CALLLOG_AddToStateObject,
-    CALLLOG_CreateProtectedResourceSession1,
-    CALLLOG_CreateCommittedResource2,
-    CALLLOG_CreatePlacedResource1,
-    CALLLOG_CreateShaderCacheSession,
-    CALLLOG_ShaderCacheControl,
-    CALLLOG_CreateCommandQueue1,
-    CALLLOG_CreateCommittedResource3,
-    CALLLOG_CreatePlacedResource2,
-    CALLLOG_CreateReservedResource2,
-    CALLLOG_COUNT
-};
-static LONG g_calllog_calls[CALLLOG_COUNT];
-static void mad_calllog_note(int idx, const char *method, HRESULT hr, int quiet) {
-    LONG seq = InterlockedIncrement(&g_calllog_seq);
-    LONG nth = InterlockedIncrement(&g_calllog_calls[idx]);
-    if (FAILED(hr)) {
-        if (InterlockedIncrement(&g_calllog_fail_lines) > 2000) return;
-        d3d12_log("[d3d12-call] #%ld tid=%04lx Device::%s -> 0x%08lx FAILED (call %ld of this method)\n",
-                  (long)seq, (unsigned long)GetCurrentThreadId(), method, (unsigned long)hr, (long)nth);
-        return;
-    }
-    if (nth != 1 && (g_calllog_level < 2 || quiet)) return;
-    if (InterlockedIncrement(&g_calllog_lines) > 20000) return;
-    d3d12_log("[d3d12-call] #%ld tid=%04lx Device::%s -> 0x%08lx%s\n",
-              (long)seq, (unsigned long)GetCurrentThreadId(), method, (unsigned long)hr, nth == 1 ? " (first call)" : "");
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandQueue(ID3D12Device10 *This, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **command_queue) {
-    HRESULT hr = g_calllog_orig.CreateCommandQueue(This, desc, riid, command_queue);
-    mad_calllog_note(CALLLOG_CreateCommandQueue, "CreateCommandQueue", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandAllocator(ID3D12Device10 *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **command_allocator) {
-    HRESULT hr = g_calllog_orig.CreateCommandAllocator(This, type, riid, command_allocator);
-    mad_calllog_note(CALLLOG_CreateCommandAllocator, "CreateCommandAllocator", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateGraphicsPipelineState(ID3D12Device10 *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) {
-    HRESULT hr = g_calllog_orig.CreateGraphicsPipelineState(This, desc, riid, pipeline_state);
-    mad_calllog_note(CALLLOG_CreateGraphicsPipelineState, "CreateGraphicsPipelineState", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateComputePipelineState(ID3D12Device10 *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) {
-    HRESULT hr = g_calllog_orig.CreateComputePipelineState(This, desc, riid, pipeline_state);
-    mad_calllog_note(CALLLOG_CreateComputePipelineState, "CreateComputePipelineState", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandList(ID3D12Device10 *This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *command_allocator, ID3D12PipelineState *initial_pipeline_state, REFIID riid, void **command_list) {
-    HRESULT hr = g_calllog_orig.CreateCommandList(This, node_mask, type, command_allocator, initial_pipeline_state, riid, command_list);
-    mad_calllog_note(CALLLOG_CreateCommandList, "CreateCommandList", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateDescriptorHeap(ID3D12Device10 *This, const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **descriptor_heap) {
-    HRESULT hr = g_calllog_orig.CreateDescriptorHeap(This, desc, riid, descriptor_heap);
-    mad_calllog_note(CALLLOG_CreateDescriptorHeap, "CreateDescriptorHeap", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateRootSignature(ID3D12Device10 *This, UINT node_mask, const void *bytecode, SIZE_T bytecode_length, REFIID riid, void **root_signature) {
-    HRESULT hr = g_calllog_orig.CreateRootSignature(This, node_mask, bytecode, bytecode_length, riid, root_signature);
-    mad_calllog_note(CALLLOG_CreateRootSignature, "CreateRootSignature", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateCommittedResource(This, heap_properties, heap_flags, desc, initial_state, optimized_clear_value, riid, resource);
-    mad_calllog_note(CALLLOG_CreateCommittedResource, "CreateCommittedResource", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateHeap(ID3D12Device10 *This, const D3D12_HEAP_DESC *desc, REFIID riid, void **heap) {
-    HRESULT hr = g_calllog_orig.CreateHeap(This, desc, riid, heap);
-    mad_calllog_note(CALLLOG_CreateHeap, "CreateHeap", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreatePlacedResource(This, heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource);
-    mad_calllog_note(CALLLOG_CreatePlacedResource, "CreatePlacedResource", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateReservedResource(This, desc, initial_state, optimized_clear_value, riid, resource);
-    mad_calllog_note(CALLLOG_CreateReservedResource, "CreateReservedResource", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateSharedHandle(ID3D12Device10 *This, ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle) {
-    HRESULT hr = g_calllog_orig.CreateSharedHandle(This, object, attributes, access, name, handle);
-    mad_calllog_note(CALLLOG_CreateSharedHandle, "CreateSharedHandle", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_OpenSharedHandle(ID3D12Device10 *This, HANDLE handle, REFIID riid, void **object) {
-    HRESULT hr = g_calllog_orig.OpenSharedHandle(This, handle, riid, object);
-    mad_calllog_note(CALLLOG_OpenSharedHandle, "OpenSharedHandle", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_OpenSharedHandleByName(ID3D12Device10 *This, const WCHAR *name, DWORD access, HANDLE *handle) {
-    HRESULT hr = g_calllog_orig.OpenSharedHandleByName(This, name, access, handle);
-    mad_calllog_note(CALLLOG_OpenSharedHandleByName, "OpenSharedHandleByName", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_MakeResident(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects) {
-    HRESULT hr = g_calllog_orig.MakeResident(This, object_count, objects);
-    mad_calllog_note(CALLLOG_MakeResident, "MakeResident", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_Evict(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects) {
-    HRESULT hr = g_calllog_orig.Evict(This, object_count, objects);
-    mad_calllog_note(CALLLOG_Evict, "Evict", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateFence(ID3D12Device10 *This, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid, void **fence) {
-    HRESULT hr = g_calllog_orig.CreateFence(This, initial_value, flags, riid, fence);
-    mad_calllog_note(CALLLOG_CreateFence, "CreateFence", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_GetDeviceRemovedReason(ID3D12Device10 *This) {
-    HRESULT hr = g_calllog_orig.GetDeviceRemovedReason(This);
-    mad_calllog_note(CALLLOG_GetDeviceRemovedReason, "GetDeviceRemovedReason", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateQueryHeap(ID3D12Device10 *This, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **heap) {
-    HRESULT hr = g_calllog_orig.CreateQueryHeap(This, desc, riid, heap);
-    mad_calllog_note(CALLLOG_CreateQueryHeap, "CreateQueryHeap", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_SetStablePowerState(ID3D12Device10 *This, WINBOOL enable) {
-    HRESULT hr = g_calllog_orig.SetStablePowerState(This, enable);
-    mad_calllog_note(CALLLOG_SetStablePowerState, "SetStablePowerState", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandSignature(ID3D12Device10 *This, const D3D12_COMMAND_SIGNATURE_DESC *desc, ID3D12RootSignature *root_signature, REFIID riid, void **command_signature) {
-    HRESULT hr = g_calllog_orig.CreateCommandSignature(This, desc, root_signature, riid, command_signature);
-    mad_calllog_note(CALLLOG_CreateCommandSignature, "CreateCommandSignature", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreatePipelineLibrary(ID3D12Device10 *This, const void *blob, SIZE_T blob_size, REFIID iid, void **lib) {
-    HRESULT hr = g_calllog_orig.CreatePipelineLibrary(This, blob, blob_size, iid, lib);
-    mad_calllog_note(CALLLOG_CreatePipelineLibrary, "CreatePipelineLibrary", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_SetEventOnMultipleFenceCompletion(ID3D12Device10 *This, ID3D12Fence *const *fences, const UINT64 *values, UINT fence_count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
-    HRESULT hr = g_calllog_orig.SetEventOnMultipleFenceCompletion(This, fences, values, fence_count, flags, event);
-    mad_calllog_note(CALLLOG_SetEventOnMultipleFenceCompletion, "SetEventOnMultipleFenceCompletion", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_SetResidencyPriority(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects, const D3D12_RESIDENCY_PRIORITY *priorities) {
-    HRESULT hr = g_calllog_orig.SetResidencyPriority(This, object_count, objects, priorities);
-    mad_calllog_note(CALLLOG_SetResidencyPriority, "SetResidencyPriority", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreatePipelineState(ID3D12Device10 *This, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state) {
-    HRESULT hr = g_calllog_orig.CreatePipelineState(This, desc, riid, pipeline_state);
-    mad_calllog_note(CALLLOG_CreatePipelineState, "CreatePipelineState", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_OpenExistingHeapFromAddress(ID3D12Device10 *This, const void *address, REFIID riid, void **heap) {
-    HRESULT hr = g_calllog_orig.OpenExistingHeapFromAddress(This, address, riid, heap);
-    mad_calllog_note(CALLLOG_OpenExistingHeapFromAddress, "OpenExistingHeapFromAddress", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_OpenExistingHeapFromFileMapping(ID3D12Device10 *This, HANDLE file_mapping, REFIID riid, void **heap) {
-    HRESULT hr = g_calllog_orig.OpenExistingHeapFromFileMapping(This, file_mapping, riid, heap);
-    mad_calllog_note(CALLLOG_OpenExistingHeapFromFileMapping, "OpenExistingHeapFromFileMapping", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_EnqueueMakeResident(ID3D12Device10 *This, D3D12_RESIDENCY_FLAGS flags, UINT num_objects, ID3D12Pageable *const *objects, ID3D12Fence *fence, UINT64 fence_value) {
-    HRESULT hr = g_calllog_orig.EnqueueMakeResident(This, flags, num_objects, objects, fence, fence_value);
-    mad_calllog_note(CALLLOG_EnqueueMakeResident, "EnqueueMakeResident", hr, 1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandList1(ID3D12Device10 *This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void **command_list) {
-    HRESULT hr = g_calllog_orig.CreateCommandList1(This, node_mask, type, flags, riid, command_list);
-    mad_calllog_note(CALLLOG_CreateCommandList1, "CreateCommandList1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateProtectedResourceSession(ID3D12Device10 *This, const D3D12_PROTECTED_RESOURCE_SESSION_DESC *desc, REFIID riid, void **session) {
-    HRESULT hr = g_calllog_orig.CreateProtectedResourceSession(This, desc, riid, session);
-    mad_calllog_note(CALLLOG_CreateProtectedResourceSession, "CreateProtectedResourceSession", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource1(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_resource_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid_resource, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateCommittedResource1(This, heap_properties, heap_flags, desc, initial_resource_state, optimized_clear_value, protected_session, riid_resource, resource);
-    mad_calllog_note(CALLLOG_CreateCommittedResource1, "CreateCommittedResource1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateHeap1(ID3D12Device10 *This, const D3D12_HEAP_DESC *desc, ID3D12ProtectedResourceSession *protected_session, REFIID riid, void **heap) {
-    HRESULT hr = g_calllog_orig.CreateHeap1(This, desc, protected_session, riid, heap);
-    mad_calllog_note(CALLLOG_CreateHeap1, "CreateHeap1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource1(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateReservedResource1(This, desc, initial_state, optimized_clear_value, protected_session, riid, resource);
-    mad_calllog_note(CALLLOG_CreateReservedResource1, "CreateReservedResource1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateLifetimeTracker(ID3D12Device10 *This, ID3D12LifetimeOwner *owner, REFIID riid, void **tracker) {
-    HRESULT hr = g_calllog_orig.CreateLifetimeTracker(This, owner, riid, tracker);
-    mad_calllog_note(CALLLOG_CreateLifetimeTracker, "CreateLifetimeTracker", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_EnumerateMetaCommands(ID3D12Device10 *This, UINT *meta_commands_count, D3D12_META_COMMAND_DESC *descs) {
-    HRESULT hr = g_calllog_orig.EnumerateMetaCommands(This, meta_commands_count, descs);
-    mad_calllog_note(CALLLOG_EnumerateMetaCommands, "EnumerateMetaCommands", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_EnumerateMetaCommandParameters(ID3D12Device10 *This, REFGUID command_id, D3D12_META_COMMAND_PARAMETER_STAGE stage, UINT *total_structure_size_in_bytes, UINT *parameter_count, D3D12_META_COMMAND_PARAMETER_DESC *parameter_descs) {
-    HRESULT hr = g_calllog_orig.EnumerateMetaCommandParameters(This, command_id, stage, total_structure_size_in_bytes, parameter_count, parameter_descs);
-    mad_calllog_note(CALLLOG_EnumerateMetaCommandParameters, "EnumerateMetaCommandParameters", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateMetaCommand(ID3D12Device10 *This, REFGUID command_id, UINT node_mask, const void *creation_parameters_data, SIZE_T creation_parameters_data_size_in_bytes, REFIID riid, void **meta_command) {
-    HRESULT hr = g_calllog_orig.CreateMetaCommand(This, command_id, node_mask, creation_parameters_data, creation_parameters_data_size_in_bytes, riid, meta_command);
-    mad_calllog_note(CALLLOG_CreateMetaCommand, "CreateMetaCommand", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateStateObject(ID3D12Device10 *This, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **state_object) {
-    HRESULT hr = g_calllog_orig.CreateStateObject(This, desc, riid, state_object);
-    mad_calllog_note(CALLLOG_CreateStateObject, "CreateStateObject", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_SetBackgroundProcessingMode(ID3D12Device10 *This, D3D12_BACKGROUND_PROCESSING_MODE mode, D3D12_MEASUREMENTS_ACTION action, HANDLE event, WINBOOL *further_measurements_desired) {
-    HRESULT hr = g_calllog_orig.SetBackgroundProcessingMode(This, mode, action, event, further_measurements_desired);
-    mad_calllog_note(CALLLOG_SetBackgroundProcessingMode, "SetBackgroundProcessingMode", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_AddToStateObject(ID3D12Device10 *This, const D3D12_STATE_OBJECT_DESC *addition, ID3D12StateObject *state_object_to_grow_from, REFIID riid, void **new_state_object) {
-    HRESULT hr = g_calllog_orig.AddToStateObject(This, addition, state_object_to_grow_from, riid, new_state_object);
-    mad_calllog_note(CALLLOG_AddToStateObject, "AddToStateObject", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateProtectedResourceSession1(ID3D12Device10 *This, const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *desc, REFIID riid, void **session) {
-    HRESULT hr = g_calllog_orig.CreateProtectedResourceSession1(This, desc, riid, session);
-    mad_calllog_note(CALLLOG_CreateProtectedResourceSession1, "CreateProtectedResourceSession1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource2(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_resource_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid_resource, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateCommittedResource2(This, heap_properties, heap_flags, desc, initial_resource_state, optimized_clear_value, protected_session, riid_resource, resource);
-    mad_calllog_note(CALLLOG_CreateCommittedResource2, "CreateCommittedResource2", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource1(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreatePlacedResource1(This, heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource);
-    mad_calllog_note(CALLLOG_CreatePlacedResource1, "CreatePlacedResource1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateShaderCacheSession(ID3D12Device10 *This, const D3D12_SHADER_CACHE_SESSION_DESC *desc, REFIID riid, void **session) {
-    HRESULT hr = g_calllog_orig.CreateShaderCacheSession(This, desc, riid, session);
-    mad_calllog_note(CALLLOG_CreateShaderCacheSession, "CreateShaderCacheSession", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_ShaderCacheControl(ID3D12Device10 *This, D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control) {
-    HRESULT hr = g_calllog_orig.ShaderCacheControl(This, kinds, control);
-    mad_calllog_note(CALLLOG_ShaderCacheControl, "ShaderCacheControl", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommandQueue1(ID3D12Device10 *This, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID creator_id, REFIID riid, void **command_queue) {
-    HRESULT hr = g_calllog_orig.CreateCommandQueue1(This, desc, creator_id, riid, command_queue);
-    mad_calllog_note(CALLLOG_CreateCommandQueue1, "CreateCommandQueue1", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource3(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1 *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid_resource, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateCommittedResource3(This, heap_properties, heap_flags, desc, initial_layout, optimized_clear_value, protected_session, castable_formats_count, castable_formats, riid_resource, resource);
-    mad_calllog_note(CALLLOG_CreateCommittedResource3, "CreateCommittedResource3", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource2(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreatePlacedResource2(This, heap, heap_offset, desc, initial_layout, optimized_clear_value, castable_formats_count, castable_formats, riid, resource);
-    mad_calllog_note(CALLLOG_CreatePlacedResource2, "CreatePlacedResource2", hr, 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource2(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid, void **resource) {
-    HRESULT hr = g_calllog_orig.CreateReservedResource2(This, desc, initial_layout, optimized_clear_value, protected_session, castable_formats_count, castable_formats, riid, resource);
-    mad_calllog_note(CALLLOG_CreateReservedResource2, "CreateReservedResource2", hr, 0);
-    return hr;
-}
-static void mad_calllog_install(void) {
-    char v[8];
-    DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_CALL_LOG", v, sizeof v);   /* 1 = failed device calls and each method's first call; 2 = every device call; unset/0 = off */
-    g_calllog_level = (n && n < sizeof v) ? atoi(v) : 0;
-    if (g_calllog_level <= 0) return;
-    g_calllog_orig = g_device_vtbl;
-    g_device_vtbl.CreateCommandQueue = calllog_CreateCommandQueue;
-    g_device_vtbl.CreateCommandAllocator = calllog_CreateCommandAllocator;
-    g_device_vtbl.CreateGraphicsPipelineState = calllog_CreateGraphicsPipelineState;
-    g_device_vtbl.CreateComputePipelineState = calllog_CreateComputePipelineState;
-    g_device_vtbl.CreateCommandList = calllog_CreateCommandList;
-    g_device_vtbl.CreateDescriptorHeap = calllog_CreateDescriptorHeap;
-    g_device_vtbl.CreateRootSignature = calllog_CreateRootSignature;
-    g_device_vtbl.CreateCommittedResource = calllog_CreateCommittedResource;
-    g_device_vtbl.CreateHeap = calllog_CreateHeap;
-    g_device_vtbl.CreatePlacedResource = calllog_CreatePlacedResource;
-    g_device_vtbl.CreateReservedResource = calllog_CreateReservedResource;
-    g_device_vtbl.CreateSharedHandle = calllog_CreateSharedHandle;
-    g_device_vtbl.OpenSharedHandle = calllog_OpenSharedHandle;
-    g_device_vtbl.OpenSharedHandleByName = calllog_OpenSharedHandleByName;
-    g_device_vtbl.MakeResident = calllog_MakeResident;
-    g_device_vtbl.Evict = calllog_Evict;
-    g_device_vtbl.CreateFence = calllog_CreateFence;
-    g_device_vtbl.GetDeviceRemovedReason = calllog_GetDeviceRemovedReason;
-    g_device_vtbl.CreateQueryHeap = calllog_CreateQueryHeap;
-    g_device_vtbl.SetStablePowerState = calllog_SetStablePowerState;
-    g_device_vtbl.CreateCommandSignature = calllog_CreateCommandSignature;
-    g_device_vtbl.CreatePipelineLibrary = calllog_CreatePipelineLibrary;
-    g_device_vtbl.SetEventOnMultipleFenceCompletion = calllog_SetEventOnMultipleFenceCompletion;
-    g_device_vtbl.SetResidencyPriority = calllog_SetResidencyPriority;
-    g_device_vtbl.CreatePipelineState = calllog_CreatePipelineState;
-    g_device_vtbl.OpenExistingHeapFromAddress = calllog_OpenExistingHeapFromAddress;
-    g_device_vtbl.OpenExistingHeapFromFileMapping = calllog_OpenExistingHeapFromFileMapping;
-    g_device_vtbl.EnqueueMakeResident = calllog_EnqueueMakeResident;
-    g_device_vtbl.CreateCommandList1 = calllog_CreateCommandList1;
-    g_device_vtbl.CreateProtectedResourceSession = calllog_CreateProtectedResourceSession;
-    g_device_vtbl.CreateCommittedResource1 = calllog_CreateCommittedResource1;
-    g_device_vtbl.CreateHeap1 = calllog_CreateHeap1;
-    g_device_vtbl.CreateReservedResource1 = calllog_CreateReservedResource1;
-    g_device_vtbl.CreateLifetimeTracker = calllog_CreateLifetimeTracker;
-    g_device_vtbl.EnumerateMetaCommands = calllog_EnumerateMetaCommands;
-    g_device_vtbl.EnumerateMetaCommandParameters = calllog_EnumerateMetaCommandParameters;
-    g_device_vtbl.CreateMetaCommand = calllog_CreateMetaCommand;
-    g_device_vtbl.CreateStateObject = calllog_CreateStateObject;
-    g_device_vtbl.SetBackgroundProcessingMode = calllog_SetBackgroundProcessingMode;
-    g_device_vtbl.AddToStateObject = calllog_AddToStateObject;
-    g_device_vtbl.CreateProtectedResourceSession1 = calllog_CreateProtectedResourceSession1;
-    g_device_vtbl.CreateCommittedResource2 = calllog_CreateCommittedResource2;
-    g_device_vtbl.CreatePlacedResource1 = calllog_CreatePlacedResource1;
-    g_device_vtbl.CreateShaderCacheSession = calllog_CreateShaderCacheSession;
-    g_device_vtbl.ShaderCacheControl = calllog_ShaderCacheControl;
-    g_device_vtbl.CreateCommandQueue1 = calllog_CreateCommandQueue1;
-    g_device_vtbl.CreateCommittedResource3 = calllog_CreateCommittedResource3;
-    g_device_vtbl.CreatePlacedResource2 = calllog_CreatePlacedResource2;
-    g_device_vtbl.CreateReservedResource2 = calllog_CreateReservedResource2;
-    d3d12_log("[d3d12-call] device call log on, level %d (MADEIRA_D3D12_CALL_LOG): %d methods wrapped\n",
-              g_calllog_level, (int)CALLLOG_COUNT);
 }
 
 /* ---- vtable construction ------------------------------------------------- */
@@ -22091,8 +21336,6 @@ static void build_vtables(void) {
     g_device_vtbl.CreateCommandQueue1                = device_CreateCommandQueue1;
     g_device_vtbl.SetResidencyPriority               = device_SetResidencyPriority;
     g_device_vtbl.EnqueueMakeResident                = device_EnqueueMakeResident;
-    g_device_vtbl.MakeResident                       = device_MakeResident;
-    g_device_vtbl.Evict                              = device_Evict;
     g_device_vtbl.RemoveDevice                       = device_RemoveDevice;
     g_device_vtbl.GetDeviceRemovedReason             = device_GetDeviceRemovedReason;
     g_device_vtbl.GetAdapterLuid                     = device_GetAdapterLuid;
@@ -22214,7 +21457,6 @@ static void build_vtables(void) {
     g_res_vtbl.Unmap = (void *)res_Unmap;
     g_res_vtbl.GetGPUVirtualAddress = (void *)res_GetGPUVirtualAddress;
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
-    g_res_vtbl.GetHeapProperties = res_GetHeapProperties;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
     g_list_vtbl8.OMSetFrontAndBackStencilRef = list_OMSetFrontAndBackStencilRef;   /* ml1300 */
@@ -22300,8 +21542,6 @@ static void build_vtables(void) {
     g_fence_vtbl.GetCompletedValue      = fence_GetCompletedValue;
     g_fence_vtbl.SetEventOnCompletion   = fence_SetEventOnCompletion;
     g_fence_vtbl.Signal                 = fence_Signal;
-
-    mad_calllog_install();   /* last: wraps the finished device table (MADEIRA_D3D12_CALL_LOG) */
 }
 
 /* ---- exports ------------------------------------------------------------- */
@@ -22405,7 +21645,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     }
     if (d->mtl_device && d->mtl_queue) {
         struct WMTBufferInfo nbi;
-        d->resset = MTLDevice_newResidencySet(d->mtl_device, 4096);
+        d->resset = MadeiraMTLDevice_newResidencySet(d->mtl_device, 4096);
         if (d->resset) MTLCommandQueue_addResidencySet(d->mtl_queue, d->resset);
         d3d12_log("[madeira-d3d12] residency set: %s\n", d->resset ? "attached to the queue" : "UNAVAILABLE (per-draw lists only)");
         memset(&nbi, 0, sizeof nbi);
@@ -22869,7 +22109,6 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
-    mad_ev_tick();                  /* madeira pso-evict-idle / pso-mem-log: once a frame */
     mad_swd_step(s->queue, 'F');    /* madeira-bcd: [swap-diag] steps, named by a drain that waits on this Present */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
@@ -23196,18 +22435,66 @@ static HRESULT mad_swap_resize(struct mad_swapchain *s, UINT count, UINT w, UINT
 static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
     return mad_swap_resize((struct mad_swapchain *)T, count, w, h, fmt, flags, "ResizeBuffers");
 }
+/* resize-target: Windows' DXGI ResizeTarget, for a windowed swapchain, sizes
+ * the window so its client area is the requested mode (style kept, position
+ * kept). Resident Evil Village opens a 1920x1080 window on a 1408x648 desktop,
+ * then asks ResizeTarget(1408x648); as a no-op the window stayed 1920x1080 and
+ * the desktop fit shrank the picture (0.2.52 log 80c2496f). Done like
+ * fullscreen-window above: user32 looked up at the call, the move posted to the
+ * window's thread (SWP_ASYNCWINDOWPOS). Full screen stays a no-op (the display
+ * mode is not changed). env MADEIRA_D3D12_RESIZE_TARGET=0 = the old no-op.
+ * Returns 1 when SetWindowPos was posted, 0 when nothing was done, -1 on failure. */
+static int mad_swap_resize_window(struct mad_swapchain *s, UINT w, UINT h, RECT *out_rc) {
+    typedef BOOL (WINAPI *is_window_fn)(HWND);
+    typedef LONG (WINAPI *getlong_fn)(HWND, int);
+    typedef BOOL (WINAPI *adjust_fn)(RECT *, DWORD, BOOL, DWORD);
+    typedef BOOL (WINAPI *pos_fn)(HWND, HWND, int, int, int, int, UINT);
+    /* On by default: a windowed swap chain resize also sizes the target. 0 turns it off (the old no-op). state: 0 = not read yet, 1 = on, 2 = off */
+    static LONG state;
+    HMODULE u;
+    is_window_fn is_window; getlong_fn getlong; adjust_fn adjust; pos_fn pos;
+    DWORD style, exstyle;
+    RECT rc;
+    if (!state) {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_RESIZE_TARGET", v, sizeof v);
+        InterlockedExchange(&state, (n == 1 && v[0] == '0') ? 2 : 1);
+    }
+    if (state != 1 || !s->hwnd || !s->fs.Windowed || !w || !h) return 0;
+    if (!(u = GetModuleHandleW(L"user32.dll"))) return 0;   /* a process with a window has it loaded */
+    is_window = (is_window_fn)(void *)GetProcAddress(u, "IsWindow");
+    getlong = (getlong_fn)(void *)GetProcAddress(u, "GetWindowLongW");
+    adjust = (adjust_fn)(void *)GetProcAddress(u, "AdjustWindowRectEx");
+    pos = (pos_fn)(void *)GetProcAddress(u, "SetWindowPos");
+    if (!is_window || !getlong || !adjust || !pos || !is_window(s->hwnd)) return -1;
+    style = (DWORD)getlong(s->hwnd, GWL_STYLE);
+    exstyle = (DWORD)getlong(s->hwnd, GWL_EXSTYLE);
+    rc.left = 0; rc.top = 0; rc.right = (LONG)w; rc.bottom = (LONG)h;   /* not SetRect: user32 is only looked up */
+    if (!adjust(&rc, style, FALSE, exstyle)) return -1;
+    if (out_rc) *out_rc = rc;
+    return pos(s->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+               SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) ? 1 : -1;
+}
 static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     LONG seq;
-    /* madeira-bcd: [swap-diag] still a no-op: the window keeps its size and the
-     * display its mode, so no WM_SIZE or WM_DISPLAYCHANGE follows from it. */
+    RECT rc = {0, 0, 0, 0};
+    static volatile LONG rt_logs;
+    int resized = m ? mad_swap_resize_window(s, m->Width, m->Height, &rc) : 0;
+    if (resized && InterlockedIncrement(&rt_logs) <= 16)
+        d3d12_log("[madeira-d3d12] resize-target: window %p client -> %ux%u (window %ldx%ld)%s\n", (void *)s->hwnd,
+                  m->Width, m->Height, (long)(rc.right - rc.left), (long)(rc.bottom - rc.top),
+                  resized < 0 ? " -- FAILED" : "");
+    /* madeira-bcd: [swap-diag] the line below says "no-op" when resize-target did not
+     * act (full screen, off, zero size) and "resize was posted" when it did. */
     if (mad_swd_take(&g_swd_rt_n, &seq)) {
         if (m)
             mad_swd_log("[swap-diag] #%ld ResizeTarget(%ux%u, refresh %u/%u, format %u, scanline %u, scaling %u) on swapchain %p "
-                        "(hwnd %p, %ux%u, fullscreen %d) -> S_OK at once: a no-op, the window and the display mode keep "
-                        "their size; tid %04lx\n", (long)seq, m->Width, m->Height, m->RefreshRate.Numerator,
+                        "(hwnd %p, %ux%u, fullscreen %d) -> S_OK at once: %s; tid %04lx\n", (long)seq, m->Width, m->Height, m->RefreshRate.Numerator,
                         m->RefreshRate.Denominator, (unsigned)m->Format, (unsigned)m->ScanlineOrdering, (unsigned)m->Scaling,
                         (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height, !s->fs.Windowed,
+                        resized > 0 ? "the window's resize was posted (see the resize-target line); the display mode keeps its size"
+                                    : "a no-op, the window and the display mode keep their size",
                         (unsigned long)GetCurrentThreadId());
         else
             mad_swd_log("[swap-diag] #%ld ResizeTarget(NULL) on swapchain %p -> S_OK at once (a no-op); tid %04lx\n",
@@ -23454,6 +22741,71 @@ static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out) {
     t->vtbl = &g_mdd_vtbl; t->refs = 1; t->queue = q;
     ID3D12CommandQueue_AddRef((ID3D12CommandQueue *)q);
     d3d12_log("[madeira-d3d12] dxgi asked the queue for its Metal device; swapchain bridge engaged\n");
+    *out = t;
+    return S_OK;
+}
+
+/* swap-factory: DXMT v0.80's dxgi.dll (CreateSwapChainForHwnd) no longer asks
+ * for IMTLDXGIDevice. It asks the queue for IMTLSwapChainFactory {6c030003-...},
+ * then for vkd3d's IDXGIVkSwapChainFactory, and fails with "Unsupported device
+ * type" / DXGI_ERROR_UNSUPPORTED when neither answers. The queue now answers
+ * the first with a tear-off: IUnknown plus CreateSwapChain, the same signature
+ * as IMTLDXGIDevice::CreateSwapChain, so it goes to the same bridge.
+ * env MADEIRA_D3D12_SWAP_FACTORY=0 refuses the query, as before. */
+struct mad_swap_factory;
+struct mad_swap_factory_vtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct mad_swap_factory *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(struct mad_swap_factory *);
+    ULONG (STDMETHODCALLTYPE *Release)(struct mad_swap_factory *);
+    HRESULT (STDMETHODCALLTYPE *CreateSwapChain)(struct mad_swap_factory *, IDXGIFactory1 *, HWND,
+                                                 const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *,
+                                                 IDXGISwapChain1 **);
+};
+struct mad_swap_factory {
+    const struct mad_swap_factory_vtbl *vtbl;
+    LONG refs;
+    struct mad_queue *queue;
+};
+static int mad_swapfactory_enabled(void) {
+    /* On by default; 0 turns off the swapchain-factory answer (a game's DX12 swapchain then fails as before).
+     * state: 0 = not read yet, 1 = on, 2 = off */
+    static LONG state;
+    if (!state) {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_SWAP_FACTORY", v, sizeof v);
+        InterlockedExchange(&state, (n == 1 && v[0] == '0') ? 2 : 1);
+    }
+    return state == 1;
+}
+static HRESULT STDMETHODCALLTYPE msf_QI(struct mad_swap_factory *T, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IMTLSwapChainFactory)) {
+        InterlockedIncrement(&T->refs); *out = T; return S_OK;
+    }
+    /* Anything else is the queue's business. */
+    return T->queue->vtbl->QueryInterface((ID3D12CommandQueue *)T->queue, riid, out);
+}
+static ULONG STDMETHODCALLTYPE msf_AddRef(struct mad_swap_factory *T) { return (ULONG)InterlockedIncrement(&T->refs); }
+static ULONG STDMETHODCALLTYPE msf_Release(struct mad_swap_factory *T) {
+    LONG n = InterlockedDecrement(&T->refs);
+    if (n == 0) { ID3D12CommandQueue_Release((ID3D12CommandQueue *)T->queue); free(T); }
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE msf_CreateSwapChain(struct mad_swap_factory *T, IDXGIFactory1 *factory, HWND hwnd,
+        const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGISwapChain1 **out) {
+    HRESULT hr = mad_swapchain_create(T->queue, factory, hwnd, desc, fs, out);
+    d3d12_log("[madeira-d3d12] swap-factory: CreateSwapChain %ux%u fmt %u buffers %u -> hr %#lx\n",
+              desc ? desc->Width : 0, desc ? desc->Height : 0, desc ? (unsigned)desc->Format : 0,
+              desc ? desc->BufferCount : 0, (unsigned long)hr);
+    return hr;
+}
+static const struct mad_swap_factory_vtbl g_msf_vtbl = { msf_QI, msf_AddRef, msf_Release, msf_CreateSwapChain };
+static HRESULT mad_queue_swapfactory_tearoff(struct mad_queue *q, void **out) {
+    struct mad_swap_factory *t = calloc(1, sizeof *t);
+    if (!t) return E_OUTOFMEMORY;
+    t->vtbl = &g_msf_vtbl; t->refs = 1; t->queue = q;
+    ID3D12CommandQueue_AddRef((ID3D12CommandQueue *)q);
+    d3d12_log("[madeira-d3d12] swap-factory: dxgi asked the queue for IMTLSwapChainFactory; swapchain bridge engaged\n");
     *out = t;
     return S_OK;
 }

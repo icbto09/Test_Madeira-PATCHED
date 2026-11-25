@@ -1,0 +1,138 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 193d414..e57c6b2 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -2259,8 +2259,29 @@ private:
+     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);
+   }
+ 
++  // madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 (MIT)
++  // env MADEIRA_EC_DF_CTX = 0 turns it off (here and in xtajit64/ntdll, where it is logged); on by default.
++  // Affects code generation: read once per process.
++  static bool MadeiraDfCtx() {
++    static const bool On = [] {
++      const char* E = getenv("MADEIRA_EC_DF_CTX");
++      return !(E && E[0] == '0' && E[1] == '\0');
++    }();
++    return On;
++  }
++
+   void StoreDF(Ref Value) {
++    if (!MadeiraDfCtx()) {
++      StoreContext(DFIndex, Value);
++      return;
++    }
++    // madeira [df-ctx]: write DF through immediately. Cached context values are only flushed at block exits, so a
++    // fault later in the block (e.g. std; movs to a bad address) would otherwise see, report in its exception
++    // context and resume with a stale direction flag. STD/CLD/POPF are rare, the store is cheap. Still cached for
++    // the LoadDF()s that follow, but not left Written, so FlushRegisterCache doesn't store it again.
++    _StoreContextGPR(OpSize::i8Bit, Value, offsetof(Core::CPUState, flags[X86State::RFLAG_DF_RAW_LOC]));
+     StoreContext(DFIndex, Value);
++    RegCache.Written &= ~(1ull << DFIndex);
+   }
+ 
+   Ref GetRFLAG(unsigned BitOffset, bool Invert = false) {
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 29a2442..04f9ba1 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -235,6 +235,12 @@ struct ThreadCPUArea {
+ 
+ struct FrontendThreadData {
+   bool InLockedRWXRead {};
++#ifdef FEX_IOS_HOST
++  // madeira [df-ctx]: the last exception went to the guest by RethrowGuestException (its context's CPSR bit 16 reached
++  // the handler, so the DF in the context it continues with is real). Cleared by RaiseException (the unix syscall
++  // path masks bit 16) and consumed by SyncThreadContext.
++  bool IosDfDelivered {};
++#endif
+ };
+ 
+ namespace {
+@@ -617,6 +623,16 @@ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
+  * signal_arm64ec.c ios_pfaf_stash: PF/AF go to the guest in CPSR bits 26/27 of the packed context,
+  * and come back in ContextAmd64.EFlags marked with reserved bit 15. */
+ uint32_t IosPfAfKeep = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
++/* madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 (MIT)
++ * (env MADEIRA_EC_DF_CTX = 0 turns it off, here, in the JIT (StoreDF write-through) and in ntdll). rev=df-ctx-1.
++ * DF goes to the guest in RES0 CPSR bit 16 of the packed context (ntdll's cpsr_to_eflags maps it; bits 26/27 are
++ * [pfaf-keep]'s PF/AF), and comes back the [pfaf-keep] way: never in CPSR (the unix syscall frame's cpsr_user_mask
++ * drops bit 16), but stashed by ntdll from the x64 context of NtContinue / NtSetContextThread(self) and put into
++ * ContextAmd64.EFlags by dispatch_emulation with reserved EFLAGS bit 3 set to say it is real. SyncThreadContext uses it
++ * only after an exception RethrowGuestException delivered (FrontendThreadData::IosDfDelivered): for traps raised through
++ * the unix path (RaiseException: int3, single-step, ud) bit 16 never reached the handler, so its context says DF=0
++ * whatever the code had, and the resume keeps the JIT state's DF as before. */
++uint32_t IosDfCtx = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
+ #endif
+ 
+ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+@@ -870,6 +886,9 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+     ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
+     ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
+   }
++  if (IosDfCtx) { // madeira [df-ctx]: DF has no NZCV equivalent; RES0 bit 16, which ntdll's cpsr_to_eflags maps
++    ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)) ? (1U << 16) : 0;
++  }
+ #endif
+ 
+   ECContext.Fpcr = FPCR;
+@@ -919,6 +938,13 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
+   // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   [[maybe_unused]] const uint32_t RaiseLiveTF = (EFlags >> FEXCore::X86State::RFLAG_TF_RAW_LOC) & 1U; // madeira [assert-dump-2]
++#ifdef FEX_IOS_HOST
++  // madeira [df-ctx]: this path goes through the unix syscall frame, which drops CPSR bit 16: the handler saw DF=0 and
++  // the DF of the context it continues with is not real, so the resume keeps the JIT state's DF (as before).
++  if (auto* FTD = GetFrontendThreadData(Thread)) {
++    FTD->IosDfDelivered = false;
++  }
++#endif
+   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+ 
+@@ -1158,6 +1184,9 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
+     ReconstructThreadState(Thread, Context);
+   }
+   Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
++  if (auto* FTD = GetFrontendThreadData(Thread)) { // madeira [df-ctx]: bit 16 reaches the handler on this path
++    FTD->IosDfDelivered = IosDfCtx != 0;
++  }
+ 
+   // ml341: see RaiseException.
+   const uint64_t PeRip = IosJitReverseTranslate(Args->Context.Pc);
+@@ -1425,6 +1454,23 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+       ValidMask |= (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC);
+     }
+   }
++  // madeira [df-ctx]: ntdll marks a resume whose DF came from the guest's own context with reserved bit 3. It is used
++  // only when the exception before it was delivered with DF (RethrowGuestException); otherwise, and without the mark, DF
++  // stays merged in from the JIT state, as before (single-step/int3 traps raised through the unix path, thread
++  // suspend/resume, contexts built from ARM ones).
++  {
++    auto* FTD = GetFrontendThreadData(Thread);
++    const bool DfDelivered = FTD && FTD->IosDfDelivered;
++    if (FTD) {
++      FTD->IosDfDelivered = false;
++    }
++    if (Context->EFlags & (1U << 3)) {
++      Context->EFlags &= ~(1U << 3);
++      if (Exception::IosDfCtx && DfDelivered) {
++        ValidMask |= 1U << FEXCore::X86State::RFLAG_DF_RAW_LOC;
++      }
++    }
++  }
+ #endif
+   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   Context->EFlags = (Context->EFlags & ValidMask) | (StateEFlags & ~ValidMask);
+@@ -1636,6 +1682,11 @@ NTSTATUS ProcessInit() {
+       Exception::IosPfAfKeep = 0;
+     }
+     LogMan::Msg::EFmt("[pfaf-keep] rev=pfaf-keep-2 xtajit64 {}", Exception::IosPfAfKeep ? "on" : "off (MADEIRA_EC_PFAF_KEEP=0)");
++    const char* DfCtx = getenv("MADEIRA_EC_DF_CTX"); // madeira [df-ctx]
++    if (DfCtx && DfCtx[0] == '0') {
++      Exception::IosDfCtx = 0;
++    }
++    LogMan::Msg::EFmt("[df-ctx] rev=df-ctx-1 xtajit64 {}", Exception::IosDfCtx ? "on" : "off (MADEIRA_EC_DF_CTX=0)");
+     const char* SectionViews = getenv("MADEIRA_EC_SECTION_VIEWS"); // madeira [section-views]
+     FEX_MadeiraSectionViews = (SectionViews && SectionViews[0] == '0') ? 0 : 1;
+     const char* JitInval = getenv("MADEIRA_EC_JIT_INVAL"); // madeira [jit-inval]

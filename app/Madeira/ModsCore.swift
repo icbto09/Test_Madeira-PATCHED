@@ -41,6 +41,8 @@ enum ModError: LocalizedError, Equatable {
     case unknownFile(String)
     case rar(String)
     case encrypted
+    case bepinexDownload
+    case bepinexHash
 
     var errorDescription: String? {
         switch self {
@@ -54,6 +56,8 @@ enum ModError: LocalizedError, Equatable {
         case .unknownFile(let name): return "Madeira can't open \(name). Choose a .zip, .7z, .rar or .fomod file, or a folder."
         case .rar(let why): return ".rar files can't be opened on this device (\(why)). Unpack it on a computer and choose the folder, or use a .zip or .7z."
         case .encrypted: return "This archive has a password. Madeira can't open it."
+        case .bepinexDownload: return "BepInEx couldn't be downloaded. Check your connection and try again."
+        case .bepinexHash: return "The download was not the expected BepInEx file, so nothing was installed."
         }
     }
 }
@@ -1131,5 +1135,120 @@ final class ModStore {
             game.writeConfig(ModConfigLines.removing(game.readConfig()))
             manifest.addedOverride = false
         }
+    }
+}
+
+// MARK: BepInEx, one tap
+
+/// SHA-256 (FIPS 180-4), written out so the same code runs in the host fixture; the app checks
+/// one pinned download with it.
+struct SHA256Hasher {
+    private var state: [UInt32] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+    private var pending: [UInt8] = []
+    private var length: UInt64 = 0
+    private static let k: [UInt32] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ]
+
+    private static func rotr(_ x: UInt32, _ n: UInt32) -> UInt32 { (x >> n) | (x << (32 - n)) }
+
+    private mutating func block(_ chunk: ArraySlice<UInt8>) {
+        var w = [UInt32](repeating: 0, count: 64)
+        let base = chunk.startIndex
+        for i in 0..<16 {
+            let j = base + i * 4
+            w[i] = UInt32(chunk[j]) << 24 | UInt32(chunk[j + 1]) << 16 | UInt32(chunk[j + 2]) << 8 | UInt32(chunk[j + 3])
+        }
+        for i in 16..<64 {
+            let s0 = Self.rotr(w[i - 15], 7) ^ Self.rotr(w[i - 15], 18) ^ (w[i - 15] >> 3)
+            let s1 = Self.rotr(w[i - 2], 17) ^ Self.rotr(w[i - 2], 19) ^ (w[i - 2] >> 10)
+            w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
+        }
+        var a = state[0], b = state[1], c = state[2], d = state[3], e = state[4], f = state[5], g = state[6], h = state[7]
+        for i in 0..<64 {
+            let s1 = Self.rotr(e, 6) ^ Self.rotr(e, 11) ^ Self.rotr(e, 25)
+            let ch = (e & f) ^ (~e & g)
+            let t1 = h &+ s1 &+ ch &+ Self.k[i] &+ w[i]
+            let s0 = Self.rotr(a, 2) ^ Self.rotr(a, 13) ^ Self.rotr(a, 22)
+            let maj = (a & b) ^ (a & c) ^ (b & c)
+            let t2 = s0 &+ maj
+            h = g; g = f; f = e; e = d &+ t1; d = c; c = b; b = a; a = t1 &+ t2
+        }
+        state[0] = state[0] &+ a; state[1] = state[1] &+ b; state[2] = state[2] &+ c; state[3] = state[3] &+ d
+        state[4] = state[4] &+ e; state[5] = state[5] &+ f; state[6] = state[6] &+ g; state[7] = state[7] &+ h
+    }
+
+    mutating func update(_ bytes: [UInt8]) {
+        length += UInt64(bytes.count)
+        pending += bytes
+        var offset = 0
+        while pending.count - offset >= 64 {
+            block(pending[offset..<offset + 64])
+            offset += 64
+        }
+        if offset > 0 { pending.removeFirst(offset) }
+    }
+
+    /// The digest as 64 lowercase hex digits.
+    mutating func finish() -> String {
+        let bits = length * 8
+        var tail: [UInt8] = [0x80]
+        while (pending.count + tail.count) % 64 != 56 { tail.append(0) }
+        for i in (0..<8).reversed() { tail.append(UInt8(truncatingIfNeeded: bits >> (UInt64(i) * 8))) }
+        pending += tail
+        var offset = 0
+        while pending.count - offset >= 64 {
+            block(pending[offset..<offset + 64])
+            offset += 64
+        }
+        pending.removeAll()
+        return state.map { String(format: "%08x", $0) }.joined()
+    }
+
+    static func hex(of data: Data) -> String {
+        var hasher = SHA256Hasher()
+        hasher.update([UInt8](data))
+        return hasher.finish()
+    }
+
+    /// The file's digest, read in 1 MB pieces.
+    static func hex(ofFile url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256Hasher()
+        while let piece = try handle.read(upToCount: 1 << 20), !piece.isEmpty { hasher.update([UInt8](piece)) }
+        return hasher.finish()
+    }
+}
+
+/// The BepInEx card on the Mods page: one pinned official release of BepInEx 5 (win x64), installed
+/// like any other mod (backups, manifest; Remove takes its files out and brings back any game file it
+/// replaced; what BepInEx wrote while the game ran, its config, cache and log files and any plugins
+/// the player added, stays).
+/// bepinex-auto (WineProcessBridge.m) then adds winhttp=n,b at launch. The hash below is GitHub's own
+/// "digest" for the release asset (api.github.com, 2026-11-17); the app checks the download against
+/// it and the size before anything is unpacked.
+enum BepInExLoader {
+    static let name = "BepInEx"
+    static let version = "5.4.23.6"
+    static let url = URL(string: "https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.6/BepInEx_win_x64_5.4.23.6.zip")!
+    static let bytes: Int64 = 642_076
+    static let sha256 = "6c57a714a892efb4e9e1fef63d608a3391f30ec984031c465404e4ee381a0755"
+
+    /// The mod the card installed (or one the person added themselves under the same name).
+    static func isLoader(_ mod: ModRecord) -> Bool { mod.kind == .bepinex && mod.name == name }
+    static func loader(in mods: [ModRecord]) -> ModRecord? { mods.first(where: isLoader) }
+
+    /// Throws unless `file` is the pinned release: its size, then its SHA-256.
+    static func verify(_ file: URL, bytes expectedBytes: Int64 = bytes, sha256 expected: String = sha256) throws {
+        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? -1
+        guard size == expectedBytes, (try? SHA256Hasher.hex(ofFile: file)) == expected else { throw ModError.bepinexHash }
     }
 }

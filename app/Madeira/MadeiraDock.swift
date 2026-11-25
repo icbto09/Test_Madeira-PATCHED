@@ -126,14 +126,29 @@ enum MadeiraDock {
                 guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)) else { continue }
                 let held = depots(manifest: data)
                 lent.merge(held.lent) { $0.union($1) }
-                guard let game = game(manifest: data, library: library),
-                      !result.contains(where: { $0.id == game.id }) else { continue }
+                guard let game = game(manifest: data, library: library) else { continue }
+                if let first = result.first(where: { $0.id == game.id }) {
+                    // The same App ID in two libraries: the first one listed wins (the client's own, then the ones its
+                    // libraryfolders.vdf lists, then drive libraries). Only that copy is ever offered for a move.
+                    noteDuplicate(appID: game.id, using: first.library, other: library)
+                    continue
+                }
                 installed[game.id] = held.installed
                 result.append(game)
             }
         }
         result.removeAll { game in lent[game.id].map { installed[game.id, default: []].isSubset(of: $0) } ?? false }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private static let duplicateLock = NSLock()
+    private static var duplicatesLogged: Set<String> = []
+    /// Logs one "[external] duplicate appid" line per pair (games() runs on any thread, so the log is written on the main one).
+    private static func noteDuplicate(appID: Int, using: String, other: String) {
+        let key = "\(appID)|\(using)|\(other)"
+        duplicateLock.lock(); let isNew = duplicatesLogged.insert(key).inserted; duplicateLock.unlock()
+        guard isNew else { return }
+        DispatchQueue.main.async { LogStore.shared.log("[external] duplicate appid \(appID) in \(using) and \(other), using \(using)") }
     }
 
     /// The client's own library, the libraries on C: its `libraryfolders.vdf` lists and
@@ -515,6 +530,15 @@ enum MadeiraDock {
         let guardMap = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_MAP_GUARD", default: true)
         if guardMap { setenv("MADEIRA_IMAGE_MAP_GUARD", "1", 1) }
         SteamLog.event("[dock-launch] image-map-guard=\(guardMap ? 1 : 0)")
+        // (tcp-connect-timeout) A Steam client start waited about 150 s on a connection to
+        // crash.steampowered.com that never answered (device log 0.2.33: [srv-conn-done] dport=443
+        // err=60, the game started at t+154 s). Wine's opt-in MADEIRA_CONNECT_TIMEOUT_MS fails a TCP
+        // connect still pending after that many ms, as a refused one fails. Dock sessions default to
+        // 10000; a value already set in madeira.cfg is kept; env.MADEIRA_DOCK_CONNECT_TIMEOUT = 0
+        // leaves it unset.
+        let connectTimeout = SteamSignIn.flag("MADEIRA_DOCK_CONNECT_TIMEOUT", default: true)
+        if connectTimeout, getenv("MADEIRA_CONNECT_TIMEOUT_MS") == nil { setenv("MADEIRA_CONNECT_TIMEOUT_MS", "10000", 1) }
+        SteamLog.event("[dock-launch] connect-timeout=\(connectTimeout ? 1 : 0)")
         DockOffline.configure(appID: game.id)
     }
 

@@ -97,7 +97,7 @@ require('LogStore.shared.flushRepeats()' in store, 'the count is written when Ma
 require('LogTrail.during()' in log_fn and 'level == .error' in log_fn, 'an error line says what was going on')
 caps = dict(re.findall(r'\.(\w+): (\d+)', trail[trail.index('private static let caps'):].split('\n')[0]))
 total = sum(int(v) for v in caps.values())
-require(set(caps) == {'pad', 'focus', 'screen', 'tap', 'app', 'step'} and total <= 900, f'caps per run: {caps} = {total} lines at most')
+require(set(caps) - {'tapDiag'} == {'pad', 'focus', 'screen', 'tap', 'app', 'step'} and total <= 900, f'caps per run: {caps} = {total} lines at most')
 
 # Markers: literal segments longer than 15 bytes, so they are in the binary's string table.
 for marker in ['[log-trail] on: [pad] [focus] [screen] [tap] [app] [step]', '[focus] system focus -> ',
@@ -110,7 +110,7 @@ require(store.count('try? LogRuns.initialHeader().write(to: logFileURL, atomical
         'the log starts with the summary block (at start and after Clear)')
 require('static let headerBytes = 4096' in trail and 'data.count == headerBytes' in trail, 'the block is a fixed size, rewritten in place')
 require('String(decoding: head, as: UTF8.self) == firstLine' in trail, 'the block is rewritten only while the file still starts with it')
-require('LogRuns.start(title: entry.title, store: store, windowsPath: entry.windowsPath)' in trail
+require('LogRuns.start(title: entry.title, store: store, windowsPath: entry.windowsPath, settings: RunLedger.settingsText(entry))' in trail
         and 'LogRuns.began(title: entry.title)' in trail and 'LogRuns.stepped(name, seconds: seconds)' in trail
         and 'LogRuns.ended(why + ", " + code' in trail and 'LogRuns.previousRun(' in trail, 'runs start, step, end, and the previous run is noted')
 require('static func lastRunText(game: String? = nil, maxBytes: Int = 200_000' in trail, 'one game\'s last run for Get Help: LogRuns.lastRunText(game:)')
@@ -131,9 +131,12 @@ def slice_run(lines, game, tail=3):
         return None
     end = next((i for i in range(start, len(lines)) if f'[run-end] #{number}' in lines[i]), len(lines) - 1)
     out = []
+    crash = 0
     for i in range(start, end + 1):
         line = lines[i]
         madeira = line.startswith('[') and line[1:13].count(':') == 2
+        if '[crash-report]' in line and crash < 80:
+            out.append(line); crash += 1; continue
         if i >= end - tail + 1 or madeira or ':err:' in line:
             out.append(line)
     return out
@@ -146,6 +149,12 @@ require(s1 is not None and s1[0].endswith('#1 Stardew Valley') and '0108:err:y' 
         'a named game\'s run is cut from its start to its end, with Wine errors')
 s2 = slice_run(log, None)
 require(s2 is not None and s2[0].endswith('#2 Satisfactory') and 'noise1' not in s2 and s2[-1] == 'last2', 'no name: the last run, to the end of the file, with its last lines')
+
+# (crash-capture) the Wine crash block has no time stamp and is still kept, up to 80 lines.
+cr = ['[00:00:01.000] [INFO] [run-start] #1 G'] + ['[crash-report] line %d' % n for n in range(90)] + ['noise', 'x1', 'x2', 'x3', '[00:00:09.000] [INFO] [run-end] #1']
+sc = slice_run(cr, 'G')
+require(sc is not None and sum('[crash-report]' in l for l in sc) == 80 and 'noise' not in sc, 'the crash block is kept (80 lines), other plain lines are cut')
+require('line.contains("[crash-report]")' in trail and 'MADEIRA_REPORT_CRASH_BLOCK' in trail, 'LogTrail.slice keeps the crash block (source) with its off switch')
 
 # The timestamp reader, mirrored.
 def time_of(line):

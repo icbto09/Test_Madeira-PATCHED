@@ -1,0 +1,386 @@
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -12,6 +12,325 @@
+ #include <Metal/MTL4LibraryFunctionDescriptor.h>
+ #include <Metal/MTL4RenderPipeline.h>
+ #include <Metal/MTLDevice.h>
++#import <Metal/Metal.h>
++
++#include <dirent.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++/* ---------------------------------------------------------------------------
++ * Madeira: Metal 4 pipeline archive (opt-in). Detroit: Become Human builds
++ * ~100k pipelines on first launch and ~96% of that time is Apple's Metal
++ * compiler ([kk-compile] probe). Metal 4 can capture finished pipelines into an
++ * archive file and look them up on the next launch.
++ *
++ * ON:  env.MADEIRA_KK_METAL_ARCHIVE = 1   (default OFF; anything else = off,
++ *      and then every function below behaves exactly like upstream Mesa)
++ * Folder: $MESA_SHADER_CACHE_DIR/kk-metal-archive (else $HOME/Library/Caches/...)
++ *
++ * Why one compiler + serializer PER THREAD: Apple's forum reports crashes when
++ * several threads capture into one MTL4PipelineDataSetSerializer, and when it
++ * is flushed while compiles are in flight. Each thread owns its compiler and
++ * serializer and flushes only between its own compiles. Files are named
++ * r<unix time>-t<slot>.mtl4a so a new run never overwrites an older run.
++ * Every *.mtl4a in the folder is opened at the first compile and passed as
++ * lookupArchives.
++ * ------------------------------------------------------------------------- */
++#define KK_ARCH_MAX_FILES 256
++#define KK_ARCH_FLUSH_NS (30ull * 1000000000ull)
++#define KK_ARCH_PRINT_NS (10ull * 1000000000ull)
++
++struct kk_arch_thread {
++   id<MTL4Compiler> comp;
++   id<MTL4PipelineDataSetSerializer> ser;
++   NSURL *url;
++   uint64_t last_flush_ns;
++   uint32_t since_flush;
++};
++
++static pthread_key_t kk_arch_key;
++static pthread_once_t kk_arch_key_once = PTHREAD_ONCE_INIT;
++static dispatch_once_t kk_arch_load_once;
++static NSArray *kk_arch_archives = nil;
++static char kk_arch_dir[1024];
++static long long kk_arch_run_id;
++static atomic_uint kk_arch_slots;
++static atomic_ullong kk_arch_lib_ns, kk_arch_lib_n, kk_arch_pipe_ns,
++   kk_arch_pipe_n, kk_arch_flush_ns, kk_arch_flush_n, kk_arch_flush_bytes,
++   kk_arch_last_print_ns, kk_arch_prev_lib_n, kk_arch_prev_pipe_n;
++
++static bool
++kk_arch_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("MADEIRA_KK_METAL_ARCHIVE");
++      on = (e && !strcmp(e, "1")) ? 1 : 0;
++   }
++   return on == 1;
++}
++
++static uint64_t
++kk_arch_now(void)
++{
++   return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++static void
++kk_arch_print(uint64_t now)
++{
++   uint64_t last = atomic_load(&kk_arch_last_print_ns);
++   if (now <= last || now - last < KK_ARCH_PRINT_NS)
++      return;
++   if (!atomic_compare_exchange_strong(&kk_arch_last_print_ns, &last, now))
++      return;
++   unsigned long long ln = atomic_load(&kk_arch_lib_n);
++   unsigned long long pn = atomic_load(&kk_arch_pipe_n);
++   unsigned long long fn = atomic_load(&kk_arch_flush_n);
++   unsigned long long wl = ln - atomic_exchange(&kk_arch_prev_lib_n, ln);
++   unsigned long long wp = pn - atomic_exchange(&kk_arch_prev_pipe_n, pn);
++   fprintf(stderr,
++           "[kk-archive] since last line: libraries %llu, pipelines %llu | all: "
++           "library avg %.1f ms, pipeline avg %.1f ms | archives opened %lu | "
++           "flushes %llu avg %.0f ms, last total %.1f MB | threads %u (on by "
++           "env.MADEIRA_KK_METAL_ARCHIVE = 1)\n",
++           wl, wp, ln ? atomic_load(&kk_arch_lib_ns) / 1e6 / ln : 0.0,
++           pn ? atomic_load(&kk_arch_pipe_ns) / 1e6 / pn : 0.0,
++           (unsigned long)[kk_arch_archives count], fn,
++           fn ? atomic_load(&kk_arch_flush_ns) / 1e6 / fn : 0.0,
++           atomic_load(&kk_arch_flush_bytes) / 1048576.0,
++           atomic_load(&kk_arch_slots));
++}
++
++static void
++kk_arch_flush(struct kk_arch_thread *t)
++{
++   if (t->since_flush == 0)
++      return;
++   uint64_t t0 = kk_arch_now();
++   NSError *error = nil;
++   BOOL ok = [t->ser serializeAsArchiveAndFlushToURL:t->url error:&error];
++   uint64_t t1 = kk_arch_now();
++   t->last_flush_ns = t1;
++   if (!ok) {
++      fprintf(stderr, "[kk-archive] flush failed: %s\n",
++              error ? [error.localizedDescription UTF8String] : "(no error)");
++      return;
++   }
++   t->since_flush = 0;
++   struct stat st;
++   if (stat([t->url.path fileSystemRepresentation], &st) == 0)
++      atomic_store(&kk_arch_flush_bytes, (unsigned long long)st.st_size);
++   atomic_fetch_add(&kk_arch_flush_ns, t1 - t0);
++   atomic_fetch_add(&kk_arch_flush_n, 1);
++}
++
++static void
++kk_arch_thread_exit(void *data)
++{
++   struct kk_arch_thread *t = data;
++   if (!t)
++      return;
++   @autoreleasepool {
++      if (t->ser)
++         kk_arch_flush(t);
++      [t->url release];
++      [t->ser release];
++      [t->comp release];
++   }
++   free(t);
++}
++
++static void
++kk_arch_make_key(void)
++{
++   pthread_key_create(&kk_arch_key, kk_arch_thread_exit);
++}
++
++static void
++kk_arch_load(id<MTLDevice> dev)
++{
++   const char *base = getenv("MESA_SHADER_CACHE_DIR");
++   const char *home = getenv("HOME");
++   if (base && *base)
++      snprintf(kk_arch_dir, sizeof(kk_arch_dir), "%s/kk-metal-archive", base);
++   else if (home)
++      snprintf(kk_arch_dir, sizeof(kk_arch_dir),
++               "%s/Library/Caches/kk-metal-archive", home);
++   else
++      return;
++   kk_arch_run_id = (long long)time(NULL);
++
++   /* mkdir -p for the last two levels (the cache dir itself may be new) */
++   char tmp[1024];
++   snprintf(tmp, sizeof(tmp), "%s", kk_arch_dir);
++   for (char *c = tmp + 1; *c; c++) {
++      if (*c == '/') {
++         *c = 0;
++         mkdir(tmp, 0755);
++         *c = '/';
++      }
++   }
++   mkdir(tmp, 0755);
++
++   NSMutableArray *list = [[NSMutableArray alloc] init];
++   unsigned opened = 0, bad = 0, pruned = 0;
++   @autoreleasepool {
++      NSString *ns_dir = [NSString stringWithUTF8String:kk_arch_dir];
++      if (ns_dir == nil) {
++         /* not UTF-8: leave the feature off (kk_arch_pick sees an empty dir) */
++         kk_arch_dir[0] = 0;
++         fprintf(stderr, "[kk-archive] cache folder path is not UTF-8: off\n");
++         kk_arch_archives = list;
++         return;
++      }
++      NSFileManager *fm = [NSFileManager defaultManager];
++      NSMutableArray *files = [NSMutableArray array];
++      for (NSString *name in [fm contentsOfDirectoryAtPath:ns_dir error:nil]) {
++         if (![name hasSuffix:@".mtl4a"])
++            continue;
++         NSString *full = [ns_dir stringByAppendingPathComponent:name];
++         NSDate *mtime =
++            [[fm attributesOfItemAtPath:full error:nil] fileModificationDate];
++         [files addObject:@[ full, mtime ? mtime : [NSDate distantPast] ]];
++      }
++      /* newest first; older files past the limit are deleted so the folder
++       * can't grow without bound */
++      [files sortUsingComparator:^NSComparisonResult(NSArray *x, NSArray *y) {
++         return [y[1] compare:x[1]];
++      }];
++      for (NSArray *f in files) {
++         NSString *full = f[0];
++         if (opened + bad >= KK_ARCH_MAX_FILES) {
++            unlink([full fileSystemRepresentation]);
++            pruned++;
++            continue;
++         }
++         NSURL *url = [NSURL fileURLWithPath:full];
++         NSError *error = nil;
++         id<MTL4Archive> ar = [dev newArchiveWithURL:url error:&error];
++         if (ar == nil) {
++            /* Corrupt, or written by another OS/GPU: drop it so it can't hurt. */
++            fprintf(stderr, "[kk-archive] cannot open %s (%s): removed\n",
++                    [[full lastPathComponent] UTF8String],
++                    error ? [error.localizedDescription UTF8String] : "?");
++            unlink([full fileSystemRepresentation]);
++            bad++;
++            continue;
++         }
++         [list addObject:ar];
++         [ar release];
++         opened++;
++      }
++   }
++   kk_arch_archives = list;
++   fprintf(stderr,
++           "[kk-archive] on dir=%s archives opened=%u removed(bad)=%u removed(old)=%u\n",
++           kk_arch_dir, opened, bad, pruned);
++}
++
++/* The compiler to use on this thread: the shared one when off or on failure. */
++static id<MTL4Compiler>
++kk_arch_pick(id<MTL4Compiler> shared)
++{
++   if (!kk_arch_on() || shared == nil)
++      return shared;
++   pthread_once(&kk_arch_key_once, kk_arch_make_key);
++   struct kk_arch_thread *t = pthread_getspecific(kk_arch_key);
++   if (t)
++      return t->comp ? t->comp : shared;
++
++   t = calloc(1, sizeof(*t));
++   if (!t)
++      return shared;
++   if (pthread_setspecific(kk_arch_key, t) != 0) {
++      free(t);
++      return shared;
++   } /* the struct is kept even when setup fails below: remembers failure */
++
++   id<MTLDevice> dev = [shared device];
++   dispatch_once(&kk_arch_load_once, ^{
++      kk_arch_load(dev);
++   });
++   if (kk_arch_dir[0] == 0)
++      return shared;
++
++   MTL4PipelineDataSetSerializerDescriptor *sd =
++      [[MTL4PipelineDataSetSerializerDescriptor new] autorelease];
++   sd.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
++   id<MTL4PipelineDataSetSerializer> ser =
++      [dev newPipelineDataSetSerializerWithDescriptor:sd];
++   if (ser == nil) {
++      fprintf(stderr, "[kk-archive] cannot create serializer: archive off for this thread\n");
++      return shared;
++   }
++
++   MTL4CompilerDescriptor *cd = [[MTL4CompilerDescriptor new] autorelease];
++   cd.pipelineDataSetSerializer = ser;
++   NSError *error = nil;
++   id<MTL4Compiler> comp = [dev newCompilerWithDescriptor:cd error:&error];
++   if (comp == nil) {
++      fprintf(stderr, "[kk-archive] cannot create compiler: %s\n",
++              error ? [error.localizedDescription UTF8String] : "?");
++      [ser release];
++      return shared;
++   }
++
++   unsigned slot = atomic_fetch_add(&kk_arch_slots, 1);
++   char path[1280];
++   snprintf(path, sizeof(path), "%s/r%lld-t%u.mtl4a", kk_arch_dir,
++            kk_arch_run_id, slot);
++   NSString *ns_path = [NSString stringWithUTF8String:path];
++   if (ns_path == nil) {
++      fprintf(stderr, "[kk-archive] archive path is not UTF-8: archive off for this thread\n");
++      [ser release];
++      [comp release];
++      return shared;
++   }
++   t->url = [[NSURL fileURLWithPath:ns_path] retain];
++   t->ser = ser;
++   t->comp = comp;
++   t->last_flush_ns = kk_arch_now();
++   return comp;
++}
++
++static MTL4CompilerTaskOptions *
++kk_arch_options(void)
++{
++   if (!kk_arch_on() || kk_arch_archives == nil || [kk_arch_archives count] == 0)
++      return nil;
++   MTL4CompilerTaskOptions *o = [[MTL4CompilerTaskOptions new] autorelease];
++   o.lookupArchives = kk_arch_archives;
++   return o;
++}
++
++static void
++kk_arch_note(bool is_lib, uint64_t t0)
++{
++   if (!kk_arch_on())
++      return;
++   uint64_t now = kk_arch_now();
++   if (is_lib) {
++      atomic_fetch_add(&kk_arch_lib_ns, now - t0);
++      atomic_fetch_add(&kk_arch_lib_n, 1);
++   } else {
++      atomic_fetch_add(&kk_arch_pipe_ns, now - t0);
++      atomic_fetch_add(&kk_arch_pipe_n, 1);
++      struct kk_arch_thread *t = pthread_getspecific(kk_arch_key);
++      if (t && t->ser) {
++         t->since_flush++;
++         if (now - t->last_flush_ns >= KK_ARCH_FLUSH_NS)
++            kk_arch_flush(t);
++      }
++   }
++   kk_arch_print(now);
++}
+ 
+ /* Compiler */
+ mtl_compiler *
+@@ -41,7 +360,7 @@
+                 enum mtl_math_floating_point_functions math_fp_fns)
+ {
+    @autoreleasepool {
+-      id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
++      id<MTL4Compiler> comp = kk_arch_pick((id<MTL4Compiler>)compiler);
+       NSString *ns_src = [NSString stringWithCString:src encoding:NSASCIIStringEncoding];
+ 
+       MTLCompileOptions *opts = [[MTLCompileOptions new] autorelease];
+@@ -54,7 +373,9 @@
+       desc.options = opts;
+ 
+       NSError *error;
++      uint64_t arch_t0 = kk_arch_now();
+       id<MTLLibrary> lib = [comp newLibraryWithDescriptor:desc error:&error];
++      kk_arch_note(true, arch_t0);
+ 
+       if (lib == nil) {
+          fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
+@@ -85,15 +406,18 @@
+                                uint64_t max_total_threads_per_threadgroup)
+ {
+    @autoreleasepool {
+-      id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
++      id<MTL4Compiler> comp = kk_arch_pick((id<MTL4Compiler>)compiler);
+ 
+       MTL4ComputePipelineDescriptor *desc = [[MTL4ComputePipelineDescriptor new] autorelease];
+       desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
+       desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
+ 
+       NSError *error;
+-      id<MTLComputePipelineState> pipeline = [comp newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil
++      uint64_t arch_t0 = kk_arch_now();
++      id<MTLComputePipelineState> pipeline = [comp newComputePipelineStateWithDescriptor:desc
++                                                                     compilerTaskOptions:kk_arch_options()
+                                                                                    error:&error];
++      kk_arch_note(false, arch_t0);
+ 
+       if (pipeline == nil) {
+          fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n", [error.localizedDescription UTF8String]);
+@@ -188,12 +512,15 @@
+ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *descriptor)
+ {
+    @autoreleasepool {
+-      id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
++      id<MTL4Compiler> comp = kk_arch_pick((id<MTL4Compiler>)compiler);
+       MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+ 
+       NSError *error = nil;
+-      id<MTLRenderPipelineState> pipeline = [comp newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:nil
++      uint64_t arch_t0 = kk_arch_now();
++      id<MTLRenderPipelineState> pipeline = [comp newRenderPipelineStateWithDescriptor:desc
++                                                                   compilerTaskOptions:kk_arch_options()
+                                                                                  error:&error];
++      kk_arch_note(false, arch_t0);
+ 
+       if (pipeline == nil) {
+          fprintf(stderr, "Failed to create MTLRenderPipelineState: %s\n", [error.localizedDescription UTF8String]);

@@ -95,7 +95,7 @@ static const IMAGE_NT_HEADERS32 *get_nt_header( void )
     if (!dos) return NULL;
     is_builtin = (dos->e_lfanew >= sizeof(*dos) + 32 &&
                   !memcmp( dos + 1, builtin_signature, sizeof(builtin_signature) ));
-    return PRD(dos->e_lfanew, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
+    return PRD((ULONG)dos->e_lfanew, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
 }
 
 void print_fake_dll( void )
@@ -4125,7 +4125,7 @@ static void print_clr_stream( const BYTE *base, const BYTE **ptr, UINT *size )
         guids.data = base + stream_offset;
         guids.size = stream_size;
     }
-    else if (!strcmp( name, "#~" ))
+    else if (!strcmp( name, "#~" ) || !strcmp (name, "#-" ))
     {
         tables.data = base + stream_offset;
         tables.size = stream_size;
@@ -4161,7 +4161,7 @@ static void print_clr_metadata( const BYTE *data, UINT data_size )
     version = (const char *)ptr;
     print_clr( "Version      " );
     printf( "%s\n", version );
-    len = ((strlen( version ) + 1) + 3) & ~3;
+    len = (len + 3) & ~3;
     if (size < len) return;
     ptr += len; size -= len;
 
@@ -5137,7 +5137,7 @@ enum FileSig get_kind_exec(void)
     if ((dh = PRD(0, sizeof(IMAGE_DOS_HEADER))))
     {
         /* the signature is the first DWORD */
-        pdw = PRD(dh->e_lfanew, sizeof(DWORD));
+        pdw = PRD((ULONG)dh->e_lfanew, sizeof(DWORD));
         if (pdw)
         {
             if (*pdw == IMAGE_NT_SIGNATURE)                     return SIG_PE;

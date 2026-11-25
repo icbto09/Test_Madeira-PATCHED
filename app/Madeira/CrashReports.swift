@@ -58,6 +58,7 @@ enum CrashReports {
         subscribed = true
         _ = started
         info.appVersion = BuildStamp.text
+        info.playerID = GetHelp.playerID ?? ""
         info.build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         info.bundle = Bundle.main.bundleIdentifier ?? "?"
         info.device = CompatReport.device
@@ -329,8 +330,10 @@ struct CrashReportsSection: View {
                 .onChange(of: on) { _, now in
                     if now { CrashReports.start() } else { CrashReports.stop() }
                 }
+                .padToggle("logs-crash-reports", $on)
             if DebugLogging.available {
                 Button { ask = true } label: { Text(verbatim: "Crash Madeira now (test copy only)") }
+                    .padRow("logs-crash-test") { ask = true }
                     .confirmationDialog(Text(verbatim: "Madeira will close. Open it again and the crash report is sent."),
                                         isPresented: $ask, titleVisibility: .visible) {
                         Button(role: .destructive) { CrashReports.crashNow() } label: { Text(verbatim: "Crash now") }
@@ -338,6 +341,8 @@ struct CrashReportsSection: View {
                 Button { CrashReports.testError(); wrote = true } label: {
                     Text(verbatim: wrote ? "Test error written. It is sent at the next start." : "Write a test error (test copy only)")
                 }
+                .padRow("logs-test-error") { CrashReports.testError(); wrote = true }
+
             }
         } footer: {
             Text("When Madeira crashes, freezes or logs an error, a short report goes to Sentry the next time it opens, with all personal details taken out.")

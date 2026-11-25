@@ -80,6 +80,8 @@ enum DebugLogging {
 
     enum Level: Int, CaseIterable, Identifiable {
         case off, low, medium, high
+        /// (crash-debug) Low's lines plus this game's own WINEDEBUG line (module loads with their base addresses, and exceptions). The game's config line wins and the bridge resets WINEDEBUG at each launch, so nothing carries to the next game.
+        case crash
         var id: Int { rawValue }
 
         var title: String {
@@ -88,6 +90,7 @@ enum DebugLogging {
             case .low: return "Low"
             case .medium: return "Medium"
             case .high: return "High"
+            case .crash: return "Crash"
             }
         }
 
@@ -97,6 +100,7 @@ enum DebugLogging {
             case .low: return "Copies every guest text-log line (up to 3000) into the log."
             case .medium: return "Low, plus reports of code patches the emulated copy misses and of image-protection patches."
             case .high: return "Medium, plus file open/query and Social Club pipe traces. Can slow the game and make big logs."
+            case .crash: return "Low, plus Wine's module-load lines (with base addresses) and exception lines. For a crash: slower and bigger logs while it runs."
             }
         }
 
@@ -108,12 +112,15 @@ enum DebugLogging {
             case .medium: return [("env.MADEIRA_EC_HOOK_TRACE", "1"), ("env.MADEIRA_IMAGE_PATCH_TRACE", "1")]
             case .high: return [("env.MADEIRA_PIPE_TRACE", "1"), ("env.MADEIRA_PIPE_TRACE_LIMIT", "5000"),
                                 ("env.MADEIRA_FILE_TRACE", "1"), ("env.MADEIRA_FILE_TRACE_LIMIT", "20000")]
+            case .crash: return [("env.WINEDEBUG", "err+all,err-virtual,fixme-d3dcompiler,trace+loaddll,trace+seh")]
             }
         }
 
         /// Every line of this level, lower levels first.
         var lines: [(key: String, value: String)] {
-            Level.allCases.filter { $0.rawValue >= 1 && $0.rawValue <= rawValue }.flatMap { $0.own }
+            // Crash sits beside the cumulative Low/Medium/High: Low's lines plus its own, not High's traces.
+            if self == .crash { return Level.low.own + Level.crash.own }
+            return Level.allCases.filter { $0.rawValue >= 1 && $0.rawValue <= rawValue && $0 != .crash }.flatMap { $0.own }
         }
     }
 
@@ -136,7 +143,7 @@ enum DebugLogging {
     /// `text` with every line this setting writes removed, then `level`'s lines added at the end.
     /// All other lines (and comments) stay as they were.
     static func apply(_ level: Level, to text: String) -> String {
-        let managed = lineSet(.high)
+        let managed = lineSet(.high).union(lineSet(.crash))
         var kept = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init).filter { line in
             guard let p = pair(line) else { return true }
             return !managed.contains("\(p.key) = \(p.value)")
@@ -159,10 +166,9 @@ enum DebugLogging {
 
     /// The stamp for a run's log: nil unless this is the test bundle and Debug logging is not Off.
     static func stamp(windowsPath: String) -> String? {
-        guard available else { return nil }
         let text = GameProfile(windowsPath: windowsPath).text
         let level = level(of: text)
-        guard level != .off else { return nil }
+        guard level != .off, available || level == .crash else { return nil }   // (crash-debug-row) a normal build stamps Crash only
         return "Debug logging \(level.title) · game config \(configHash(text)) (\(lineCount(text)) lines)"
     }
 
@@ -202,7 +208,7 @@ enum DebugLogging {
         let mine = effective(config), rec = effective(recommended)
         let mineValues = Dictionary(mine.map { ($0.key, $0.value) }, uniquingKeysWith: { $1 })
         let recValues = Dictionary(rec.map { ($0.key, $0.value) }, uniquingKeysWith: { $1 })
-        let managed = lineSet(.high)
+        let managed = lineSet(.high).union(lineSet(.crash))
         var out: [String] = []
         for (k, v) in mine {
             if let r = recValues[k] {
@@ -233,17 +239,21 @@ enum DebugLogging {
     /// How many setting lines Reset to clean state would take out: (Debug logging, Get Help).
     static func cleanCounts(windowsPath: String) -> (debug: Int, getHelp: Int) {
         let text = GameProfile(windowsPath: windowsPath).text
-        let added = GetHelp.record(windowsPath)?.added ?? []
-        let afterHelp = added.isEmpty ? text : GetHelpCore.undo(added, from: text)
+        // (auto-tune-writer) Counted with the same walk Reset takes the lines out with.
+        let record = GetHelp.record(windowsPath)
+        let afterHelp = record.map { GetHelpCore.undo(blocks: GetHelpCore.blocks(of: $0), picked: { _ in true }, from: text) } ?? text
         return (lineCount(afterHelp) - lineCount(apply(.off, to: afterHelp)), lineCount(text) - lineCount(afterHelp))
     }
 
-    /// Takes Get Help's added lines out through Get Help's own Undo (so its record goes the same way), then the
+    /// Takes Get Help's (and auto-tune's) added lines out through their own Undo (so its record goes the same way), then the
     /// Debug logging lines, in this game's own config only. Returns what was removed.
     @discardableResult
     static func resetToClean(windowsPath: String, title: String) -> (debug: Int, getHelp: Int) {
         let counts = cleanCounts(windowsPath: windowsPath)
-        if GetHelp.record(windowsPath) != nil { GetHelp.undo(windowsPath: windowsPath, title: title) }
+        if GetHelp.record(windowsPath) != nil {
+            GetHelp.undo(windowsPath: windowsPath, title: title)
+            GetHelp.undoAutoTune(windowsPath: windowsPath, title: title)   // (auto-tune-writer) its lines go too
+        }
         let file = GameProfile(windowsPath: windowsPath)
         let before = file.text
         let after = apply(.off, to: before)

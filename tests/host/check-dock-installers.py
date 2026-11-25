@@ -66,7 +66,8 @@ require('func isdotnetframework' in lower and 'dotnetfx' not in named and
 require('SteamSignIn.flag(name, default: true)' in installers, 'every installer switch defaults on and reads env.NAME')
 for switch in ('MADEIRA_DOCK_INSTALLERS', 'MADEIRA_INSTALL_DEFAULT_KEY', 'MADEIRA_DOCK_INSTALL_CHOICE',
                'MADEIRA_DOCK_INSTALL_SCM', 'MADEIRA_DOCK_INSTALL_SERVER_SYNC', 'MADEIRA_DOTNET_FUSION',
-               'MADEIRA_INSTALL_SKIP_DOTNET', 'MADEIRA_INSTALL_SKIP_DIRECTX', 'MADEIRA_DOCK_INSTALL_REGISTRY'):
+               'MADEIRA_INSTALL_SKIP_DOTNET', 'MADEIRA_INSTALL_SKIP_DIRECTX', 'MADEIRA_DOCK_INSTALL_REGISTRY',
+               'MADEIRA_INSTALL_ALL_LIBRARIES', 'MADEIRA_INSTALL_DRIVE_LINKS'):
     require(f'flag("{switch}")' in installers, f'switch {switch} is read')
 require('reg.exe' not in installers, 'the batch never writes the registry (no reg.exe in the bundle)')
 require(content.count('setenv("MADEIRA_MADSYNC_SESSION", "0", 1)') == 1 and
@@ -128,7 +129,15 @@ struct LogEntry { enum Level { case info, success, error, debug } }
     var lines: [String] = []
     func log(_ message: String, level: LogEntry.Level = .info) { lines.append(message) }
 }
-enum MadeiraDock { static let executable = "C:\\windows\\system32\\dockhost.exe" }
+enum MadeiraDock {
+    static let executable = "C:\\windows\\system32\\dockhost.exe"
+    // dock-physx-libraries: no other Steam libraries in the fixture (found() takes extraLibraries)
+    static func steamLibraries(drive: URL) -> [String] { [] }
+}
+enum ExternalDrives {
+    static var steamLibraries: [String] { [] }
+    static func externalRoot(for relative: String, cached: Bool = false) throws -> (root: URL, identity: String?)? { nil }
+}
 ''' + game_src
 
 checks = r'''

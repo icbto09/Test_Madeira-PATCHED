@@ -39,6 +39,15 @@
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 
+struct xcontext
+{
+    ARM64EC_NT_CONTEXT c;
+    CONTEXT_EX c_ex;
+    char xs[sizeof(XSTATE) + 64];
+};
+
+C_ASSERT( sizeof(struct xcontext) == 0x670 );
+
 /* xtajit64.dll functions */
 static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
 static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
@@ -53,6 +62,10 @@ static void     (WINAPI *pBTCpu64IosSetMonoBridge)(unsigned long long);  /* ml64
  * raw base+RVA lookup — see the registration comment below. */
 static unsigned int (WINAPI *pBTCpu64IosReleaseThreadHolds)(void*, unsigned long long*, unsigned int*, unsigned int*);
 static void     (WINAPI *pBTCpu64NotifyMemoryDirty)(void*,SIZE_T);
+static unsigned int (WINAPI *pBTCpu64IosDebugRegs)(unsigned int,ULONG64*);  /* madeira [dr-pass]; iOS-only */
+static unsigned int (WINAPI *pBTCpu64IosGuestContext)(void*,ARM64_NT_CONTEXT*,unsigned int);  /* madeira [getctx-guest]; iOS-only */
+static unsigned int (WINAPI *pBTCpu64IosRaisePfAf)(ULONG64,ULONG64);  /* madeira [pfaf-int3]; iOS-only */
+static unsigned int (WINAPI *pBTCpu64IosCrashMailerData)(unsigned int,void*,unsigned int);  /* madeira [crashmailer-dump]; iOS-only */
 static void     (WINAPI *pBTCpu64NotifyReadFile)(HANDLE,void*,SIZE_T,BOOL,NTSTATUS);
 static void     (WINAPI *pBeginSimulation)(void);
 static void     (WINAPI *pFlushInstructionCacheHeavy)(const void*,SIZE_T);
@@ -69,7 +82,9 @@ static NTSTATUS (WINAPI *pThreadInit)(void);
 static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
 static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
-static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+/* store full xstate before the config is fully initialized */
+static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX] = { [PF_AVX_INSTRUCTIONS_AVAILABLE] = TRUE };
+
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
 extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
 
@@ -135,6 +150,12 @@ struct ec_thread_state
 {
     struct ec_stack_window win;
     int root_used;          /* ml633: terminal root frame accepted once per walk */
+    /* madeira [pfaf-keep]: x86 PF/AF of the context last passed to NtContinue / NtSetContextThread(self) */
+    ULONG_PTR pfaf_rip, pfaf_rsp;
+    ULONG pfaf_bits, pfaf_valid;
+    /* madeira [df-ctx]: x86 DF of the context last passed to NtContinue / NtSetContextThread(self) */
+    ULONG_PTR df_rip, df_rsp;
+    ULONG df_bits, df_valid;
 };
 static struct ec_thread_state ec_state_fallback;
 static inline struct ec_thread_state *ec_state( void )
@@ -142,7 +163,10 @@ static inline struct ec_thread_state *ec_state( void )
     CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
     ULONG_PTR p;
     if (!area) return &ec_state_fallback;
-    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(ARM64EC_NT_CONTEXT);
+    /* Wine 11.22: dispatch_emulation() writes a whole struct xcontext (context,
+     * CONTEXT_EX and XSTATE, 0x670 bytes) at ContextAmd64, so the free bytes
+     * start after that, not after the bare context. */
+    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(struct xcontext);
     p = (p + 15) & ~(ULONG_PTR)15;
     return (struct ec_thread_state *)p;
 }
@@ -359,9 +383,17 @@ static inline BOOL enter_syscall_callback(void)
 
 static inline void leave_syscall_callback(void)
 {
-    CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+    CHPE_V2_CPU_AREA_INFO *cpu_area = get_arm64ec_cpu_area();
+    CONTEXT ctx;
 
-    if (area) area->InSyscallCallback = 0;
+    if (!cpu_area) return;   /* iOS-Madeira: a thread with no CPU area yet */
+    cpu_area->InSyscallCallback = 0;
+
+    if (!cpu_area->InSimulation && cpu_area->SuspendDoorbell && *cpu_area->SuspendDoorbell)
+    {
+        RtlCaptureContext( &ctx );
+        if (*cpu_area->SuspendDoorbell) NtContinue( &ctx, FALSE );
+    }
 }
 
 /**********************************************************************
@@ -535,6 +567,12 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
             void *target = (char *)ptr + 14 + off;
             return xlate_ios_jit( target );
         }
+        /* Madeira [hotpatch-thunks]: step over the 8-byte hotpatch prologue
+         * (48 8d a4 24 00 00 00 00) the loader puts before forwarder jumps when
+         * env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1. */
+        if (bytes[0] == 0x48 && bytes[1] == 0x8d && bytes[2] == 0xa4 && bytes[3] == 0x24 &&
+            !bytes[4] && !bytes[5] && !bytes[6] && !bytes[7] && bytes[8] == 0xff && bytes[9] == 0x25)
+            bytes += 8;
         /* (a) simple forwarder thunk */
         if (bytes[0] == 0xff && bytes[1] == 0x25)
         {
@@ -602,6 +640,63 @@ static void arm64x_check_call(void);
  * to phase 2 (arm64ec_process_init_finish), which runs AFTER DllMains
  * because FEX's CRT init requires ucrtbase to be initialized.
  */
+/* rtcs-diag (Battle.net / Overwatch 2 test builds): diagnostic only, no behaviour change.
+ * In the Overwatch process pResetToConsistentState was NULL ("[rtcs] pre ... rtcs=0000000000000000"), so a
+ * brk #0 from FEX's guest-SIGTRAP stub reached the guest handler with the host rip and sp. This logs what
+ * the CPU module's ResetToConsistentState export looked like at init and whether the pointer is still the
+ * same at the first exceptions. MADEIRA_RTCS_DIAG=0 turns it off (read once; any other value leaves it on). */
+static void *rtcs_diag_raw, *rtcs_diag_init;
+static LONG rtcs_diag_hits;
+
+static BOOL rtcs_diag_enabled( void )
+{
+    static LONG mode;   /* 0 not yet, 1 off, 2 on */
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_RTCS_DIAG" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
+/* rtcs-diag2 (bnettest22): the bnettest21 log showed pointer, stored-at-init and export all reading 0 at
+ * the exception although init had set them (same thread). So either this .data page was cleared after init,
+ * or the exception runs in a DIFFERENT ntdll instance than the one init wrote. Log, at init and at the
+ * exception: where the static lives, which code instance is running (this function's address), the
+ * arm64x_check_call address init stashed in PEB.WerRegistrationData versus this instance's own, and an
+ * FNV-1a hash of the 4 KB page holding the static. Same off switch: MADEIRA_RTCS_DIAG=0. */
+/* returns the FNV-1a hash; *nz = non-zero bytes in the page (a page cleared after init shows only the few
+ * bytes the diag's own counters wrote since, instead of hundreds) */
+static unsigned int rtcs_diag_page_fnv( const void *p, unsigned int *nz )
+{
+    const unsigned char *b = (const unsigned char *)((ULONG_PTR)p & ~(ULONG_PTR)0xfff);
+    unsigned int h = 2166136261u, i;
+
+    *nz = 0;
+    for (i = 0; i < 0x1000; i++) { h = (h ^ b[i]) * 16777619u; *nz += b[i] != 0; }
+    return h;
+}
+
+static void rtcs_diag_where( const char *when )
+{
+    void *stashed = RtlGetCurrentPeb()->WerRegistrationData;
+    void *mine = (void *)arm64x_check_call;
+    unsigned int nz, fnv = rtcs_diag_page_fnv( &pResetToConsistentState, &nz );
+
+    ERR( "[rtcs-where] %s: static=%p value=%p code=%p check_call peb=%p this-copy=%p (%s) page-fnv=%08x page-nonzero-bytes=%u rev=rtcs-diag2\n",
+         when, (void *)&pResetToConsistentState, (void *)pResetToConsistentState, (void *)rtcs_diag_where,
+         stashed, mine, stashed == mine ? "same ntdll instance as init" : "DIFFERENT ntdll instance from init",
+         fnv, nz );
+}
+
 NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
 {
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
@@ -774,6 +869,10 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
                                       RtlFindExportedRoutineByName( module, #name ), metadata )
     GET_PTR( BTCpu64FlushInstructionCache );
     GET_PTR( BTCpu64IosAddAliasMapping );  /* iOS-only; NULL on non-iOS hosts. */
+    GET_PTR( BTCpu64IosCrashMailerData );  /* madeira [crashmailer-dump]; iOS-only, NULL elsewhere. */
+    GET_PTR( BTCpu64IosDebugRegs );  /* madeira [dr-pass]; iOS-only, NULL elsewhere. */
+    GET_PTR( BTCpu64IosGuestContext );  /* madeira [getctx-guest]; iOS-only, NULL elsewhere. */
+    GET_PTR( BTCpu64IosRaisePfAf );  /* madeira [pfaf-int3]; iOS-only, NULL elsewhere. */
     GET_PTR( BTCpu64IosReleaseThreadHolds );  /* iOS-only; ml618 leaked-hold release. */
     GET_PTR( BTCpu64IosSetMonoBridge );  /* iOS-only; ml648 Mono backpatcher bridge. */
     GET_PTR( BTCpu64IsProcessorFeaturePresent );
@@ -794,6 +893,20 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     GET_PTR( ThreadTerm );
     GET_PTR( UpdateProcessorInformation );
 #undef GET_PTR
+
+    if (rtcs_diag_enabled())
+    {
+        const unsigned char *b = rtcs_diag_raw = RtlFindExportedRoutineByName( module, "ResetToConsistentState" );
+
+        rtcs_diag_init = (void *)pResetToConsistentState;
+        ERR( "[rtcs-ptr] init: module=%p redirect-entries=%u ResetToConsistentState export=%p pointer=%p "
+             "bytes=%02x%02x%02x%02x%02x%02x%02x%02x | ProcessInit=%p ThreadInit=%p BeginSimulation=%p "
+             "NotifyMemoryAlloc=%p rev=rtcs-diag\n",
+             module, (unsigned int)metadata->RedirectionMetadataCount, rtcs_diag_raw, (void *)pResetToConsistentState,
+             b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0,
+             (void *)pProcessInit, (void *)pThreadInit, (void *)pBeginSimulation, (void *)pNotifyMemoryAlloc );
+        rtcs_diag_where( "init" );
+    }
 
     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
     info->NativeMachineType = IMAGE_FILE_MACHINE_ARM64;
@@ -909,6 +1022,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     {
         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
+
         status = create_cross_process_work_list( info );
         ERR( "arm64ec_process_init: create_cross_process_work_list -> %lx\n", status );
     }
@@ -1053,6 +1167,12 @@ DEFINE_SYSCALL(NtAllocateReserveObject, (HANDLE *handle, const OBJECT_ATTRIBUTES
 DEFINE_SYSCALL(NtAllocateUuids, (ULARGE_INTEGER *time, ULONG *delta, ULONG *sequence, UCHAR *seed))
 DEFINE_WRAPPED_SYSCALL(NtAllocateVirtualMemory, (HANDLE process, PVOID *ret, ULONG_PTR zero_bits, SIZE_T *size_ptr, ULONG type, ULONG protect))
 DEFINE_WRAPPED_SYSCALL(NtAllocateVirtualMemoryEx, (HANDLE process, PVOID *ret, SIZE_T *size_ptr, ULONG type, ULONG protect, MEM_EXTENDED_PARAMETER *parameters, ULONG count))
+DEFINE_SYSCALL(NtAlpcAcceptConnectPort, (HANDLE *communication_port, HANDLE connection_port, DWORD flags, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, void *port_context, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, BOOLEAN accept))
+DEFINE_SYSCALL(NtAlpcConnectPort, (HANDLE *port_handle, UNICODE_STRING *port_name, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, DWORD flags, PSID required_server_sid, ALPC_PORT_MESSAGE *connect_msg, SIZE_T *connect_msg_size, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtAlpcCreatePort, (HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr))
+DEFINE_SYSCALL(NtAlpcDisconnectPort, (HANDLE port_handle, ULONG flags))
+DEFINE_SYSCALL(NtAlpcImpersonateClientOfPort, (HANDLE port_handle, ALPC_PORT_MESSAGE *msg, void *reserved ))
+DEFINE_SYSCALL(NtAlpcSendWaitReceivePort, (HANDLE port_handle, DWORD flags, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_PORT_MESSAGE *recv_msg, SIZE_T *recv_buffer_size, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtApphelpCacheControl, (ULONG class, void *context))
 DEFINE_SYSCALL(NtAreMappedFilesTheSame, (PVOID addr1, PVOID addr2))
 DEFINE_SYSCALL(NtAssignProcessToJobObject, (HANDLE job, HANDLE process))
@@ -1075,7 +1195,7 @@ DEFINE_SYSCALL(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, (ULONG fla
 DEFINE_SYSCALL(NtCreateDebugObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags))
 DEFINE_SYSCALL(NtCreateDirectoryObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr))
 DEFINE_WRAPPED_SYSCALL(NtCreateEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN state))
-DEFINE_SYSCALL(NtCreateFile, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length))
+DEFINE_WRAPPED_SYSCALL(NtCreateFile, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length))
 DEFINE_SYSCALL(NtCreateIoCompletion, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG threads))
 DEFINE_SYSCALL(NtCreateJobObject, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtCreateKey, (HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, ULONG index, const UNICODE_STRING *class, ULONG options, ULONG *dispos))
@@ -1097,7 +1217,7 @@ DEFINE_SYSCALL(NtCreateThreadEx, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 DEFINE_SYSCALL(NtCreateTimer, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, TIMER_TYPE type))
 DEFINE_SYSCALL(NtCreateToken, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, TOKEN_TYPE type, LUID *token_id, LARGE_INTEGER *expire, TOKEN_USER *user, TOKEN_GROUPS *groups, TOKEN_PRIVILEGES *privs, TOKEN_OWNER *owner, TOKEN_PRIMARY_GROUP *group, TOKEN_DEFAULT_DACL *dacl, TOKEN_SOURCE *source))
 DEFINE_SYSCALL(NtCreateTransaction, (HANDLE *handle, ACCESS_MASK mask, OBJECT_ATTRIBUTES *obj_attr, GUID *guid, HANDLE tm, ULONG options, ULONG isol_level, ULONG isol_flags, PLARGE_INTEGER timeout, UNICODE_STRING *description))
-DEFINE_SYSCALL(NtCreateUserProcess, (HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr, ACCESS_MASK process_access, ACCESS_MASK thread_access, OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr, ULONG process_flags, ULONG thread_flags, RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info, PS_ATTRIBUTE_LIST *ps_attr))
+DEFINE_WRAPPED_SYSCALL(NtCreateUserProcess, (HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr, ACCESS_MASK process_access, ACCESS_MASK thread_access, OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr, ULONG process_flags, ULONG thread_flags, RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info, PS_ATTRIBUTE_LIST *ps_attr))
 DEFINE_SYSCALL(NtDebugActiveProcess, (HANDLE process, HANDLE debug))
 DEFINE_SYSCALL(NtDebugContinue, (HANDLE handle, CLIENT_ID *client, NTSTATUS status))
 DEFINE_WRAPPED_SYSCALL(NtDelayExecution, (BOOLEAN alertable, const LARGE_INTEGER *timeout))
@@ -1118,7 +1238,7 @@ DEFINE_SYSCALL(NtFlushBuffersFileEx, (HANDLE handle, ULONG flags, void *params, 
 DEFINE_WRAPPED_SYSCALL(NtFlushInstructionCache, (HANDLE handle, const void *addr, SIZE_T size))
 DEFINE_SYSCALL(NtFlushKey, (HANDLE key))
 DEFINE_SYSCALL(NtFlushProcessWriteBuffers, (void))
-DEFINE_SYSCALL(NtFlushVirtualMemory, (HANDLE process, LPCVOID *addr_ptr, SIZE_T *size_ptr, ULONG unknown))
+DEFINE_SYSCALL(NtFlushVirtualMemory, (HANDLE process, LPCVOID *addr_ptr, SIZE_T *size_ptr, IO_STATUS_BLOCK *io))
 DEFINE_WRAPPED_SYSCALL(NtFreeVirtualMemory, (HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type))
 DEFINE_SYSCALL(NtFsControlFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size, void *out_buffer, ULONG out_size))
 DEFINE_WRAPPED_SYSCALL(NtGetContextThread, (HANDLE handle, ARM64_NT_CONTEXT *context))
@@ -1158,6 +1278,7 @@ DEFINE_SYSCALL(NtOpenKeyTransacted, (HANDLE *key, ACCESS_MASK access, const OBJE
 DEFINE_SYSCALL(NtOpenKeyTransactedEx, (HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, ULONG options, HANDLE transaction))
 DEFINE_SYSCALL(NtOpenKeyedEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_WRAPPED_SYSCALL(NtOpenMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
+DEFINE_SYSCALL(NtOpenPrivateNamespace, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const OBJECT_BOUNDARY_DESCRIPTOR *boundary_descriptor))
 DEFINE_SYSCALL(NtOpenProcess, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const CLIENT_ID *id))
 DEFINE_SYSCALL(NtOpenProcessToken, (HANDLE process, DWORD access, HANDLE *handle))
 DEFINE_SYSCALL(NtOpenProcessTokenEx, (HANDLE process, DWORD access, DWORD attributes, HANDLE *handle))
@@ -1183,8 +1304,8 @@ DEFINE_SYSCALL(NtQueryFullAttributesFile, (const OBJECT_ATTRIBUTES *attr, FILE_N
 DEFINE_SYSCALL(NtQueryInformationAtom, (RTL_ATOM atom, ATOM_INFORMATION_CLASS class, void *ptr, ULONG size, ULONG *retsize))
 DEFINE_SYSCALL(NtQueryInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class))
 DEFINE_SYSCALL(NtQueryInformationJobObject, (HANDLE handle, JOBOBJECTINFOCLASS class, void *info, ULONG len, ULONG *ret_len))
-DEFINE_SYSCALL(NtQueryInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len))
-DEFINE_SYSCALL(NtQueryInformationThread, (HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len))
+DEFINE_WRAPPED_SYSCALL(NtQueryInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len))
+DEFINE_WRAPPED_SYSCALL(NtQueryInformationThread, (HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len))
 DEFINE_SYSCALL(NtQueryInformationToken, (HANDLE token, TOKEN_INFORMATION_CLASS class, void *info, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQueryInstallUILanguage, (LANGID *lang))
 DEFINE_SYSCALL(NtQueryIoCompletion, (HANDLE handle, IO_COMPLETION_INFORMATION_CLASS class, void *buffer, ULONG len, ULONG *ret_len))
@@ -1192,7 +1313,7 @@ DEFINE_SYSCALL(NtQueryKey, (HANDLE handle, KEY_INFORMATION_CLASS info_class, voi
 DEFINE_SYSCALL(NtQueryLicenseValue, (const UNICODE_STRING *name, ULONG *type, void *data, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQueryMultipleValueKey, (HANDLE key, KEY_MULTIPLE_VALUE_INFORMATION *info, ULONG count, void *buffer, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQueryMutant, (HANDLE handle, MUTANT_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
-DEFINE_SYSCALL(NtQueryObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len))
+DEFINE_WRAPPED_SYSCALL(NtQueryObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len))
 DEFINE_SYSCALL(NtQueryPerformanceCounter, (LARGE_INTEGER *counter, LARGE_INTEGER *frequency))
 DEFINE_SYSCALL(NtQuerySection, (HANDLE handle, SECTION_INFORMATION_CLASS class, void *ptr, SIZE_T size, SIZE_T *ret_size))
 DEFINE_SYSCALL(NtQuerySecurityObject, (HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR descr, ULONG length, ULONG *retlen))
@@ -1201,12 +1322,12 @@ DEFINE_SYSCALL(NtQuerySymbolicLinkObject, (HANDLE handle, UNICODE_STRING *target
 DEFINE_SYSCALL(NtQuerySystemEnvironmentValue, (UNICODE_STRING *name, WCHAR *buffer, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQuerySystemEnvironmentValueEx, (UNICODE_STRING *name, GUID *vendor, void *buffer, ULONG *retlen, ULONG *attrib))
 DEFINE_WRAPPED_SYSCALL(NtQuerySystemInformation, (SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size))
-DEFINE_SYSCALL(NtQuerySystemInformationEx, (SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len, void *info, ULONG size, ULONG *ret_size))
+DEFINE_WRAPPED_SYSCALL(NtQuerySystemInformationEx, (SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len, void *info, ULONG size, ULONG *ret_size))
 DEFINE_SYSCALL(NtQuerySystemTime, (LARGE_INTEGER *time))
 DEFINE_SYSCALL(NtQueryTimer, (HANDLE handle, TIMER_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
 DEFINE_SYSCALL(NtQueryTimerResolution, (ULONG *min_res, ULONG *max_res, ULONG *current_res))
 DEFINE_SYSCALL(NtQueryValueKey, (HANDLE handle, const UNICODE_STRING *name, KEY_VALUE_INFORMATION_CLASS info_class, void *info, DWORD length, DWORD *result_len))
-DEFINE_SYSCALL(NtQueryVirtualMemory, (HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len))
+DEFINE_WRAPPED_SYSCALL(NtQueryVirtualMemory, (HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len))
 DEFINE_SYSCALL(NtQueryVolumeInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length, FS_INFORMATION_CLASS info_class))
 DEFINE_SYSCALL(NtQueueApcThread, (HANDLE handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
 DEFINE_SYSCALL(NtQueueApcThreadEx, (HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
@@ -1220,7 +1341,7 @@ DEFINE_SYSCALL(NtReadVirtualMemory, (HANDLE process, const void *addr, void *buf
 DEFINE_SYSCALL(NtRegisterThreadTerminatePort, (HANDLE handle))
 DEFINE_SYSCALL(NtReleaseKeyedEvent, (HANDLE handle, const void *key, BOOLEAN alertable, const LARGE_INTEGER *timeout))
 DEFINE_WRAPPED_SYSCALL(NtReleaseMutant, (HANDLE handle, LONG *prev_count))
-DEFINE_SYSCALL(NtReleaseSemaphore, (HANDLE handle, ULONG count, ULONG *previous))
+DEFINE_SYSCALL(NtReleaseSemaphore, (HANDLE handle, LONG count, ULONG *previous))
 DEFINE_SYSCALL(NtRemoveIoCompletion, (HANDLE handle, ULONG_PTR *key, ULONG_PTR *value, IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtRemoveIoCompletionEx, (HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count, ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable))
 DEFINE_SYSCALL(NtRemoveProcessDebug, (HANDLE process, HANDLE debug))
@@ -1250,8 +1371,8 @@ DEFINE_SYSCALL(NtSetInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *
 DEFINE_SYSCALL(NtSetInformationJobObject, (HANDLE handle, JOBOBJECTINFOCLASS class, void *info, ULONG len))
 DEFINE_SYSCALL(NtSetInformationKey, (HANDLE key, int class, void *info, ULONG length))
 DEFINE_SYSCALL(NtSetInformationObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len))
-DEFINE_SYSCALL(NtSetInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size))
-DEFINE_SYSCALL(NtSetInformationThread, (HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length))
+DEFINE_WRAPPED_SYSCALL(NtSetInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size))
+DEFINE_WRAPPED_SYSCALL(NtSetInformationThread, (HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length))
 DEFINE_SYSCALL(NtSetInformationToken, (HANDLE token, TOKEN_INFORMATION_CLASS class, void *info, ULONG length))
 DEFINE_SYSCALL(NtSetInformationVirtualMemory, (HANDLE process, VIRTUAL_MEMORY_INFORMATION_CLASS info_class, ULONG_PTR count, PMEMORY_RANGE_ENTRY addresses, PVOID ptr, ULONG size))
 DEFINE_SYSCALL(NtSetIntervalProfile, (ULONG interval, KPROFILE_SOURCE source))
@@ -1295,6 +1416,13 @@ DEFINE_SYSCALL(NtWriteFileGather, (HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
 DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
 DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
 DEFINE_WRAPPED_SYSCALL(NtYieldExecution, (void))
+
+/* madeira [crashmailer-dump]: defined after [exc-ring] */
+enum { IOS_CMD_QIP = 1, IOS_CMD_QSI, IOS_CMD_QSIX, IOS_CMD_QIT, IOS_CMD_SIT, IOS_CMD_QO, IOS_CMD_CLOSE, IOS_CMD_SIP };
+static void ios_cmd_q_hook( ULONG fn, HANDLE handle, ULONG cls, NTSTATUS status, const void *data, ULONG len,
+                            const ULONG *retlen );
+static void ios_cmd_getctx( HANDLE handle, const CONTEXT *context, ULONG want, NTSTATUS status );
+void ios_cmd_continue(void);
 
 NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                               SIZE_T *size_ptr, ULONG type, ULONG protect )
@@ -1362,19 +1490,689 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
     return status;
 }
 
+/* madeira-bcd [subpage-sweep] (env MADEIRA_SUBPAGE_SWEEP = 0 turns it off).
+ *
+ * iOS pages are 16 KB; Windows pages are 4 KB. Wine gives a host page the union of its four
+ * 4 KB protections (virtual_ios.c get_host_page_vprot: "Return the union of the page protection
+ * bytes of all the pages making up the host page"). Overwatch 2's loader keeps its .text
+ * PAGE_NOACCESS per 4 KB page and decrypts a page when touching it faults. Once one 4 KB page of a
+ * host page is unlocked, its locked neighbours become readable while still ENCRYPTED, so a read
+ * never faults and the game uses garbage. 0.2.75 log e59342d7: a switch at Overwatch.exe
+ * 141C5AFBB read its jump table at 141C5B49C (page 141C5B000, bytes still encrypted, same host
+ * page as the decrypted 141C5A000) and jumped to Rcx=00000001533C7640 -> c0000005, 20 s in.
+ *
+ * Idea from NutsEmu's notes 0203/0205 (study only, our own code). Only while a thread is
+ * dispatching a REAL access violation on a PAGE_NOACCESS image page ("armed"): when that thread
+ * unlocks a 4 KB page of the image and other 4 KB pages of the same host page are still
+ * PAGE_NOACCESS in the same image, remember them; when the thread resumes from that dispatch
+ * (NtContinue, not alertable) at a pc in the same image, hand it a read access violation for each
+ * one still locked, so the game's handler unlocks (decrypts) them as it would on Windows when they
+ * are first touched. At most 8 raises per armed chain. Also logs re-locks that leave a host page
+ * mixed (evidence for a later step). */
+#define IOS_SP_HOST 0x4000   /* iOS host page size; the guest page is 4 KB */
+#define IOS_SP_SLOTS 64
+#define IOS_SP_CHAIN_MAX 8
+
+static struct ios_sp_slot
+{
+    LONG tid;              /* owner thread, 0 = free; only the owner writes the other fields */
+    LONG n;                /* queued pages */
+    LONG armed;            /* dispatching an AV on a locked page of alloc_base */
+    LONG chain;            /* raises since the last real AV */
+    ULONG_PTR alloc_base;  /* image the pages belong to */
+    ULONG_PTR armed_sp;    /* v3: tick count when armed (name kept) */
+    ULONG_PTR last_page, last_rip;   /* the last synthetic AV, so its own dispatch is not "real" */
+    ULONG_PTR page[6];     /* the other 4 KB pages of at most two host pages */
+} ios_sp_slots[IOS_SP_SLOTS];
+static LONG ios_sp_mode;   /* 0 = unread, 1 = off, 2 = on */
+static LONG ios_sp_noted, ios_sp_raised, ios_sp_relocks, ios_sp_capped;
+
+static BOOL ios_sp_on(void)
+{
+    if (!ios_sp_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_SUBPAGE_SWEEP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_sp_mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                       value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[subpage-sweep] %s (env.MADEIRA_SUBPAGE_SWEEP = 0 turns it off) rev=subpage-sweep-3\n",
+             ios_sp_mode == 2 ? "on" : "off" );
+    }
+    return ios_sp_mode == 2;
+}
+
+static struct ios_sp_slot *ios_sp_slot_get( BOOL create )
+{
+    LONG tid = (LONG)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+    unsigned i;
+
+    for (i = 0; i < IOS_SP_SLOTS; i++) if (ios_sp_slots[i].tid == tid) return &ios_sp_slots[i];
+    if (!create) return NULL;
+    for (i = 0; i < IOS_SP_SLOTS; i++)
+        if (!InterlockedCompareExchange( &ios_sp_slots[i].tid, tid, 0 ))
+        {
+            struct ios_sp_slot *slot = &ios_sp_slots[i];
+            slot->n = slot->armed = slot->chain = 0;
+            slot->alloc_base = slot->last_page = slot->last_rip = slot->armed_sp = 0;
+            return slot;
+        }
+    {
+        static LONG full;
+        if (InterlockedIncrement( &full ) <= 4) ERR( "[subpage-sweep] thread table full, no sweep\n" );
+    }
+    return NULL;
+}
+
+static void ios_sp_slot_free( struct ios_sp_slot *slot )
+{
+    slot->n = slot->armed = slot->chain = 0;
+    InterlockedExchange( &slot->tid, 0 );   /* claims only CAS 0 -> tid, so this is the owner's last write */
+}
+
+/* v3: the main exe's range from its PE header (no loader lock); 0.2.76 log af6b8f01 showed no
+ * queue at all, so the image test no longer depends on MEMORY_BASIC_INFORMATION.Type */
+static BOOL ios_sp_in_main_image( ULONG_PTR addr, ULONG_PTR *base_out )
+{
+    static ULONG_PTR lo, hi;
+    if (!hi)
+    {
+        ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Peb->ImageBaseAddress;
+        IMAGE_DOS_HEADER dos;
+        IMAGE_NT_HEADERS64 nt;
+        SIZE_T got;
+        if (!base ||
+            NtReadVirtualMemory( GetCurrentProcess(), (void *)base, &dos, sizeof(dos), &got ) || got != sizeof(dos) ||
+            dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x1000 ||
+            NtReadVirtualMemory( GetCurrentProcess(), (void *)(base + dos.e_lfanew), &nt, sizeof(nt), &got ) ||
+            got != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE) return FALSE;
+        lo = base;
+        __sync_synchronize();   /* publish lo before hi: readers test hi first */
+        hi = base + nt.OptionalHeader.SizeOfImage;
+    }
+    if (base_out) *base_out = lo;
+    return addr >= lo && addr < hi;
+}
+
+static BOOL ios_sp_query( ULONG_PTR addr, MEMORY_BASIC_INFORMATION *mbi )
+{
+    SIZE_T len = 0;
+    return !NtQueryVirtualMemory( GetCurrentProcess(), (void *)addr, MemoryBasicInformation,
+                                  mbi, sizeof(*mbi), &len ) && len >= sizeof(*mbi);
+}
+
+static BOOL ios_sp_locked_image_page( ULONG_PTR page, ULONG_PTR alloc_base, ULONG_PTR *base_out )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR base;
+    if (!ios_sp_in_main_image( page, &base )) return FALSE;
+    if (!ios_sp_query( page, &mbi ) || mbi.State != MEM_COMMIT || mbi.Protect != PAGE_NOACCESS) return FALSE;
+    if (base_out) *base_out = base;
+    return !alloc_base || base == alloc_base;
+}
+
+/* armed only while this code runs inside that dispatch, i.e. below the faulting stack pointer;
+ * a resume that skipped NtContinue (own register restore, thread death) leaves a stale arm,
+ * which this drops the next time it is looked at */
+static BOOL ios_sp_still_armed( struct ios_sp_slot *slot, const void *here )
+{
+    /* v3: the x64 stack and this code's stack differ under FEX here (0.2.76: guest Rsp
+     * 0x707923FFA8, native sp 0x70ebd70000), so an sp test is meaningless; an arm lasts 500 ms */
+    if (!slot->armed) return FALSE;
+    if (NtGetTickCount() - (ULONG)slot->armed_sp < 500) return TRUE;
+    {
+        static LONG stale;
+        LONG k = InterlockedIncrement( &stale );
+        if (k <= 8 || !(k % 256))
+            ERR( "[subpage-sweep] stale arm dropped (armed %lu ms ago, %ld queued)\n",
+                 NtGetTickCount() - (ULONG)slot->armed_sp, slot->n );
+    }
+    ios_sp_slot_free( slot );
+    return FALSE;
+}
+
+/* called from prepare_exception_arm64ec for every access violation */
+static void ios_sp_note_av( const EXCEPTION_RECORD *rec, ULONG_PTR sp )
+{
+    struct ios_sp_slot *slot;
+    ULONG_PTR addr, base = 0;
+
+    if (ios_sp_mode == 1 || rec->NumberParameters < 2) return;
+    addr = rec->ExceptionInformation[1];
+    if (ios_sp_in_main_image( addr, NULL ))
+    {
+        static LONG seen;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (seen < 16 && InterlockedIncrement( &seen ) <= 16 && ios_sp_on() && ios_sp_query( addr & ~(ULONG_PTR)0xfff, &mbi ))
+            ERR( "[subpage-sweep] av %lu of %p in main image: state %lx type %lx protect %lx base %p\n",
+                 (unsigned long)rec->ExceptionInformation[0], (void *)addr, mbi.State, mbi.Type, mbi.Protect,
+                 mbi.AllocationBase );
+    }
+    if (!ios_sp_locked_image_page( addr & ~(ULONG_PTR)0xfff, 0, &base )) return;   /* not a locked image page */
+    if (!ios_sp_on() || !(slot = ios_sp_slot_get( TRUE ))) return;
+    if (slot->alloc_base != base) slot->n = 0;
+    slot->alloc_base = base;
+    slot->armed = 1;
+    slot->armed_sp = NtGetTickCount();
+    (void)sp;
+    if (!(addr - (addr & 0xfff) == slot->last_page && (ULONG_PTR)rec->ExceptionAddress == slot->last_rip))
+        slot->chain = 0;   /* a real fault starts a new chain; our own raise continues it */
+}
+
+/* called after a successful protect in the current process; addr/size are the rounded results */
+static void ios_sp_note_protect( ULONG_PTR addr, SIZE_T size, ULONG new_prot, ULONG old )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR host, q, alloc_base;
+    struct ios_sp_slot *slot;
+    BOOL unlock, relock;
+
+    if (!size || size >= IOS_SP_HOST || ios_sp_mode == 1) return;
+    if (ios_sp_in_main_image( addr, NULL ))
+    {
+        static LONG seen;
+        struct ios_sp_slot *s0;
+        if (seen < 48 && InterlockedIncrement( &seen ) <= 48 && ios_sp_on() && ((s0 = ios_sp_slot_get( FALSE )) || 1))
+            ERR( "[subpage-sweep] protect %p+0x%lx old %lx new %lx armed %d\n", (void *)addr,
+                 (unsigned long)size, old, new_prot, s0 ? (int)s0->armed : -1 );
+    }
+    unlock = old == PAGE_NOACCESS && (new_prot & 0xff) != PAGE_NOACCESS;
+    relock = old != PAGE_NOACCESS && (new_prot & 0xff) == PAGE_NOACCESS;
+    if (!unlock && !relock) return;
+    slot = ios_sp_slot_get( FALSE );
+    if (unlock && (!slot || !ios_sp_still_armed( slot, &mbi ))) return;   /* only inside a real locked-page AV's dispatch */
+    if (!ios_sp_on()) return;
+    if (!ios_sp_in_main_image( addr, &alloc_base )) return;
+
+    for (host = addr & ~(ULONG_PTR)(IOS_SP_HOST - 1); host < addr + size; host += IOS_SP_HOST)
+    {
+        if (relock)
+        {
+            /* evidence only: a re-lock next to a page that stays open leaves the host page readable */
+            for (q = host; q < host + IOS_SP_HOST; q += 0x1000)
+            {
+                if (q >= addr && q < addr + size) continue;
+                if (ios_sp_in_main_image( q, NULL ) && ios_sp_query( q, &mbi ) && mbi.State == MEM_COMMIT &&
+                    mbi.Protect != PAGE_NOACCESS)
+                {
+                    LONG k = InterlockedIncrement( &ios_sp_relocks );
+                    if (k <= 16 || !(k % 256))
+                        ERR( "[subpage-sweep] relock #%ld %p+0x%lx next to open %p (prot %lx): host page %p stays readable\n",
+                             k, (void *)addr, (unsigned long)size, (void *)q, mbi.Protect, (void *)host );
+                    break;
+                }
+            }
+            continue;
+        }
+        if (slot->alloc_base != alloc_base) continue;   /* armed for another image */
+        for (q = host; q < host + IOS_SP_HOST; q += 0x1000)
+        {
+            LONG i;
+            BOOL have = FALSE;
+            if (q >= addr && q < addr + size) continue;
+            if (!ios_sp_locked_image_page( q, alloc_base, NULL )) continue;
+            for (i = 0; i < slot->n; i++) if (slot->page[i] == q) have = TRUE;
+            if (have || slot->n >= (LONG)ARRAY_SIZE(slot->page)) continue;
+            slot->page[slot->n++] = q;
+            {
+                LONG k = InterlockedIncrement( &ios_sp_noted );
+                if (k <= 32 || !(k % 256))
+                    ERR( "[subpage-sweep] #%ld unlock of %p (was NOACCESS, now %lx) leaves %p locked in host page %p: queued\n",
+                         k, (void *)addr, new_prot, (void *)q, (void *)host );
+            }
+        }
+    }
+}
+
+/* called from NtContinue/NtContinueEx: raise a read AV for the next still-locked queued page */
+static void ios_sp_continue( CONTEXT *context, BOOL alertable )
+{
+    struct ios_sp_slot *slot;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    if (ios_sp_mode != 2 || !(slot = ios_sp_slot_get( FALSE ))) return;
+    if (alertable || !ios_sp_still_armed( slot, &mbi )) return;   /* APC resume etc.: not the end of a locked-page dispatch */
+    if (slot->n && ios_sp_in_main_image( context->Rip, NULL ))
+    {
+        while (slot->n)
+        {
+            ULONG_PTR page = slot->page[--slot->n];
+            EXCEPTION_RECORD rec;
+            LONG k;
+
+            if (!ios_sp_locked_image_page( page, slot->alloc_base, NULL )) continue;   /* unlocked meanwhile */
+            if (slot->chain >= IOS_SP_CHAIN_MAX)
+            {
+                k = InterlockedIncrement( &ios_sp_capped );
+                if (k <= 8 || !(k % 256))
+                    ERR( "[subpage-sweep] chain cap %d hit at %p (page %p still locked): stopping this chain\n",
+                         IOS_SP_CHAIN_MAX, (void *)context->Rip, (void *)page );
+                break;
+            }
+            memset( &rec, 0, sizeof(rec) );
+            rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
+            rec.ExceptionAddress = (void *)context->Rip;
+            rec.NumberParameters = 2;
+            rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+            rec.ExceptionInformation[1] = page;
+            slot->chain++;
+            slot->last_page = page;
+            slot->last_rip = context->Rip;
+            k = InterlockedIncrement( &ios_sp_raised );
+            if (k <= 32 || !(k % 256))
+                ERR( "[subpage-sweep] raise #%ld AV READ of %p at Rip=%p (%ld left, chain %ld)\n",
+                     k, (void *)page, (void *)context->Rip, slot->n, slot->chain );
+            NtRaiseException( &rec, context, TRUE );   /* does not return when dispatch starts */
+            return;
+        }
+    }
+    if (slot->n)
+    {
+        static LONG dropped;
+        LONG k = InterlockedIncrement( &dropped );
+        if (k <= 8 || !(k % 256))
+            ERR( "[subpage-sweep] resume at %p outside the image: %ld queued page(s) dropped\n",
+                 (void *)context->Rip, slot->n );
+    }
+    ios_sp_slot_free( slot );   /* chain over: nothing queued, nothing left to raise */
+}
+
+/* madeira [pfaf-keep] (env MADEIRA_EC_PFAF_KEEP = 0 turns it off, here and in xtajit64). rev=pfaf-keep-2.
+ *
+ * An ARM64EC context has room for NZCV (+SS) of the x86 EFLAGS only, so PF and AF were lost both
+ * ways: the guest's exception handler always saw PF=AF=0, and the code it resumed (same RIP or the
+ * new RIP it chose) ran with whatever PF/AF the handler code computed last (xtajit64
+ * SyncThreadContext takes them from the live JIT state). Overwatch 2's protector steps obfuscated
+ * code through int3 exceptions, its handler picking the next RIP each time (0.2.79 log 80f5a778:
+ * "[set-ctx] ml946 ... req pc=0x70eaa91e92" after "Exception: Code: 80000003 Address: 70EAA91E93"),
+ * and decrypts pages on fault. Online: GameNative/proton-wine PR #47 and GameNative/FEX patch 0001
+ * (Dmage22, MIT/LGPL): Blizzard's loader resumes a decrypt fault on a `jp`; they carry PF/AF in
+ * CPSR bits 26/27 both ways. Here: out to the guest the same way (xtajit64 sets the bits, unwind.h
+ * cpsr_to_eflags maps them); back WITHOUT CPSR bits, because on this port the unix syscall frame
+ * masks the cpsr with cpsr_user_mask (bit 27 lost) and writes it to the host PSTATE. Instead the
+ * x64 context's PF/AF are stashed per thread here and put into ContextAmd64 by dispatch_emulation
+ * when the resume RIP/RSP match, with reserved EFLAGS bit 15 set to tell xtajit64 they are real. */
+static LONG ios_pfaf_mode, ios_pfaf_logged;   /* 0 not read, 1 off, 2 on */
+
+static BOOL ios_pfaf_enabled(void)
+{
+    if (!ios_pfaf_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_PFAF_KEEP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_pfaf_mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                         value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[pfaf-keep] rev=pfaf-keep-2 %s\n", ios_pfaf_mode == 2 ? "on" : "off (MADEIRA_EC_PFAF_KEEP=0)" );
+    }
+    return ios_pfaf_mode == 2;
+}
+
+/* madeira [pfaf-int3] (env MADEIRA_EC_PFAF_INT3 = 0 turns it off; needs [pfaf-keep] on). rev=pfaf-int3-2. Ours.
+ * pfaf-keep-2's known gap: an int3 / ud / single-step trap reaches the guest through FEX's RaiseException and the unix
+ * NtRaiseException syscall, whose frame keeps CPSR bit 26 (PF) but masks bit 27 (AF). The guest's handler then saw
+ * AF=0, and since NtContinue stashes the handler's flags for the resume, the code also resumed with AF=0. Real x64
+ * Windows gives the handler the true AF. xtajit64 keeps the PF/AF of its last raise with the guest RIP/RSP; this puts
+ * them into the handler's context when the context is that raise's (same RIP and RSP). Nothing else changes. */
+static LONG ios_pfaf_int3_mode, ios_pfaf_int3_logged;   /* 0 not read, 1 off, 2 on */
+
+static void ios_pfaf_int3( CONTEXT *context )
+{
+    ULONG r;
+
+    if (!pBTCpu64IosRaisePfAf) return;
+    /* ios_pfaf_enabled() reads the environment through the PEB lock: only once loader_init() has set it up */
+    if (ios_pfaf_mode ? ios_pfaf_mode != 2 : (!NtCurrentTeb()->Peb->FastPebLock || !ios_pfaf_enabled()))
+    {
+        pBTCpu64IosRaisePfAf( 0, 0 );   /* use up a saved value anyway (review-2 SHOULD 1); FEX keeps none when off */
+        return;
+    }
+    if (!ios_pfaf_int3_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_PFAF_INT3" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_pfaf_int3_mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                              value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[pfaf-int3] rev=pfaf-int3-2 %s\n", ios_pfaf_int3_mode == 2 ? "on" : "off (MADEIRA_EC_PFAF_INT3=0)" );
+    }
+    if (ios_pfaf_int3_mode != 2) return;
+    if (!(r = pBTCpu64IosRaisePfAf( context->Rip, context->Rsp ))) return;
+    if ((context->EFlags & 0x14) != (r & 0x14))
+    {
+        LONG n = InterlockedIncrement( &ios_pfaf_int3_logged );
+        if (n <= 16 || !(n % 5000))
+            ERR( "[pfaf-int3] handler context rip=%p PF/AF %lx -> %lx n=%ld\n", (void *)context->Rip,
+                 context->EFlags & 0x14, r & 0x14, n );
+    }
+    context->EFlags = (context->EFlags & ~0x14) | (r & 0x14);
+}
+
+static void ios_pfaf_stash( const CONTEXT *context )
+{
+    struct ec_thread_state *st;
+
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) != CONTEXT_AMD64_CONTROL || !ios_pfaf_enabled()) return;
+    st = ec_state();
+    if (st == &ec_state_fallback) return;   /* not an EC thread */
+    /* an alertable resume can run an APC first, whose own NtContinue carries the same rip/rsp but
+     * PF/AF lost in the ARM round trip: keep the first, real values */
+    if (st->pfaf_valid && st->pfaf_rip == context->Rip && st->pfaf_rsp == context->Rsp) return;
+    st->pfaf_rip = context->Rip;
+    st->pfaf_rsp = context->Rsp;
+    st->pfaf_bits = context->EFlags & 0x14;
+    st->pfaf_valid = 1;
+}
+
+/* dispatch_emulation: the thread resumes x64 code from this context */
+static void ios_pfaf_apply( CONTEXT *context )
+{
+    struct ec_thread_state *st;
+
+    if (ios_pfaf_mode != 2) return;
+    st = ec_state();
+    if (st == &ec_state_fallback || !st->pfaf_valid) return;
+    st->pfaf_valid = 0;
+    if (st->pfaf_rip != context->Rip || st->pfaf_rsp != context->Rsp) return;
+    context->EFlags = (context->EFlags & ~0x14) | st->pfaf_bits | 0x8000;   /* bit 15: PF/AF valid */
+    if (st->pfaf_bits)
+    {
+        LONG n = InterlockedIncrement( &ios_pfaf_logged );
+        if (n <= 16 || !(n % 5000))
+            ERR( "[pfaf-keep] resume rip=%p with PF/AF=%lx n=%ld\n", (void *)context->Rip, st->pfaf_bits, n );
+    }
+}
+
+/* madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 / Wine patch 0017
+ * (MIT/LGPL). env MADEIRA_EC_DF_CTX = 0 turns it off, here and in xtajit64. rev=df-ctx-1.
+ *
+ * The [pfaf-keep] design, for the direction flag. Out to the guest's exception handler: xtajit64 writes DF
+ * through at STD/CLD/POPF (so a fault later in the block sees it) and sets CPSR bit 16; unwind.h cpsr_to_eflags
+ * maps it. Back: not through CPSR (cpsr_user_mask drops bit 16 in the unix frame), so the x64 context's DF is
+ * stashed per thread here and put into ContextAmd64 by dispatch_emulation when the resume RIP/RSP match, with
+ * reserved EFLAGS bit 3 set to tell xtajit64 it is real (bit 15 is [pfaf-keep]'s). Without it xtajit64 resumes
+ * with the DF of the live JIT state, i.e. of the handler code, whatever the handler put in the context. xtajit64
+ * trusts the mark only after an exception it delivered with bit 16 (not for traps raised through the unix syscall
+ * path, which masks bit 16 so the handler saw DF=0). */
+static LONG ios_df_mode, ios_df_logged;   /* 0 not read, 1 off, 2 on */
+
+static BOOL ios_df_enabled(void)
+{
+    if (!ios_df_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        PEB *peb = NtCurrentTeb()->Peb;
+        /* as in ios_xstate_revert(): before loader_init() FastPebLock is NULL, so read the block itself */
+        WCHAR *env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_DF_CTX" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_df_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                       value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[df-ctx] rev=df-ctx-1 %s\n", ios_df_mode == 2 ? "on" : "off (MADEIRA_EC_DF_CTX=0)" );
+    }
+    return ios_df_mode == 2;
+}
+
+static void ios_df_stash( const CONTEXT *context )
+{
+    struct ec_thread_state *st;
+
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) != CONTEXT_AMD64_CONTROL || !ios_df_enabled()) return;
+    st = ec_state();
+    if (st == &ec_state_fallback) return;   /* not an EC thread */
+    /* as [pfaf-keep]: an APC run first by an alertable resume continues with the same rip/rsp, keep the first */
+    if (st->df_valid && st->df_rip == context->Rip && st->df_rsp == context->Rsp) return;
+    st->df_rip = context->Rip;
+    st->df_rsp = context->Rsp;
+    st->df_bits = context->EFlags & 0x400;
+    st->df_valid = 1;
+}
+
+/* dispatch_emulation: the thread resumes x64 code from this context */
+static void ios_df_apply( CONTEXT *context )
+{
+    struct ec_thread_state *st;
+
+    if (ios_df_mode != 2) return;
+    st = ec_state();
+    if (st == &ec_state_fallback || !st->df_valid) return;
+    st->df_valid = 0;
+    if (st->df_rip != context->Rip || st->df_rsp != context->Rsp) return;
+    context->EFlags = (context->EFlags & ~0x400) | st->df_bits | 0x8;   /* bit 3: DF valid */
+    if (st->df_bits)
+    {
+        LONG n = InterlockedIncrement( &ios_df_logged );
+        if (n <= 16 || !(n % 5000))
+            ERR( "[df-ctx] resume rip=%p with DF=1 n=%ld\n", (void *)context->Rip, n );
+    }
+}
+
+/* madeira [dr-pass] (env MADEIRA_EC_DEBUG_REGS = 0 turns it off). rev=dr-pass-1.
+ *
+ * x64 debug registers (Dr0-Dr3, Dr6, Dr7) for emulated code. context_x64_to_arm() has nowhere to
+ * put them, so until now a SetThreadContext / NtContinue with CONTEXT_DEBUG_REGISTERS silently
+ * dropped them and a GetThreadContext or an exception context returned whatever was in memory.
+ * FEX keeps them in its per-thread state and already turns instruction breakpoints into
+ * EXCEPTION_SINGLE_STEP; this hands them over (xtajit64 BTCpu64IosDebugRegs). Current thread
+ * only; another thread's debug registers are logged, not applied.
+ * Online: FEX #6099 ("needs Debug Register support" for the Overwatch loader on ARM64EC),
+ * MetalSharp-Wine 4614051 (passes them on NtContinue / NtSetContextThread / NtGetContextThread).
+ * Our own code. */
+static LONG ios_dr_mode, ios_dr_logged;   /* mode: 0 not read, 1 off, 2 on */
+
+static BOOL ios_dr_enabled(void)
+{
+    if (!ios_dr_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_DEBUG_REGS" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_dr_mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                       value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[dr-pass] rev=dr-pass-1 %s, xtajit64 export %s\n", ios_dr_mode == 2 ? "on" : "off (MADEIRA_EC_DEBUG_REGS=0)",
+             pBTCpu64IosDebugRegs ? "found" : "missing" );
+    }
+    return ios_dr_mode == 2 && pBTCpu64IosDebugRegs;
+}
+
+static BOOL ios_dr_log_ok(void)
+{
+    LONG n = InterlockedIncrement( &ios_dr_logged );
+    return n <= 32 || !(n % 1000);
+}
+
+static BOOL ios_dr_is_self( HANDLE handle )
+{
+    THREAD_BASIC_INFORMATION tbi;
+
+    if (handle == GetCurrentThread()) return TRUE;
+    if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return FALSE;
+    return tbi.ClientId.UniqueThread == NtCurrentTeb()->ClientId.UniqueThread;
+}
+
+/* the x64 context's debug registers -> FEX, for the current thread */
+static void ios_dr_apply( const CONTEXT *context, const char *why )
+{
+    ULONG64 regs[6], old[6];
+
+    if ((context->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) != CONTEXT_AMD64_DEBUG_REGISTERS) return;
+    if (!ios_dr_enabled()) return;
+    regs[0] = context->Dr0; regs[1] = context->Dr1; regs[2] = context->Dr2; regs[3] = context->Dr3;
+    regs[4] = context->Dr6; regs[5] = context->Dr7;
+    if (!pBTCpu64IosDebugRegs( 0, old )) return;
+    if (!memcmp( regs, old, sizeof(regs) )) return;
+    pBTCpu64IosDebugRegs( 1, regs );
+    if (ios_dr_log_ok())
+        ERR( "[dr-pass] %s tid=%04lx rip=%p dr0=%p dr1=%p dr2=%p dr3=%p dr6=%p dr7=%p (was dr7=%p) eflags=%08lx\n",
+             why, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), (void *)context->Rip,
+             (void *)regs[0], (void *)regs[1], (void *)regs[2], (void *)regs[3], (void *)regs[4], (void *)regs[5],
+             (void *)old[5], (ULONG)context->EFlags );
+}
+
+/* x86 RF (resume flag) is not emulated: resuming ON an enabled instruction breakpoint with RF set
+ * would fire it again. Logged so a loop shows up in the log. */
+static void ios_dr_check_rf( const CONTEXT *context )
+{
+    ULONG64 regs[6];
+    int i;
+
+    if (!(context->EFlags & 0x10000) || !ios_dr_enabled() || !pBTCpu64IosDebugRegs( 0, regs ) || !(regs[5] & 0xff)) return;
+    for (i = 0; i < 4; i++)
+        if (((regs[5] >> (2 * i)) & 3) && !((regs[5] >> (16 + 4 * i)) & 3) && regs[i] == context->Rip && ios_dr_log_ok())
+            ERR( "[dr-pass] RF resume on breakpoint %d at %p: RF is not emulated, it will fire again\n", i, (void *)context->Rip );
+}
+
+/* FEX -> the x64 context, for the current thread */
+static void ios_dr_fill( CONTEXT *context )
+{
+    ULONG64 regs[6];
+
+    if (!ios_dr_enabled() || !pBTCpu64IosDebugRegs( 0, regs )) return;
+    context->Dr0 = regs[0]; context->Dr1 = regs[1]; context->Dr2 = regs[2]; context->Dr3 = regs[3];
+    context->Dr6 = regs[4]; context->Dr7 = regs[5];
+    context->ContextFlags |= CONTEXT_AMD64_DEBUG_REGISTERS;
+}
+
+/* madeira [xstate-revert] (env MADEIRA_EC_XSTATE_REVERT = 0 turns it off).
+ *
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine
+ * 5af8c40642 "ntdll: Revert the ARM64EC XSTATE context series from Wine 11.22"
+ * (https://github.com/metalsharp/MetalSharp-Wine/pull/64): the 17 upstream Wine
+ * 11.22 commits that carry AVX state through ARM64EC contexts "make Overwatch's
+ * loader stop on an int3 under FEX". His change reverts them in the source. Ours
+ * is our own runtime version of the same thing, written from upstream Wine
+ * (LGPL-2.1) and no MetalSharp code: while the switch is on, every x64 context
+ * this file builds or reads behaves as in Wine 11.21 -
+ *   - exception, APC, emulation and thread-start contexts carry no CONTEXT_XSTATE
+ *     (flags come from the ARM context, as 11.21's context_arm_to_x64() did);
+ *   - NtGetContextThread ignores a CONTEXT_XSTATE request (11.21 had no XSTATE);
+ *   - NtContinue(Ex) / NtSetContextThread / NtRaiseException ignore the XSTATE
+ *     area of the context they are given (11.21 never read it).
+ * The frame layouts (struct xcontext, the 0x670 KiUserExceptionDispatcher frame)
+ * stay; [ki-legacy-frame] already hands a hooked x64 dispatcher the 0x4d0 frame.
+ * The unix side (init_shared_data_cpuinfo) reads the same variable. */
+static LONG ios_xsr_mode;   /* 0 not read, 1 off, 2 on */
+
+static BOOL ios_xstate_revert(void)
+{
+    if (!ios_xsr_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        PEB *peb = NtCurrentTeb()->Peb;
+        /* The first call comes from LdrInitializeThunk, before loader_init() has set
+         * FastPebLock: RtlQueryEnvironmentVariable_U( NULL, ... ) would take that NULL lock.
+         * Passing the environment block itself takes no lock; the process has one thread
+         * then, so reading it unlocked is safe (and the mode is cached from then on). */
+        WCHAR *env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_XSTATE_REVERT" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_xsr_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                        value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[xstate-revert] rev=xstate-revert-2 %s\n", ios_xsr_mode == 2 ? "on" : "off (MADEIRA_EC_XSTATE_REVERT=0)" );
+        if (ios_xsr_mode == 2 && (user_shared_data->XState.EnabledFeatures & XSTATE_MASK_AVX))
+            ERR( "[xstate-revert] AVX is advertised (MADEIRA_FEX_AVX=1) but contexts carry no YMM state: "
+                 "use MADEIRA_EC_XSTATE_REVERT=0 for a game that needs AVX across exceptions\n" );
+    }
+    return ios_xsr_mode == 2;
+}
+
+/* madeira [ctx-x64-fields] (env MADEIRA_EC_CTX_X64_FIELDS = 0 turns it off). rev=ctx-x64-fields-1.
+ *
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine d100ac4215 "ntdll: Give an
+ * x64 exception context its segment registers and x87 control word, and recognise hot-patchable
+ * export prologues" (LGPL-2.1,
+ * https://github.com/metalsharp/MetalSharp-Wine). An exception context built from an ARM64 context
+ * said nothing of segments (no CONTEXT_SEGMENTS, though the selectors are filled in) and had an x87
+ * control word of 0, where x64 Windows hands a handler CONTEXT_SEGMENTS and 0x27f. His commit: protection
+ * code compares the context its exception handler gets with what x64 Windows gives it. (Our own 0.2.88
+ * log: Overwatch's loader takes ~537 int3 traps through its own handler before its check.) Ours applies
+ * it to exception contexts only, after init_xcontext(). */
+static LONG ios_cxf_mode;   /* 0 not read, 1 off, 2 on */
+
+static void ios_ctx_x64_fields( CONTEXT *context )
+{
+    if (!ios_cxf_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        PEB *peb = NtCurrentTeb()->Peb;
+        /* as in ios_xstate_revert(): before loader_init() FastPebLock is NULL, so read the block itself */
+        WCHAR *env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_CTX_X64_FIELDS" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_cxf_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                        value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[ctx-x64-fields] rev=ctx-x64-fields-1 %s\n", ios_cxf_mode == 2 ? "on" : "off (MADEIRA_EC_CTX_X64_FIELDS=0)" );
+    }
+    if (ios_cxf_mode != 2) return;
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL)
+        context->ContextFlags |= CONTEXT_AMD64_SEGMENTS;
+    if (!context->FltSave.ControlWord) context->FltSave.ControlWord = 0x27f;
+}
+
+/* [xstate-revert]: context_x64_to_arm() without reading the caller's XSTATE area. */
+static NTSTATUS ios_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const CONTEXT *context )
+{
+    ARM64EC_NT_CONTEXT copy;
+
+    if (!ios_xstate_revert() || (context->ContextFlags & CONTEXT_AMD64_XSTATE) != CONTEXT_AMD64_XSTATE)
+        return context_x64_to_arm( arm_ctx, (const ARM64EC_NT_CONTEXT *)context );
+    memcpy( &copy, context, sizeof(copy) );
+    copy.ContextFlags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+    return context_x64_to_arm( arm_ctx, &copy );
+}
+
 NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    ios_cmd_continue();                      /* madeira [crashmailer-dump]: a handler that continues is done */
+    ios_sp_continue( context, alertable );   /* madeira-bcd [subpage-sweep] */
+    ios_dr_apply( context, "continue" );     /* madeira [dr-pass] */
+    ios_pfaf_stash( context );               /* madeira [pfaf-keep] */
+    ios_df_stash( context );                 /* madeira [df-ctx] */
+    ios_dr_check_rf( context );
+
+    if ((status = ios_x64_to_arm( &arm_ctx, context ))) return status;   /* madeira [xstate-revert] */
     return syscall_NtContinue( &arm_ctx, alertable );
 }
 
 NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    ios_cmd_continue();   /* madeira [crashmailer-dump] */
+    /* [subpage-sweep]; a value <= 0xff is the legacy BOOLEAN alertable form */
+    ios_sp_continue( context, (ULONG_PTR)args <= 0xff ? (ULONG_PTR)args != 0
+                                                      : (args->ContinueFlags & 1 /* KCONTINUE_FLAG_TEST_ALERT */) != 0 );
+    ios_dr_apply( context, "continue-ex" );  /* madeira [dr-pass] */
+    ios_pfaf_stash( context );               /* madeira [pfaf-keep] */
+    ios_df_stash( context );                 /* madeira [df-ctx] */
+    ios_dr_check_rf( context );
+
+    if ((status = ios_x64_to_arm( &arm_ctx, context ))) return status;   /* madeira [xstate-revert] */
     return syscall_NtContinueEx( &arm_ctx, args );
 }
 
@@ -1744,7 +2542,11 @@ NTSTATUS SYSCALL_API NtClose( HANDLE handle )
                 break;
             }
     }
-    return syscall_NtClose( handle );
+    {
+        NTSTATUS status = syscall_NtClose( handle );
+        if (status) ios_cmd_q_hook( IOS_CMD_CLOSE, handle, 0, status, NULL, 0, NULL );   /* madeira [crashmailer-dump] */
+        return status;
+    }
 }
 
 NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
@@ -1804,12 +2606,114 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
     return status;
 }
 
+/* madeira [getctx-guest] (env MADEIRA_GETCTX_GUEST = 0 turns it off; on by default). rev=getctx-guest-2. Ours.
+ *
+ * NtGetContextThread on another thread of this process that is suspended inside FEX's translated code
+ * used to hand back the native ARM64 registers converted with the ARM64EC mapping: Rip a JIT code-buffer
+ * address, Rsp the host sp, and the flags without PF/AF. Real x64 Windows hands back the guest state.
+ * When the native pc is not EC code, the target is in this process, is not the caller, and is suspended
+ * (ThreadSuspendCount > 0, so its JIT block cannot change under us), xtajit64's BTCpu64IosGuestContext
+ * rebuilds the guest registers from that same native context. Anywhere else (EC code, a syscall, the
+ * dispatcher) the export returns 0 and the old answer stands. The native context is always fetched with
+ * CONTROL|INTEGER|FLOATING_POINT in that case, because the guest RIP, RSP and PF/AF need all of them; only
+ * the parts the caller asked for are converted. */
+static LONG ios_gcg_mode;   /* 0 not read, 1 off, 2 on */
+
+static BOOL ios_getctx_guest_on(void)
+{
+    if (!ios_gcg_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        PEB *peb = NtCurrentTeb()->Peb;
+        WCHAR *env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;   /* as ios_xstate_revert */
+        RtlInitUnicodeString( &var, L"MADEIRA_GETCTX_GUEST" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_gcg_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                        value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[getctx-guest] rev=getctx-guest-2 %s, export %s\n",
+             ios_gcg_mode == 2 ? "on" : "off (MADEIRA_GETCTX_GUEST=0)",
+             pBTCpu64IosGuestContext ? "found" : "missing" );
+    }
+    return ios_gcg_mode == 2 && pBTCpu64IosGuestContext;
+}
+
+/* returns TRUE when arm_ctx now holds the guest view. No server call: the target's TEB is the snapshot's x18
+ * (ARM64EC keeps the TEB there, also in FEX's JIT); xtajit64 checks it and reads the target only through
+ * checked reads, and never writes it. The rebuild works on a copy, so a refusal leaves arm_ctx untouched. */
+static BOOL ios_getctx_guest( ARM64_NT_CONTEXT *arm_ctx )
+{
+    static LONG log_n;
+    ARM64_NT_CONTEXT copy;
+
+    if (RtlIsEcCode( arm_ctx->Pc ) || !arm_ctx->X18 || arm_ctx->X18 == (ULONG_PTR)NtCurrentTeb()) return FALSE;
+    copy = *arm_ctx;
+    if (!pBTCpu64IosGuestContext( (void *)(ULONG_PTR)arm_ctx->X18, &copy, 1 )) return FALSE;
+    if (InterlockedIncrement( &log_n ) <= 32)
+        ERR( "[getctx-guest] rev=getctx-guest-2 teb %p: native pc %I64x sp %I64x -> guest rip %I64x rsp %I64x\n",
+             (void *)(ULONG_PTR)arm_ctx->X18, arm_ctx->Pc, arm_ctx->Sp, copy.Pc, copy.Sp );
+    *arm_ctx = copy;
+    return TRUE;
+}
+
 NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
-    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
-    NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
+    /* madeira [xstate-revert]: as in Wine 11.21, a CONTEXT_XSTATE request is not served
+     * (the XSTATE bit is dropped from the request and from the result). */
+    const ULONG cmd_want = context->ContextFlags;   /* madeira [crashmailer-dump] */
+    const ULONG xsr_want = ios_xstate_revert() ? (context->ContextFlags & ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64))
+                                               : context->ContextFlags;
+    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( xsr_want ) };
+    const ULONG arm_want = arm_ctx.ContextFlags;   /* madeira [getctx-guest] */
+    BOOL gcg;
+    ULONG64 native_pc = 0;   /* madeira [getctx-guest] */
+    NTSTATUS status;
 
-    if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+    if ((xsr_want & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSTATE *xstate = (XSTATE *)((char *)context_ex + context_ex->XState.Offset);
+
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) || context_ex->XState.Length > sizeof(*xstate))
+            return STATUS_INVALID_PARAMETER;
+
+        xstate->Mask &= XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+        xstate->CompactionMask = 0;
+        if ((xstate->Mask & XSTATE_MASK_AVX) && context_ex->XState.Length < sizeof(*xstate))
+            return STATUS_BUFFER_OVERFLOW;
+    }
+
+    gcg = handle != GetCurrentThread() && ios_getctx_guest_on();   /* madeira [getctx-guest] */
+    /* the rebuild needs CONTROL (pc, NZCV) and INTEGER (the GPRs, x9/x24, x18); not FLOATING_POINT: xmm0-15
+     * are already at v0-v15, so a caller that asks for them gets them, and MADEIRA_CTX_FP=0 does not matter */
+    if (gcg) arm_ctx.ContextFlags |= CONTEXT_ARM64_CONTROL | CONTEXT_ARM64_INTEGER;
+    status = syscall_NtGetContextThread( handle, &arm_ctx );
+    native_pc = arm_ctx.Pc;   /* for the ml715 line below */
+    if (!status)
+    {
+        ULONG want = context->ContextFlags;   /* madeira [dr-pass] */
+        if (gcg)   /* madeira [getctx-guest] */
+        {
+            const ULONG need = CONTEXT_ARM64_CONTROL | CONTEXT_ARM64_INTEGER;
+            /* only the bits this wrapper added and the caller did not ask for are taken away again; the rest of
+             * the answer (CONTEXT_EXCEPTION_REPORTING, SERVICE_ACTIVE, EXCEPTION_ACTIVE ...) stays */
+            const ULONG added = need & ~arm_want & ~CONTEXT_ARM64;
+            /* YMM upper halves: this Wine has no FEX YMM context flag, and with [xstate-revert] (default) no
+             * XSTATE is returned, so v16-v31 (JIT temporaries) never reach the caller as YMM-high */
+            if ((arm_ctx.ContextFlags & need) == need) ios_getctx_guest( &arm_ctx );
+            arm_ctx.ContextFlags &= ~added;
+        }
+        context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx,
+                            ctx_flags_arm_to_x64( arm_ctx.ContextFlags ) | (xsr_want & CONTEXT_AMD64_XSTATE));
+        if ((want & CONTEXT_AMD64_DEBUG_REGISTERS) == CONTEXT_AMD64_DEBUG_REGISTERS && ios_dr_enabled())
+        {
+            if (ios_dr_is_self( handle )) ios_dr_fill( context );
+            else if (ios_dr_log_ok())
+                ERR( "[dr-pass] get of another thread's debug registers (handle %p) not filled\n", handle );
+        }
+    }
 
     /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
      *
@@ -1836,12 +2740,13 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
             ARM64EC_NT_CONTEXT *ec = (ARM64EC_NT_CONTEXT *)context;
             ERR( "[ec-getctx] ml715 #%d handle=%p status=%08x native_pc=%p is_ec=%d -> "
                  "returned rip=%p rsp=%p flags=%08x\n",
-                 (int)n, handle, (unsigned int)status, (void *)arm_ctx.Pc,
-                 status ? -1 : (RtlIsEcCode( arm_ctx.Pc ) ? 1 : 0),
+                 (int)n, handle, (unsigned int)status, (void *)(ULONG_PTR)native_pc,
+                 status ? -1 : (RtlIsEcCode( native_pc ) ? 1 : 0),
                  status ? NULL : (void *)ec->Pc, status ? NULL : (void *)ec->Sp,
                  status ? 0 : (unsigned int)ec->ContextFlags );
         }
     }
+    ios_cmd_getctx( handle, context, cmd_want, status );   /* madeira [crashmailer-dump] */
     return status;
 }
 
@@ -1911,6 +2816,144 @@ static BOOL ios_map_exec_view_enabled( void )
     return mode == 2;
 }
 
+/* Madeira ec-raw-image-metadata (Black Ops III, 0.2.79 run).
+ *
+ * An ARM64EC (or ARM64X) image's code reaches the emulator only through the
+ * __os_arm64x_* pointer slots named in its CHPE metadata: every exit thunk,
+ * indirect call and entry-thunk return loads one of them. Only the loader fills
+ * them (update_load_config -> arm64ec_update_hybrid_metadata). An application that
+ * maps an image section itself, without the loader, gets a view whose slots are all
+ * 0, so its first outgoing call or return jumps to address 0. Black Ops III's
+ * protector does exactly that with gdi32.dll (Wine bug 48171): the 0.2.79 run logs
+ * "[map-notify] SKIP (no ArbitraryUserPointer) addr=0000000071ED590000" and then
+ * "Unhandled exception code c0000005 flags 0 addr 0x0" in gdi32.dll+0x706a0.
+ * On x64 Windows gdi32 is plain x64 with nothing to fill, so such a copy works.
+ *
+ * Fill the slots for views that were mapped without the loader, with the same
+ * values the loader writes (they are process-wide, not per module). Loader views
+ * carry an ArbitraryUserPointer and are left to update_load_config.
+ * The idea was found in DroidDeck-Proton PR #34 (BSD-3-Clause repo), which copies
+ * the slots from the loaded instance in unix virtual.c; this is our own code and
+ * fills them directly instead. Off: env MADEIRA_EC_RAW_IMAGE_METADATA=0. */
+static BOOL ios_ec_raw_image_metadata_enabled( void )
+{
+    static LONG mode;  /* 0 not read yet, 1 off, 2 on (default) */
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_EC_RAW_IMAGE_METADATA" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
+static void ios_fill_raw_image_metadata( HANDLE handle, void *addr, SIZE_T size )
+{
+    static LONG fill_n, skip_n;  /* separate caps, so skips cannot hide the fill line */
+    SECTION_IMAGE_INFORMATION info;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    ULONG cfg_size;
+    ULONG_PTR rva;
+    LONG n;
+
+    if (!ios_ec_raw_image_metadata_enabled()) return;
+    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return;
+    if (!(nt = RtlImageNtHeader( addr ))) return;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return;
+    if (nt->OptionalHeader.SizeOfImage > size) goto skip;  /* partial view */
+    if (!(cfg = RtlImageDirectoryEntryToData( addr, TRUE, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &cfg_size )))
+        goto skip;
+    cfg_size = min( cfg_size, cfg->Size );
+    if (cfg_size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer )) goto skip;
+    if (!cfg->CHPEMetadataPointer) goto skip;  /* plain x64 image: nothing to fill */
+    /* The unix side relocates a view to image_info->map_addr and stores that base in
+     * OptionalHeader.ImageBase (upstream: the first view's base; iOS virtual_ios.c forces
+     * it to this view's own address). Either way the pointer and ImageBase move together,
+     * so the pointer is turned back into an RVA and used against THIS view. */
+    rva = cfg->CHPEMetadataPointer - nt->OptionalHeader.ImageBase;
+    if (rva >= nt->OptionalHeader.SizeOfImage ||
+        rva + sizeof(IMAGE_ARM64EC_METADATA) > nt->OptionalHeader.SizeOfImage) goto skip;
+
+    n = InterlockedIncrement( &fill_n );
+    if (n <= 16)
+        ERR( "[ec-raw-meta] #%d fill hybrid pointers in raw view %p (size %p, metadata rva %lx)"
+             " (MADEIRA_EC_RAW_IMAGE_METADATA=0 turns this off)\n",
+             (int)n, addr, (void *)size, (unsigned long)rva );
+    arm64ec_update_hybrid_metadata( addr, nt, (const IMAGE_ARM64EC_METADATA *)((char *)addr + rva) );
+    return;
+
+skip:
+    n = InterlockedIncrement( &skip_n );
+    if (n <= 16) ERR( "[ec-raw-meta] #%d no fill for x64 image view %p (size %p)\n", (int)n, addr, (void *)size );
+}
+
+/* Madeira section-views (Overwatch 2, 0.2.82 run). Ported from MetalSharp-Wine
+ * patches/wine/0132 (Avery Felts, AGPL-3.0; idea also in GameNative's FEX patch 0001/0003
+ * and proton-wine #47). Overwatch_loader.dll re-maps itself as a pagefile-backed section:
+ * an RW alias at 70D0DC0000 and RX views at its base, and our log shows neither reaches
+ * the emulator ("[map-notify] SKIP (no ArbitraryUserPointer) addr=00000070D0DC0000
+ * size=0000000002440000"). A write through the RW alias changes code FEX translated from
+ * the RX view without any fault FEX can see, so the stale translation keeps running.
+ * Hand every view of a DATA section (not an image) to the emulator with its section handle
+ * and offset; xtajit64 groups views of one section and checks their code per instruction.
+ * Image sections and every existing path below are unchanged. MADEIRA_EC_SECTION_VIEWS=0
+ * turns it off. */
+static BOOL ios_section_views_enabled( void )
+{
+    static LONG mode; /* 0 not read, 1 off, 2 on */
+
+    if (!mode)
+    {
+        static const WCHAR nameW[] = {'M','A','D','E','I','R','A','_','E','C','_','S','E','C','T','I','O','N','_','V','I','E','W','S',0};
+        WCHAR buffer[8];
+        UNICODE_STRING name, value;
+
+        RtlInitUnicodeString( &name, nameW );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[section-views] rev=section-views-1 %s\n", mode == 2 ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)" );
+    }
+    return mode == 2;
+}
+
+static void ios_notify_data_section_view( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
+                                          ULONG protect, const LARGE_INTEGER *offset )
+{
+    SECTION_IMAGE_INFORMATION info;
+    NTSTATUS status;
+    static LONG logged;
+
+    if (!pNotifyMapViewOfSection || !handle || !addr || !size) return;
+    if (!ios_section_views_enabled()) return;
+    /* only a section the server says is not an image; any other failure (e.g. no SECTION_QUERY
+     * access on an image handle) keeps the old behaviour */
+    status = NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL );
+    if (status != STATUS_SECTION_NOT_IMAGE)
+    {
+        static LONG odd;
+        if (status && InterlockedIncrement( &odd ) <= 8)
+            ERR( "[section-views] view addr=%p size=%p not sent: NtQuerySection status %x\n", addr, (void *)size, (int)status );
+        return;
+    }
+    if (InterlockedIncrement( &logged ) <= 32)
+        ERR( "[section-views] data view addr=%p size=%p offset=%s prot=%x\n", addr, (void *)size,
+             wine_dbgstr_longlong( offset ? offset->QuadPart : 0 ), protect );
+    /* xtajit64 always answers STATUS_SUCCESS for a data view; never unmap on its answer. */
+    pNotifyMapViewOfSection( handle, addr, (void *)(ULONG_PTR)(offset ? offset->QuadPart : 0), size, alloc, protect );
+}
+
 static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
                                         ULONG protect, NTSTATUS *ret_status )
 {
@@ -1958,6 +3001,7 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
         }
         if (skip_aup < 20)
         { skip_aup++; ERR( "[map-notify] SKIP (no ArbitraryUserPointer) addr=%p size=%p\n", addr, (void *)size ); }
+        ios_fill_raw_image_metadata( handle, addr, size );
         return;
     }
     if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ))
@@ -2123,6 +3167,7 @@ NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *a
                             is_cur, area, insc_before, entered );
         if (entered)
         {
+            ios_notify_data_section_view( handle, *addr_ptr, *size_ptr, alloc_type, protect, offset );
             notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
             leave_syscall_callback();
         }
@@ -2152,6 +3197,7 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID 
                             is_cur, area, insc_before, entered );
         if (entered)
         {
+            ios_notify_data_section_view( handle, *addr_ptr, *size_ptr, alloc_type, protect, offset );
             notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
             leave_syscall_callback();
         }
@@ -2271,6 +3317,8 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
                  st ? "  <== FAILED" : "",
                  is_current ? "" : "  (cross-process)" );
 
+            if (is_current && !st && old_prot)   /* madeira-bcd [subpage-sweep] */
+                ios_sp_note_protect( (ULONG_PTR)*addr_ptr, *size_ptr, new_prot, *old_prot );
             if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
                                                              *addr_ptr, *size_ptr, 2, new_prot, st );
             else if (pNotifyMemoryProtect
@@ -2285,6 +3333,8 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
     }
 
     status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    if (is_current && !status && old_prot)   /* madeira-bcd [subpage-sweep] */
+        ios_sp_note_protect( (ULONG_PTR)*addr_ptr, *size_ptr, new_prot, *old_prot );
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
@@ -2296,19 +3346,76 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
     return status;
 }
 
+/* madeira [cpu-x64-identity] (rev=cpu-identity-2; env MADEIRA_CPU_X64_IDENTITY = 0 or the master
+ * MADEIRA_CPU_IDENTITY = 0 turns it off). The x64 process is described as on an x64 PC where Windows on ARM
+ * already does so for an emulated x64 process: GetSystemInfo (SystemCpuInformation, FEX's
+ * UpdateProcessorInformation: AMD64 and the CPUID signature, as before), GetNativeSystemInfo
+ * (RtlGetNativeSystemInformation: the same, where it said ARM64 before; Windows on ARM answers AMD64 here too)
+ * and SystemEmulationProcessorInformation (the x86 view: INTEL with the same level and revision, where it said
+ * ARM). Read once, like ios_xstate_revert. */
+static LONG ios_x64id_mode;   /* 0 unread, 1 off, 2 on */
+
+static BOOL ios_env_is_zero( WCHAR *env, const WCHAR *name )
+{
+    UNICODE_STRING var, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &var, name );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    return !RtlQueryEnvironmentVariable_U( env, &var, &value ) && value.Length == sizeof(WCHAR) && buffer[0] == '0';
+}
+
+static BOOL ios_x64_identity(void)
+{
+    if (!ios_x64id_mode)
+    {
+        PEB *peb = NtCurrentTeb()->Peb;
+        WCHAR *env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;   /* see ios_xstate_revert */
+        ios_x64id_mode = (ios_env_is_zero( env, L"MADEIRA_CPU_IDENTITY" ) ||
+                          ios_env_is_zero( env, L"MADEIRA_CPU_X64_IDENTITY" )) ? 1 : 2;
+        ERR( "[cpu-x64-identity] rev=cpu-identity-2 %s\n", ios_x64id_mode == 2 ? "on: GetNativeSystemInfo and the "
+             "emulation processor information follow FEX's CPUID" : "off (MADEIRA_CPU_X64_IDENTITY=0 or MADEIRA_CPU_IDENTITY=0)" );
+    }
+    return ios_x64id_mode == 2;
+}
+
 NTSTATUS SYSCALL_API NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size )
 {
     NTSTATUS status = syscall_NtQuerySystemInformation( class, info, size, ret_size );
 
     if (!status && class == SystemCpuInformation && pUpdateProcessorInformation) pUpdateProcessorInformation( info );
+    if (!status && class == SystemEmulationProcessorInformation && pUpdateProcessorInformation &&
+        size >= sizeof(SYSTEM_CPU_INFORMATION) && ios_x64_identity())
+    {
+        SYSTEM_CPU_INFORMATION *cpu = info;
+        pUpdateProcessorInformation( info );   /* madeira [cpu-x64-identity] */
+        cpu->ProcessorArchitecture = PROCESSOR_ARCHITECTURE_INTEL;
+    }
+    ios_cmd_q_hook( IOS_CMD_QSI, NULL, class, status, info, size, ret_size );   /* madeira [crashmailer-dump] */
     return status;
 }
 
 NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = ios_x64_to_arm( &arm_ctx, context ))) return status;   /* madeira [xstate-revert] */
+    /* madeira [pfaf-keep]: carry PF/AF to the handler of a raise from x64 context (e.g. [subpage-sweep]'s
+     * read AVs); bit 26 survives the unix frame's cpsr_user_mask, bit 27 (AF) does not. */
+    if (ios_pfaf_enabled() && (context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL)
+    {
+        if (context->EFlags & 0x04) arm_ctx.Cpsr |= 0x04000000;
+        if (context->EFlags & 0x10) arm_ctx.Cpsr |= 0x08000000;
+    }
+    /* madeira [df-ctx]: and DF in bit 16. [subpage-sweep] re-raises from inside NtContinue, after the
+     * FEX-delivered fault whose IosDfDelivered is still set, so xtajit64 will trust the DF of the context
+     * this handler continues with: without the bit the handler saw DF=0 and a std; rep movs resumed forwards. */
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL && (context->EFlags & 0x400) &&
+        ios_df_enabled())
+        arm_ctx.Cpsr |= 0x00010000;
     return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
 }
 
@@ -2321,25 +3428,2133 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     if (pBTCpu64NotifyReadFile && enter_syscall_callback())
     {
         pBTCpu64NotifyReadFile( handle, buffer, length, FALSE, 0 );
-        status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
-        if (pBTCpu64NotifyReadFile) pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
         leave_syscall_callback();
-        return status;
     }
-    return syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    if (pBTCpu64NotifyReadFile && enter_syscall_callback())
+    {
+        pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
+        leave_syscall_callback();
+    }
+    return status;
 }
 
 NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = ios_x64_to_arm( &arm_ctx, context ))) return status;   /* madeira [xstate-revert] */
+    /* madeira [dr-pass] */
+    if ((context->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) == CONTEXT_AMD64_DEBUG_REGISTERS && ios_dr_enabled())
+    {
+        if (ios_dr_is_self( handle )) ios_dr_apply( context, "set-self" );
+        else if ((context->Dr7 & 0xff) && ios_dr_log_ok())
+            ERR( "[dr-pass] set of another thread's debug registers (handle %p dr0=%p dr7=%p) not applied\n",
+                 handle, (void *)context->Dr0, (void *)context->Dr7 );
+    }
+    if (ios_pfaf_enabled() && (context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL &&
+        ios_dr_is_self( handle ))
+        ios_pfaf_stash( context );   /* madeira [pfaf-keep] */
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL && ios_df_enabled() &&
+        ios_dr_is_self( handle ))
+        ios_df_stash( context );     /* madeira [df-ctx] */
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
+
+/* madeira-bcd [exc-ring] (env MADEIRA_EXC_RING = 0 turns it off). Log only.
+ *
+ * 0.2.77 log 87c31d6e: with [subpage-sweep] working, Overwatch 2 no longer jumps wild; it starts
+ * its own crash reporter ("CrashMailer_64.exe" "Overwatch") at 20 s and exits with status 0. What
+ * made it give up is not in the log: the game's KiUserExceptionDispatcher hook handles most
+ * exceptions itself, so call_seh_handlers' [exc] lines see few of them, and thousands of
+ * page-decrypt faults bury the rest. This keeps the last 128 exceptions of the process as seen in
+ * prepare_exception_arm64ec (before any hook), skipping page-decrypt faults (an access violation on
+ * a PAGE_NOACCESS page of the main exe: only counted) and folding repeats of the same
+ * code+address+thread among the last 8 entries into a count. The ring is printed once, when the process terminates. */
+#define IOS_XR_N 512   /* v2: 128 held only the last 0.3 s in 0.2.79 log 80f5a778 */
+static struct ios_xr_ent
+{
+    ULONG code, tid, tick, reps;
+    ULONG_PTR addr, p0, p1, sp;
+    ULONG_PTR handler;   /* [crashmailer-dump]: the handler that took it (or the last that ran) */
+    LONG hret;
+    USHORT hkind, nh;
+} ios_xr[IOS_XR_N];
+static LONG ios_xr_mode, ios_xr_next, ios_xr_decrypt, ios_xr_printed;   /* next is used as unsigned */
+
+/* returns the ring index of the entry (or of the one it was folded into), -1 when not recorded */
+static LONG ios_xr_record( const EXCEPTION_RECORD *rec, ULONG_PTR sp )
+{
+    struct ios_xr_ent *e;
+    ULONG tid, i, n;
+
+    if (ios_xr_mode == 1) return -1;
+    if (!ios_xr_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_EXC_RING" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_xr_mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                       value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        if (ios_xr_mode == 1) return -1;
+    }
+    if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) return -1;
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION && rec->NumberParameters >= 2 &&
+        ios_sp_locked_image_page( rec->ExceptionInformation[1] & ~(ULONG_PTR)0xfff, 0, NULL ))
+    {
+        InterlockedIncrement( &ios_xr_decrypt );
+        return -1;
+    }
+    tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+    n = (ULONG)ios_xr_next;
+    for (i = 1; i <= 8 && i <= n; i++)
+    {
+        e = &ios_xr[(n - i) % IOS_XR_N];
+        BOOL same_addr = e->addr == (ULONG_PTR)rec->ExceptionAddress;
+        /* v2: the game's int3 / ud bursts walk through a page one address at a time; fold them by page */
+        if ((rec->ExceptionCode == STATUS_BREAKPOINT || rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION) &&
+            (e->addr >> 12) == ((ULONG_PTR)rec->ExceptionAddress >> 12)) same_addr = TRUE;
+        if (e->code == rec->ExceptionCode && same_addr && e->tid == tid)
+        {
+            InterlockedIncrement( (LONG *)&e->reps );
+            e->tick = NtGetTickCount();
+            e->hkind &= 0xff;   /* [crashmailer-dump]: let this repeat's handler be noted */
+            return (LONG)((n - i) % IOS_XR_N);
+        }
+    }
+    n = (ULONG)InterlockedIncrement( &ios_xr_next ) - 1;
+    e = &ios_xr[n % IOS_XR_N];
+    e->code = rec->ExceptionCode;
+    e->addr = (ULONG_PTR)rec->ExceptionAddress;
+    e->p0 = rec->NumberParameters >= 1 ? rec->ExceptionInformation[0] : 0;
+    e->p1 = rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0;
+    e->sp = sp;
+    e->tid = tid;
+    e->tick = NtGetTickCount();
+    e->reps = 0;
+    e->handler = 0;
+    e->hret = 0;
+    e->hkind = e->nh = 0;
+    return (LONG)(n % IOS_XR_N);
+}
+
+static void ios_xr_dump( const char *why, LONG exit_code )
+{
+    ULONG n = (ULONG)ios_xr_next, first, i;
+    ULONG now = NtGetTickCount();
+
+    if (ios_xr_mode != 2 || InterlockedExchange( &ios_xr_printed, 1 )) return;
+    first = n > IOS_XR_N ? n - IOS_XR_N : 0;
+    ERR( "[exc-ring] %s exit_code=%08lx: last %lu of %lu exceptions (+%ld page-decrypt faults not listed), oldest first rev=exc-ring-2\n",
+         why, (ULONG)exit_code, n - first, n, ios_xr_decrypt );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_xr_ent *e = &ios_xr[i % IOS_XR_N];
+        ERR( "[exc-ring] #%lu -%lums tid=%04lx code=%08lx addr=%p p0=%p p1=%p sp=%p x%lu\n",
+             i, now - e->tick, e->tid, e->code, (void *)e->addr, (void *)e->p0, (void *)e->p1,
+             (void *)e->sp, e->reps + 1 );
+    }
+}
+
+
+/* madeira [crashmailer-dump] (env MADEIRA_EC_CRASHMAILER_DUMP = 0 turns it off). rev=crashmailer-dump-1. LOG ONLY.
+ *
+ * Overwatch 2 raises int 0x2c (STATUS_ASSERTION_FAILURE) at Overwatch_loader.dll+0x441960, handles it, runs ~7 s
+ * more and then its main thread starts "...\ErrorReporting\x64\CrashMailer_64.exe" "Overwatch". Why it decided to
+ * is not in the log. When NtCreateUserProcess is called for an image whose name contains "CrashMailer"
+ * (case-insensitive), this prints, once per process and before the process is created:
+ *   1. the calling thread's x64 state: unwound from here through the EC frames to the x64 caller (exact for rip,
+ *      rsp, the nonvolatile GPRs and xmm6-15), plus FEX's stored state for the thread (BTCpu64IosCrashMailerData);
+ *   2. a scan of up to 2048 stack slots from that rsp to the stack base: every value inside an executable section of
+ *      a loaded image (at most 24), with module+rva and the code from ret-512 to ret+64;
+ *   3. +-64 bytes around every register value and around the first 8 callers' frames (slot and saved rbp);
+ *   4. the last 64 [exc-ring] exceptions with the VEH/SEH/KiUserExceptionDispatcher-hook handler that took each one
+ *      and its return value, the x64 contexts of the last 12, and FEX's ring of delivered contexts;
+ *   5. the calling thread's last 4096 translated blocks (the ml1205 block ring; FEX turns it on for Overwatch.exe);
+ *   6. rings of the last 256 information queries (NtQueryInformationProcess/Thread, NtQuerySystemInformation(Ex),
+ *      NtSetInformationThread/Process, NtQueryObject, failed NtClose), the last 64 NtQueryVirtualMemory calls with
+ *      per-class counts, the last answer to each debugger-related query, the debugger fields of the PEB, the
+ *      process heap and KUSER_SHARED_DATA, unwinds made by exception handlers and NtGetContextThread calls on
+ *      other threads;
+ *   7. the CrashMailer command line, the last NtCreateFile calls, the process's open file handles and the files
+ *      under the game folder (and TEMP) changed in the last 60 s.
+ * The rings only record (no logging, no locks, no allocation); everything is printed by the dump. The dump reads
+ * memory only through NtQueryVirtualMemory-checked NtReadVirtualMemory, calls the syscalls through private stubs
+ * (a game hook on an ntdll export is not run, and the rings do not record the dump's own queries), takes no loader
+ * lock and allocates nothing. About 2000 lines. The FEX side reads the same variable. */
+#define IOS_CMD "[crashmailer-dump] "
+
+#define DEFINE_IOS_CMD_SYSCALL(name,args) \
+    static NTSTATUS __attribute__((naked)) ioscmd_##name args { __ASM_SYSCALL_FUNC( __id_##name, ioscmd_##name ); }
+DEFINE_IOS_CMD_SYSCALL(NtReadVirtualMemory, (HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read))
+DEFINE_IOS_CMD_SYSCALL(NtOpenFile, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG options))
+DEFINE_IOS_CMD_SYSCALL(NtQueryDirectoryFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc_routine, void *apc_context, IO_STATUS_BLOCK *io, void *buffer, ULONG length, FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry, UNICODE_STRING *mask, BOOLEAN restart_scan))
+DEFINE_IOS_CMD_SYSCALL(NtQuerySystemTime, (LARGE_INTEGER *time))
+#undef DEFINE_IOS_CMD_SYSCALL
+
+static LONG ios_cmd_mode;      /* 0 not read yet, 1 off, 2 on */
+static LONG ios_cmd_dumping;   /* the dump runs: the rings stop recording */
+static LONG ios_cmd_done;
+static void ios_xp_read_switch( WCHAR *env );   /* [crashmailer-exit-probe] */
+static void ios_xp_exit_event( const char *why );
+static void ios_xp_exit_hint( LONG *latch, const char *why );
+static LONG ios_xp_sppi_done;
+static void ios_xp_av_check( const EXCEPTION_RECORD *rec, const CONTEXT *c );
+static BOOL ios_xp_ring_last( ULONG_PTR ring, ULONG64 idx, ULONG64 *out, ULONG want );
+
+/* Read once, from LdrInitializeThunk of the first thread (before loader_init(), one thread, no lock: the
+ * ios_xstate_revert() pattern). The rings only look at the cached mode, so they never take the PEB lock. */
+static void ios_cmd_read_switch(void)
+{
+    UNICODE_STRING var, value;
+    WCHAR buffer[2];
+    PEB *peb = NtCurrentTeb()->Peb;
+    WCHAR *env;
+
+    if (ios_cmd_mode) return;
+    if (!peb->FastPebLock && !peb->ProcessParameters) return;
+    env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;
+    RtlInitUnicodeString( &var, L"MADEIRA_EC_CRASHMAILER_DUMP" );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    ios_cmd_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                    value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    ios_xp_read_switch( env );   /* [crashmailer-exit-probe] */
+}
+
+static inline BOOL ios_cmd_rec(void)
+{
+    return ios_cmd_mode == 2 && !ios_cmd_dumping;
+}
+
+static inline ULONG ios_cmd_tid(void)
+{
+    return HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+}
+
+/* per-thread state, hashed by thread id (a collision only mislabels a log line) */
+static struct ios_cmd_thr
+{
+    LONG tid;
+    LONG depth;      /* VEH/SEH handlers being run on this thread */
+    LONG internal;   /* ntdll's own dispatch/unwind code is running (its unwinds are not the game's) */
+    ULONG exc_tick;  /* last exception delivered to this thread */
+} ios_cmd_thr[256];
+
+static struct ios_cmd_thr *ios_cmd_thr_get( BOOL claim )
+{
+    ULONG tid = ios_cmd_tid();
+    struct ios_cmd_thr *t = &ios_cmd_thr[(tid >> 2) & 255];
+
+    if ((ULONG)t->tid == tid) return t;
+    if (!claim) return NULL;
+    t->depth = t->internal = 0;
+    t->exc_tick = 0;
+    t->tid = tid;
+    return t;
+}
+
+LONG ios_cmd_internal_enter(void)
+{
+    struct ios_cmd_thr *t;
+    LONG old;
+
+    if (ios_cmd_mode != 2 || !(t = ios_cmd_thr_get( TRUE ))) return 0;
+    old = t->internal;
+    t->internal = 1;
+    return old;
+}
+
+void ios_cmd_internal_leave( LONG old )
+{
+    struct ios_cmd_thr *t;
+
+    if (ios_cmd_mode == 2 && (t = ios_cmd_thr_get( FALSE ))) t->internal = old;
+}
+
+/* ---- 4. handlers, x64 contexts ---- */
+
+/* kind: 1 VEH, 2 SEH, 3 TEB-list handler, 4 hooked KiUserExceptionDispatcher */
+#define IOS_CMD_NORET 0x7fffffff   /* the handler was entered and has not returned (yet) */
+
+/* Before (phase 0) and after (phase 1) a guest-visible handler call; phase 2 only notes a handler (the hooked
+ * KiUserExceptionDispatcher, which runs outside ntdll's dispatch). Phase 0 returns the internal flag to restore. */
+LONG ios_cmd_handler( const EXCEPTION_RECORD *rec, ULONG kind, const void *handler, LONG ret, int phase )
+{
+    struct ios_cmd_thr *t;
+    LONG saved = 0;
+    ULONG tid, n, i;
+
+    if (ios_cmd_mode != 2) return 0;
+    if ((t = ios_cmd_thr_get( TRUE )))
+    {
+        if (!phase)
+        {
+            saved = t->internal;
+            t->internal = 0;
+            t->depth++;
+        }
+        else if (phase == 1 && t->depth > 0) t->depth--;   /* the caller restores internal (ios_cmd_internal_leave) */
+    }
+    if (!rec || ios_xr_mode != 2 || ios_cmd_dumping) return saved;
+    tid = ios_cmd_tid();
+    n = (ULONG)ios_xr_next;
+    /* the handler belongs to this thread's newest ring entry with this code (the address may have been rewritten
+     * by ResetToConsistentState since it was recorded) */
+    for (i = 1; i <= 16 && i <= n; i++)
+    {
+        struct ios_xr_ent *e = &ios_xr[(n - i) % IOS_XR_N];
+
+        if (e->tid != tid || e->code != rec->ExceptionCode) continue;
+        if (phase != 1) e->nh++;
+        /* keep the handler that took it: VEH -1 (continue execution), SEH 0 (continue execution) or one that
+         * never returned (it unwound or continued itself); otherwise the last one that ran */
+        if (!(e->hkind & 0x100))
+        {
+            e->hkind = (USHORT)kind;
+            e->handler = (ULONG_PTR)handler;
+            e->hret = phase == 1 ? ret : IOS_CMD_NORET;
+            if (phase && ((kind == 1 && ret == EXCEPTION_CONTINUE_EXECUTION) ||
+                          ((kind == 2 || kind == 3) && ret == ExceptionContinueExecution)))
+                e->hkind |= 0x100;
+        }
+        break;
+    }
+    return saved;
+}
+
+#define IOS_CMD_XCTX_N 16
+static struct ios_cmd_xctx
+{
+    LONG xr;   /* [exc-ring] index + 1, 0 while written */
+    ULONG tid, code, ctxflags, eflags, mxcsr;
+    USHORT fcw, pad;
+    ULONG_PTR addr;
+    ULONG64 gpr[16], rip, dr[6];
+    M128A xmm[16];
+} ios_cmd_xctx[IOS_CMD_XCTX_N];
+static LONG ios_cmd_xctx_next;
+
+static void ios_cmd_exc_ctx( LONG xr, const EXCEPTION_RECORD *rec, const CONTEXT *c )
+{
+    struct ios_cmd_xctx *x;
+    struct ios_cmd_thr *t;
+    LONG n;
+
+    if (!ios_cmd_rec()) return;
+    if ((t = ios_cmd_thr_get( TRUE ))) t->exc_tick = NtGetTickCount();
+    if (xr < 0) return;
+    n = InterlockedIncrement( &ios_cmd_xctx_next ) - 1;
+    x = &ios_cmd_xctx[(ULONG)n % IOS_CMD_XCTX_N];
+    x->xr = 0;
+    x->tid = ios_cmd_tid();
+    x->code = rec->ExceptionCode;
+    x->addr = (ULONG_PTR)rec->ExceptionAddress;
+    x->ctxflags = c->ContextFlags;
+    x->eflags = c->EFlags;
+    x->mxcsr = c->MxCsr;
+    x->fcw = c->FltSave.ControlWord;
+    memcpy( x->gpr, &c->Rax, sizeof(x->gpr) );   /* Rax..R15 are contiguous in CONTEXT */
+    x->rip = c->Rip;
+    x->dr[0] = c->Dr0; x->dr[1] = c->Dr1; x->dr[2] = c->Dr2; x->dr[3] = c->Dr3;
+    x->dr[4] = c->Dr6; x->dr[5] = c->Dr7;
+    memcpy( x->xmm, &c->Xmm0, sizeof(x->xmm) );
+    x->xr = xr + 1;
+    ios_xp_av_check( rec, c );   /* [crashmailer-exit-probe] */
+}
+
+/* ---- 6. information queries ---- */
+
+static const char * const ios_cmd_qname[] = { "?", "QueryInformationProcess", "QuerySystemInformation",
+    "QuerySystemInformationEx", "QueryInformationThread", "SetInformationThread", "QueryObject", "Close(bad)",
+    "SetInformationProcess" };
+
+#define IOS_CMD_Q_N 256
+static struct ios_cmd_q
+{
+    ULONG seq, tick, tid, fn, cls, status, len, retlen;
+    ULONG_PTR handle;
+    UCHAR data[32];
+} ios_cmd_q[IOS_CMD_Q_N];
+static LONG ios_cmd_q_next;
+
+/* the last answer to each debugger-related query */
+static const struct { ULONG fn, cls; const char *name; } ios_cmd_dbgq[] =
+{
+    { IOS_CMD_QIP, 7, "ProcessDebugPort" },
+    { IOS_CMD_QIP, 0x1e, "ProcessDebugObjectHandle" },
+    { IOS_CMD_QIP, 0x1f, "ProcessDebugFlags" },
+    { IOS_CMD_QSI, 0x23, "SystemKernelDebuggerInformation" },
+    { IOS_CMD_QSI, 0x95, "SystemKernelDebuggerInformationEx" },
+    { IOS_CMD_QIT, 0x11, "ThreadHideFromDebugger(query)" },
+    { IOS_CMD_SIT, 0x11, "ThreadHideFromDebugger(set)" },
+    { IOS_CMD_SIP, 0x1f, "ProcessDebugFlags(set)" },
+};
+static struct { LONG count; ULONG status, tid, len, tick; UCHAR data[16]; } ios_cmd_dbga[ARRAY_SIZE(ios_cmd_dbgq)];
+
+/* data: for a query the result (copied only on success or buffer overflow, when the kernel side wrote it), for a
+ * set the input (copied only on success: a failed set may never have read it, and the caller's pointer can be bad).
+ * The copy never crosses the page of data[0], which the kernel side has just accessed. */
+static void ios_cmd_q_record( ULONG fn, HANDLE handle, ULONG cls, NTSTATUS status, const void *data,
+                              ULONG len, const ULONG *retlen_ptr )
+{
+    struct ios_cmd_q *q;
+    ULONG n, copy = 0, retlen = 0, i;
+    BOOL wrote = !status || status == STATUS_BUFFER_OVERFLOW;
+    BOOL is_set = fn == IOS_CMD_SIT || fn == IOS_CMD_SIP;
+
+    if (wrote && retlen_ptr) retlen = *retlen_ptr;
+    if (data && (is_set ? !status : wrote))
+    {
+        copy = len;
+        if (!is_set && retlen_ptr && retlen < copy) copy = retlen;
+        if (copy > sizeof(q->data)) copy = sizeof(q->data);
+        if (copy > 0x1000 - ((ULONG_PTR)data & 0xfff)) copy = 0x1000 - ((ULONG_PTR)data & 0xfff);
+    }
+    n = (ULONG)InterlockedIncrement( &ios_cmd_q_next );
+    q = &ios_cmd_q[(n - 1) % IOS_CMD_Q_N];
+    q->seq = 0;
+    q->tick = NtGetTickCount();
+    q->tid = ios_cmd_tid();
+    q->fn = fn;
+    q->cls = cls;
+    q->status = status;
+    q->len = len;
+    q->retlen = retlen_ptr ? retlen : ~0u;
+    q->handle = (ULONG_PTR)handle;
+    memset( q->data, 0, sizeof(q->data) );
+    if (copy) memcpy( q->data, data, copy );
+    q->seq = n;
+
+    for (i = 0; i < ARRAY_SIZE(ios_cmd_dbgq); i++)
+    {
+        if (ios_cmd_dbgq[i].fn != fn || ios_cmd_dbgq[i].cls != cls) continue;
+        InterlockedIncrement( &ios_cmd_dbga[i].count );
+        ios_cmd_dbga[i].status = status;
+        ios_cmd_dbga[i].tid = q->tid;
+        ios_cmd_dbga[i].len = len;
+        ios_cmd_dbga[i].tick = q->tick;
+        memset( ios_cmd_dbga[i].data, 0, sizeof(ios_cmd_dbga[i].data) );
+        if (copy) memcpy( ios_cmd_dbga[i].data, data, min( copy, sizeof(ios_cmd_dbga[i].data) ) );
+        break;
+    }
+}
+
+static void ios_cmd_q_hook( ULONG fn, HANDLE handle, ULONG cls, NTSTATUS status, const void *data, ULONG len,
+                            const ULONG *retlen )
+{
+    if (ios_cmd_rec()) ios_cmd_q_record( fn, handle, cls, status, data, len, retlen );
+    if (fn == IOS_CMD_QSI && cls == 8 /* SystemProcessorPerformanceInformation */)   /* [crashmailer-exit-probe] */
+        ios_xp_exit_hint( &ios_xp_sppi_done, "SystemProcessorPerformanceInformation query" );
+}
+
+#define IOS_CMD_VM_N 64
+static LONG ios_cmd_vm_count[16];
+static struct ios_cmd_vm
+{
+    ULONG seq, tick, tid, cls, status, state, protect, type;
+    ULONG_PTR addr, base, size;
+    HANDLE process;
+} ios_cmd_vm[IOS_CMD_VM_N];
+static LONG ios_cmd_vm_next;
+
+static void ios_cmd_vm_record( HANDLE process, const void *addr, ULONG cls, NTSTATUS status, const void *buffer )
+{
+    struct ios_cmd_vm *v;
+    ULONG n;
+
+    InterlockedIncrement( &ios_cmd_vm_count[cls < 15 ? cls : 15] );
+    n = (ULONG)InterlockedIncrement( &ios_cmd_vm_next );
+    v = &ios_cmd_vm[(n - 1) % IOS_CMD_VM_N];
+    v->seq = 0;
+    v->tick = NtGetTickCount();
+    v->tid = ios_cmd_tid();
+    v->cls = cls;
+    v->status = status;
+    v->addr = (ULONG_PTR)addr;
+    v->process = process;
+    v->base = v->size = 0;
+    v->state = v->protect = v->type = 0;
+    if (!status && cls == MemoryBasicInformation && buffer)
+    {
+        const MEMORY_BASIC_INFORMATION *mbi = buffer;
+        v->base = (ULONG_PTR)mbi->BaseAddress;
+        v->size = mbi->RegionSize;
+        v->state = mbi->State;
+        v->protect = mbi->Protect;
+        v->type = mbi->Type;
+    }
+    v->seq = n;
+}
+
+/* NtGetContextThread on another thread */
+#define IOS_CMD_GC_N 16
+static struct ios_cmd_gc
+{
+    ULONG seq, tick, tid, target, suspend, want, status, ctxflags, eflags;
+    ULONG_PTR handle;
+    ULONG64 gpr[16], rip, dr[6];
+} ios_cmd_gc[IOS_CMD_GC_N];
+static LONG ios_cmd_gc_next;
+
+/* unwinds made by the game outside ntdll's own dispatch: inside a VEH/SEH handler, or within 100 ms of an
+ * exception on that thread (a hooked KiUserExceptionDispatcher runs outside both) */
+#define IOS_CMD_UNW_N 16
+static struct ios_cmd_unw
+{
+    ULONG seq, tick, tid, kind, depth, since_exc, status, match, checked;
+    ULONG_PTR base, pc, target, frame;
+    ULONG64 pre[10], post[10];   /* rip rsp rbx rbp rsi rdi r12 r13 r14 r15 */
+    M128A x6[2], x7[2];          /* pre, post */
+} ios_cmd_unw[IOS_CMD_UNW_N];
+static LONG ios_cmd_unw_next, ios_cmd_unw_total;
+
+static void ios_cmd_nonvol( const CONTEXT *c, ULONG64 *r )
+{
+    r[0] = c->Rip; r[1] = c->Rsp; r[2] = c->Rbx; r[3] = c->Rbp; r[4] = c->Rsi;
+    r[5] = c->Rdi; r[6] = c->R12; r[7] = c->R13; r[8] = c->R14; r[9] = c->R15;
+}
+
+/* kind 1 RtlVirtualUnwind(2), 2 RtlUnwindEx. Returns a token for ios_cmd_unwind_post(), or -1 (not recorded). */
+int ios_cmd_unwind_pre( ULONG kind, ULONG_PTR base, ULONG_PTR pc, const CONTEXT *context )
+{
+    struct ios_cmd_thr *t;
+    struct ios_cmd_unw *u;
+    ULONG now, since, n;
+
+    if (!ios_cmd_rec() || !(t = ios_cmd_thr_get( FALSE )) || t->internal) return -1;
+    now = NtGetTickCount();
+    since = t->exc_tick ? now - t->exc_tick : ~0u;
+    if (t->depth <= 0 && since > 100) return -1;
+    InterlockedIncrement( &ios_cmd_unw_total );
+    n = (ULONG)InterlockedIncrement( &ios_cmd_unw_next );
+    u = &ios_cmd_unw[(n - 1) % IOS_CMD_UNW_N];
+    u->seq = 0;
+    u->tick = now;
+    u->tid = ios_cmd_tid();
+    u->kind = kind;
+    u->depth = t->depth;
+    u->since_exc = since;
+    u->base = base;
+    u->pc = pc;
+    u->target = u->frame = 0;
+    u->status = 0;
+    u->match = u->checked = 0;
+    ios_cmd_nonvol( context, u->pre );
+    memcpy( &u->x6[0], &context->Xmm6, sizeof(M128A) );
+    memcpy( &u->x7[0], &context->Xmm7, sizeof(M128A) );
+    memset( u->post, 0, sizeof(u->post) );
+    u->seq = n;
+    return (int)((n - 1) % IOS_CMD_UNW_N);
+}
+
+/* ptrs (may be NULL): where the unwinder took each register from. A restored register "matches" when its new value
+ * equals the memory it was restored from. The unwinder has just read those slots, so they are read directly (no
+ * syscalls on this path). */
+void ios_cmd_unwind_post( int tok, const CONTEXT *context, NTSTATUS status, const KNONVOLATILE_CONTEXT_POINTERS *ptrs,
+                          ULONG_PTR target, ULONG_PTR frame )
+{
+    static const int gpr_idx[8] = { 3, 5, 6, 7, 12, 13, 14, 15 };   /* rbx rbp rsi rdi r12-r15 in IntegerContext */
+    struct ios_cmd_unw *u;
+    int i;
+
+    if (tok < 0 || tok >= IOS_CMD_UNW_N) return;
+    u = &ios_cmd_unw[tok];
+    u->status = status;
+    u->target = target;
+    u->frame = frame;
+    ios_cmd_nonvol( context, u->post );
+    memcpy( &u->x6[1], &context->Xmm6, sizeof(M128A) );
+    memcpy( &u->x7[1], &context->Xmm7, sizeof(M128A) );
+    if (!ptrs || status) return;
+    for (i = 0; i < 8; i++)
+    {
+        if (!ptrs->IntegerContext[gpr_idx[i]]) continue;
+        u->checked |= 1u << i;
+        if (*ptrs->IntegerContext[gpr_idx[i]] == u->post[i + 2]) u->match |= 1u << i;
+    }
+    for (i = 6; i <= 7; i++)
+    {
+        const M128A *now = i == 6 ? &context->Xmm6 : &context->Xmm7;
+        if (!ptrs->FloatingContext[i]) continue;
+        u->checked |= 1u << (i + 2);
+        if (!memcmp( ptrs->FloatingContext[i], now, sizeof(*now) )) u->match |= 1u << (i + 2);
+    }
+}
+
+void ios_cmd_continue(void)
+{
+    struct ios_cmd_thr *t;
+
+    if (ios_cmd_mode == 2 && (t = ios_cmd_thr_get( FALSE ))) t->depth = t->internal = 0;
+}
+
+/* ---- 7. NtCreateFile ---- */
+#define IOS_CMD_F_N 64
+#define IOS_CMD_FW_N 32
+struct ios_cmd_file
+{
+    ULONG seq, tick, tid, access, dispo, options, status;
+    ULONG_PTR root, handle;
+    USHORT len;
+    WCHAR name[118];
+};
+static struct ios_cmd_file ios_cmd_f[IOS_CMD_F_N], ios_cmd_fw[IOS_CMD_FW_N];
+static LONG ios_cmd_f_next, ios_cmd_fw_next;
+
+static void ios_cmd_file_record( const HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, ULONG dispo,
+                                 ULONG options, NTSTATUS status )
+{
+    BOOL name_ok = !status || status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND ||
+                   status == STATUS_ACCESS_DENIED || status == STATUS_SHARING_VIOLATION ||
+                   status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_FILE_IS_A_DIRECTORY ||
+                   status == STATUS_NOT_A_DIRECTORY;
+    BOOL write = (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | DELETE)) ||
+                 dispo == FILE_CREATE || dispo == FILE_SUPERSEDE || dispo == FILE_OVERWRITE || dispo == FILE_OVERWRITE_IF;
+    int pass;
+
+    for (pass = 0; pass < (write ? 2 : 1); pass++)
+    {
+        struct ios_cmd_file *f;
+        ULONG n;
+
+        if (!pass)
+        {
+            n = (ULONG)InterlockedIncrement( &ios_cmd_f_next );
+            f = &ios_cmd_f[(n - 1) % IOS_CMD_F_N];
+        }
+        else
+        {
+            n = (ULONG)InterlockedIncrement( &ios_cmd_fw_next );
+            f = &ios_cmd_fw[(n - 1) % IOS_CMD_FW_N];
+        }
+        f->seq = 0;
+        f->tick = NtGetTickCount();
+        f->tid = ios_cmd_tid();
+        f->access = access;
+        f->dispo = dispo;
+        f->options = options;
+        f->status = status;
+        f->root = attr && name_ok ? (ULONG_PTR)attr->RootDirectory : 0;
+        f->handle = !status && handle ? (ULONG_PTR)*handle : 0;
+        f->len = 0;
+        if (name_ok && attr && attr->ObjectName && attr->ObjectName->Buffer)
+        {
+            USHORT len = attr->ObjectName->Length / sizeof(WCHAR);
+            /* keep the end of a long path: the file name is the interesting part */
+            const WCHAR *src = attr->ObjectName->Buffer;
+            if (len > ARRAY_SIZE(f->name)) { src += len - ARRAY_SIZE(f->name); len = ARRAY_SIZE(f->name); }
+            memcpy( f->name, src, len * sizeof(WCHAR) );
+            f->len = len;
+        }
+        f->seq = n;
+    }
+}
+
+/* ---- the dump ---- */
+
+static const char ios_cmd_hexd[] = "0123456789abcdef";
+
+/* TRUE when [addr, addr+len) is committed, readable and not a guard page (reading one would clear its guard bit). */
+static BOOL ios_cmd_readable( ULONG_PTR addr, SIZE_T len, ULONG *bad )
+{
+    ULONG_PTR page, end = addr + len;
+
+    if (bad) *bad = 0;
+    if (addr < 0x10000 || end < addr || end > 0x800000000000ULL)
+    {
+        if (bad) *bad = 0xfffffffd;
+        return FALSE;
+    }
+    for (page = addr & ~(ULONG_PTR)0xfff; page < end;)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        ULONG_PTR next;
+
+        if (syscall_NtQueryVirtualMemory( NtCurrentProcess(), (void *)page, MemoryBasicInformation,
+                                          &mbi, sizeof(mbi), NULL ))
+        {
+            if (bad) *bad = 0xffffffff;
+            return FALSE;
+        }
+        if (mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        {
+            if (bad) *bad = mbi.State != MEM_COMMIT ? 0xfffffffe : mbi.Protect;
+            return FALSE;
+        }
+        next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= page) return FALSE;
+        page = next;
+    }
+    return TRUE;
+}
+
+static SIZE_T ios_cmd_read( ULONG_PTR addr, void *buf, SIZE_T len )
+{
+    SIZE_T got = 0;
+
+    if (!len || !ios_cmd_readable( addr, len, NULL )) return 0;
+    if (ioscmd_NtReadVirtualMemory( NtCurrentProcess(), (void *)addr, buf, len, &got )) return 0;
+    return got;
+}
+
+static void ios_cmd_hex( char *out, const UCHAR *b, SIZE_T len, SIZE_T got )
+{
+    SIZE_T i, o = 0;
+
+    for (i = 0; i < len; i++)
+    {
+        if (i < got)
+        {
+            out[o++] = ios_cmd_hexd[b[i] >> 4];
+            out[o++] = ios_cmd_hexd[b[i] & 15];
+        }
+        else
+        {
+            out[o++] = '?';
+            out[o++] = '?';
+        }
+        out[o++] = (i % 8 == 7) ? '|' : ' ';
+    }
+    out[o] = 0;
+}
+
+/* one line: up to 64 bytes at addr */
+static void ios_cmd_hexline( const char *what, ULONG_PTR addr, SIZE_T len )
+{
+    UCHAR b[64];
+    char out[64 * 3 + 1];
+    SIZE_T got;
+    ULONG bad;
+
+    if (len > sizeof(b)) len = sizeof(b);
+    if (!ios_cmd_readable( addr, len, &bad ))
+    {
+        ERR( IOS_CMD "  %s %p: not read (state/protect %08lx)\n", what, (void *)addr, bad );
+        return;
+    }
+    got = ios_cmd_read( addr, b, len );
+    ios_cmd_hex( out, b, len, got );
+    ERR( IOS_CMD "  %s %p: %s\n", what, (void *)addr, out );
+}
+
+/* loaded images seen by the dump: base, size, name and executable sections */
+static struct ios_cmd_mod
+{
+    ULONG_PTR base, size;
+    ULONG nsec;
+    ULONG sec[16][2];   /* rva, size of the executable sections */
+    char name[48];
+} ios_cmd_mods[64];
+static unsigned int ios_cmd_nmods;
+
+static struct ios_cmd_mod *ios_cmd_module( ULONG_PTR addr )
+{
+    static struct { UNICODE_STRING str; WCHAR buf[300]; } fn;
+    MEMORY_BASIC_INFORMATION mbi;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    struct ios_cmd_mod *m;
+    ULONG_PTR base, sec_addr;
+    unsigned int i, j, nsec;
+    SIZE_T got = 0;
+
+    if (addr < 0x10000 || addr >= 0x800000000000ULL) return NULL;
+    if (syscall_NtQueryVirtualMemory( NtCurrentProcess(), (void *)addr, MemoryBasicInformation, &mbi, sizeof(mbi), NULL ) ||
+        mbi.Type != MEM_IMAGE || !mbi.AllocationBase)
+        return NULL;
+    base = (ULONG_PTR)mbi.AllocationBase;
+    for (i = 0; i < ios_cmd_nmods; i++)
+        if (ios_cmd_mods[i].base == base) return addr - base < ios_cmd_mods[i].size ? &ios_cmd_mods[i] : NULL;
+    if (ios_cmd_nmods >= ARRAY_SIZE(ios_cmd_mods)) return NULL;
+    if (ios_cmd_read( base, &dos, sizeof(dos) ) != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew <= 0 || dos.e_lfanew > 0x10000 ||
+        ios_cmd_read( base + dos.e_lfanew, &nt, sizeof(nt) ) != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+    m = &ios_cmd_mods[ios_cmd_nmods];
+    memset( m, 0, sizeof(*m) );
+    m->base = base;
+    m->size = nt.OptionalHeader.SizeOfImage;
+    nsec = nt.FileHeader.NumberOfSections;
+    sec_addr = base + dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    for (i = 0; i < nsec && i < 96 && m->nsec < ARRAY_SIZE(m->sec); i++)
+    {
+        IMAGE_SECTION_HEADER sec;
+        if (ios_cmd_read( sec_addr + i * sizeof(sec), &sec, sizeof(sec) ) != sizeof(sec)) break;
+        if (!(sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE))) continue;
+        m->sec[m->nsec][0] = sec.VirtualAddress;
+        m->sec[m->nsec][1] = max( sec.Misc.VirtualSize, sec.SizeOfRawData );
+        m->nsec++;
+    }
+    strcpy( m->name, "?" );
+    if (!syscall_NtQueryVirtualMemory( NtCurrentProcess(), (void *)base, MemoryMappedFilenameInformation,
+                                       &fn, sizeof(fn) - sizeof(WCHAR), &got ) &&
+        fn.str.Buffer && fn.str.Length)
+    {
+        unsigned int len = fn.str.Length / sizeof(WCHAR), start = 0;
+        for (j = 0; j < len; j++) if (fn.str.Buffer[j] == '\\') start = j + 1;
+        for (j = 0; start + j < len && j < sizeof(m->name) - 1; j++)
+        {
+            WCHAR ch = fn.str.Buffer[start + j];
+            m->name[j] = ch >= 0x20 && ch < 0x7f ? (char)ch : '?';
+        }
+        m->name[j] = 0;
+    }
+    ios_cmd_nmods++;
+    return addr - base < m->size ? m : NULL;
+}
+
+static BOOL ios_cmd_in_exec( const struct ios_cmd_mod *m, ULONG_PTR addr )
+{
+    ULONG rva = (ULONG)(addr - m->base), i;
+
+    for (i = 0; i < m->nsec; i++)
+        if (rva >= m->sec[i][0] && rva - m->sec[i][0] < m->sec[i][1]) return TRUE;
+    return FALSE;
+}
+
+/* "module+0xrva" for addr (a JIT-pool alias is shown by its PE address), or "-" */
+static const char *ios_cmd_where( ULONG_PTR addr, char *buf, SIZE_T size )
+{
+    ULONG_PTR pe = (ULONG_PTR)xlate_ios_jit_rev( (void *)addr );
+    struct ios_cmd_mod *m = ios_cmd_module( pe );
+
+    if (!m) return "-";
+    if (size < sizeof(((struct ios_cmd_mod *)0)->name) + 32) return "-";
+    sprintf( buf, "%s+0x%lx%s%s", m->name, (ULONG)(pe - m->base), ios_cmd_in_exec( m, pe ) ? "" : "(data)",
+              pe != addr ? "(pool)" : "" );
+    return buf;
+}
+
+static BOOL ios_cmd_is_x64_code( ULONG_PTR addr )
+{
+    ULONG_PTR pe = (ULONG_PTR)xlate_ios_jit_rev( (void *)addr );
+    return !RtlIsEcCode( pe ) && !RtlIsEcCode( addr );
+}
+
+/* 1. unwind from here through the EC frames to the first x64 frame: the caller's context at its call. Returns
+ * the number of EC frames unwound, or -1. */
+static int __attribute__((noinline)) ios_cmd_x64_context( CONTEXT *ctx )
+{
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR lo = (ULONG_PTR)teb->DeallocationStack, hi = (ULONG_PTR)teb->Tib.StackBase;
+    int i;
+
+    RtlCaptureContext( ctx );
+    for (i = 0; i < 64; i++)
+    {
+        ULONG_PTR pc = ctx->Rip, sp = ctx->Rsp, lpc, base = 0, frame = 0;
+        RUNTIME_FUNCTION *func;
+        PEXCEPTION_ROUTINE handler;
+        void *data;
+
+        if (!pc || sp < lo || sp >= hi) return -1;
+        if (ios_cmd_is_x64_code( pc )) return i;
+        lpc = (ULONG_PTR)xlate_ios_jit_rev( (void *)pc ) - 4;   /* a return address: look up the call */
+        func = RtlLookupFunctionEntry( lpc, &base, NULL );
+        if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, lpc, func, ctx, NULL, &data, &frame,
+                               NULL, NULL, NULL, &handler, 0 ))
+            return -1;
+        if (ctx->Rsp < sp || (ctx->Rsp == sp && ctx->Rip == pc)) return -1;
+    }
+    return -1;
+}
+
+struct ios_cmd_fex_thread   /* mirrors IosCmFexThread in FEX's ARM64EC Module.cpp */
+{
+    ULONG64 version, rip, gregs[16], eflags, fcw, ftw, mxcsr, dr[6], xmm[16][2], ring_seq, block_ring;
+};
+struct ios_cmd_fex_exc      /* mirrors IosCmFexExc */
+{
+    ULONG64 seq;
+    UINT tid, code, eflags, live_tf;
+    ULONG64 x[31], sp, pc;
+    UINT cpsr, fpcr, fpsr, ctxflags;
+    ULONG64 v[32][2];
+};
+C_ASSERT( sizeof(struct ios_cmd_fex_thread) == 8 * 62 );
+C_ASSERT( sizeof(struct ios_cmd_fex_exc) == 816 );
+
+static void ios_cmd_regs( const char *what, const ULONG64 *g )   /* g: rax rcx rdx rbx rsp rbp rsi rdi r8-r15 */
+{
+    ERR( IOS_CMD "%s rax=%I64x rcx=%I64x rdx=%I64x rbx=%I64x rsp=%I64x rbp=%I64x rsi=%I64x rdi=%I64x\n",
+         what, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7] );
+    ERR( IOS_CMD "%s r8=%I64x r9=%I64x r10=%I64x r11=%I64x r12=%I64x r13=%I64x r14=%I64x r15=%I64x\n",
+         what, g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15] );
+}
+
+static void ios_cmd_xmm( const char *what, const ULONG64 (*x)[2], int first, int count )
+{
+    int i;
+    for (i = first; i < first + count; i += 4)
+        ERR( IOS_CMD "%s xmm%d=%016I64x%016I64x xmm%d=%016I64x%016I64x xmm%d=%016I64x%016I64x xmm%d=%016I64x%016I64x\n",
+             what, i, x[i][1], x[i][0], i + 1, x[i + 1][1], x[i + 1][0], i + 2, x[i + 2][1], x[i + 2][0],
+             i + 3, x[i + 3][1], x[i + 3][0] );
+}
+
+static const char *ios_cmd_hkind( ULONG kind )
+{
+    switch (kind & 0xff)
+    {
+    case 1: return "VEH";
+    case 2: return "SEH";
+    case 3: return "TEB-SEH";
+    case 4: return "KiUserExceptionDispatcher-hook";
+    default: return "none-seen";
+    }
+}
+
+/* the target of a hooked KiUserExceptionDispatcher thunk: jmp rel32, jmp [rip+x], mov rax/r11,imm64 + jmp */
+static ULONG_PTR ios_cmd_hook_target( const UCHAR *p )
+{
+    ULONG_PTR t = 0;
+    UCHAR b[16];
+
+    if (ios_cmd_read( (ULONG_PTR)p, b, sizeof(b) ) != sizeof(b)) return 0;
+    if (b[0] == 0xe9) return (ULONG_PTR)p + 5 + *(const INT *)(b + 1);
+    if (b[0] == 0xff && b[1] == 0x25)
+    {
+        ios_cmd_read( (ULONG_PTR)p + 6 + *(const INT *)(b + 2), &t, sizeof(t) );
+        return t;
+    }
+    if (b[0] == 0x48 && b[1] == 0xb8) return *(const ULONG_PTR *)(b + 2);
+    if (b[0] == 0x49 && b[1] == 0xbb) return *(const ULONG_PTR *)(b + 2);
+    return 0;
+}
+
+/* prepare_exception_arm64ec hands the exception to a hooked KiUserExceptionDispatcher thunk */
+static void ios_cmd_note_ki( const EXCEPTION_RECORD *rec, const void *thunk )
+{
+    static UCHAR last[16];
+    static ULONG_PTR target;
+
+    if (!ios_cmd_rec()) return;
+    if (memcmp( last, thunk, sizeof(last) ))   /* decode again only when the hook changed */
+    {
+        memcpy( last, thunk, sizeof(last) );
+        target = ios_cmd_hook_target( (const UCHAR *)thunk );
+    }
+    ios_cmd_handler( rec, 4, (const void *)target, 0, 2 );
+}
+
+static BOOL ios_cmd_wcsistr( const WCHAR *s, SIZE_T len, const char *needle )
+{
+    SIZE_T n = strlen( needle ), i, j;
+
+    for (i = 0; i + n <= len; i++)
+    {
+        for (j = 0; j < n; j++)
+        {
+            WCHAR c = s[i + j];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)needle[j]) break;
+        }
+        if (j == n) return TRUE;
+    }
+    return FALSE;
+}
+
+/* a string of process parameters (offsets when the block is not normalized), copied with checked reads */
+static USHORT ios_cmd_pstr( const RTL_USER_PROCESS_PARAMETERS *p, const UNICODE_STRING *s, WCHAR *out, USHORT max )
+{
+    ULONG_PTR addr;
+    USHORT len;
+
+    if (!s->Buffer || !s->Length) return 0;
+    addr = (p->Flags & PROCESS_PARAMS_FLAG_NORMALIZED) ? (ULONG_PTR)s->Buffer : (ULONG_PTR)p + (ULONG_PTR)s->Buffer;
+    len = min( s->Length / sizeof(WCHAR), max );
+    return ios_cmd_read( addr, out, len * sizeof(WCHAR) ) == len * sizeof(WCHAR) ? len : 0;
+}
+
+static void ios_cmd_wline( const char *what, const WCHAR *s, SIZE_T len )
+{
+    SIZE_T i;
+
+    if (!len) ERR( IOS_CMD "%s (none)\n", what );
+    for (i = 0; i < len; i += 160)
+        ERR( IOS_CMD "%s%s %s\n", what, i ? " (cont.)" : "", debugstr_wn( s + i, min( 160, len - i ) ) );
+}
+
+static union { SYSTEM_HANDLE_INFORMATION_EX info; UCHAR buf[256 * 1024]; } ios_cmd_handles;
+static struct ios_cmd_fex_exc ios_cmd_fexr[64];
+static ULONG64 ios_cmd_blk[4096];
+static ULONG_PTR ios_cmd_dirbuf[4][8192 / sizeof(ULONG_PTR)];
+
+/* 7. files changed in the last 60 s under a folder (depth <= max_depth) */
+static void ios_cmd_scan_dir( HANDLE root, const WCHAR *name, USHORT name_chars, WCHAR *rel, USHORT rel_len,
+                              int depth, int max_depth, LONGLONG since, LONGLONG now, int *scanned, int *shown )
+{
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING us;
+    IO_STATUS_BLOCK io;
+    HANDLE dir;
+    struct { USHORT off, len; } subs[24];
+    WCHAR subnames[24][64];
+    int nsub = 0, k;
+    BOOLEAN restart = TRUE;
+    void *buf = ios_cmd_dirbuf[depth];
+
+    us.Buffer = (WCHAR *)name;
+    us.Length = us.MaximumLength = name_chars * sizeof(WCHAR);
+    InitializeObjectAttributes( &attr, &us, OBJ_CASE_INSENSITIVE, root, NULL );
+    if (ioscmd_NtOpenFile( &dir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT ))
+        return;
+    while (*scanned < 6000 &&
+           !ioscmd_NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buf, sizeof(ios_cmd_dirbuf[0]),
+                                         FileDirectoryInformation, FALSE, NULL, restart ))
+    {
+        FILE_DIRECTORY_INFORMATION *fi = buf;
+        restart = FALSE;
+        for (;;)
+        {
+            USHORT n = fi->FileNameLength / sizeof(WCHAR);
+            const WCHAR *fname = fi->FileName;
+            BOOL dot = (n == 1 && fname[0] == '.') || (n == 2 && fname[0] == '.' && fname[1] == '.');
+
+            if (!dot)
+            {
+                (*scanned)++;
+                if (fi->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                {
+                    if (!(fi->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && depth < max_depth &&
+                        nsub < ARRAY_SIZE(subs) && n <= ARRAY_SIZE(subnames[0]))
+                    {
+                        memcpy( subnames[nsub], fname, n * sizeof(WCHAR) );
+                        subs[nsub].len = n;
+                        nsub++;
+                    }
+                }
+                else if ((fi->LastWriteTime.QuadPart >= since || fi->CreationTime.QuadPart >= since) && *shown < 48)
+                {
+                    LONGLONG t = max( fi->LastWriteTime.QuadPart, fi->CreationTime.QuadPart );
+                    (*shown)++;
+                    ERR( IOS_CMD "recent -%I64ds size=%I64d attr=%lx %s\\%s\n", (now - t) / 10000000,
+                         fi->EndOfFile.QuadPart, fi->FileAttributes, debugstr_wn( rel, rel_len ),
+                         debugstr_wn( fname, n ) );
+                }
+            }
+            if (!fi->NextEntryOffset) break;
+            fi = (FILE_DIRECTORY_INFORMATION *)((char *)fi + fi->NextEntryOffset);
+        }
+    }
+    for (k = 0; k < nsub; k++)
+    {
+        USHORT len = rel_len;
+        if (len + 1 + subs[k].len > 259) continue;
+        rel[len++] = '\\';
+        memcpy( rel + len, subnames[k], subs[k].len * sizeof(WCHAR) );
+        len += subs[k].len;
+        ios_cmd_scan_dir( dir, subnames[k], subs[k].len, rel, len, depth + 1, max_depth, since, now, scanned, shown );
+    }
+    syscall_NtClose( dir );
+}
+
+static void ios_cmd_scan_root( const char *what, const WCHAR *dos_dir, USHORT dir_chars, int max_depth,
+                               LONGLONG since, LONGLONG now )
+{
+    WCHAR nt[300], rel[260];
+    int scanned = 0, shown = 0;
+
+    if (!dir_chars || dir_chars > 290) return;
+    memcpy( nt, L"\\??\\", 4 * sizeof(WCHAR) );
+    memcpy( nt + 4, dos_dir, dir_chars * sizeof(WCHAR) );
+    ERR( IOS_CMD "recent files under %s %s (changed or created in the last 60 s, depth %d):\n", what,
+         debugstr_wn( dos_dir, dir_chars ), max_depth );
+    rel[0] = '.';
+    ios_cmd_scan_dir( NULL, nt, dir_chars + 4, rel, 1, 0, max_depth, since, now, &scanned, &shown );
+    ERR( IOS_CMD "recent: %d entries scanned, %d shown\n", scanned, shown );
+}
+
+/* madeira [crashmailer-exit-probe] (env MADEIRA_EC_EXIT_PROBE = 0 turns it off; also off with
+ * MADEIRA_EC_CRASHMAILER_DUMP = 0). rev=crashmailer-exit-probe-2. LOG ONLY. Ours.
+ *
+ * Overwatch 2 decides to quit (or crashes) without saying why, and the crashmailer dump only runs when it
+ * starts CrashMailer. This prints, at most once each:
+ *   - on NtTerminateProcess of this process (which ExitProcess and the CRT's exit end in), the
+ *     main thread's last 65536 translated blocks (FEX makes the ml1205 ring that big for Overwatch.exe while
+ *     this probe is on), folded: a repeated cycle of up to 16 blocks is one "*kxr" token; the first
+ *     LdrLoadDll of winbrand.dll and the first SystemProcessorPerformanceInformation query only log one line
+ *     (rev 2: they come long before an exit in many processes and used to take the snapshot);
+ *   - on the first recorded access violation at each target (env MADEIRA_EC_EXIT_PROBE_AV, a ';' list of
+ *     "module+hexrva", up to 4; default "Overwatch_loader.dll+1d8b143;Overwatch_loader.dll+f03a09", the two
+ *     AVs of the 0.2.94/0.2.95 crash), the faulting thread's x64 registers as its handlers get them, 64 bytes
+ *     around every register value, 32 stack slots with module+rva, and the same block snapshot for that thread;
+ *   - every software exception raised through RtlRaiseException (RaiseException, C++ throw 0xE06D7363 with
+ *     the thrown type's name), the first 64 and then every 256th; for the first NONCONTINUABLE one also the
+ *     caller's registers, the code addresses on its stack, this thread's last information queries and the
+ *     block snapshots of this thread and of the main thread.
+ * The snapshot and the AV dump read memory only through the dump's checked reads. The 512 KB snapshot buffer is
+ * allocated once at startup, only when the probe is on. */
+static LONG ios_xp_mode;   /* 0 not read, 1 off, 2 on; set with ios_cmd_mode */
+static TEB *ios_xp_main_teb;
+static LONG ios_xp_exit_done, ios_xp_busy, ios_xp_raise_n, ios_xp_nc_done, ios_xp_brand_done;
+/* the snapshot buffer: allocated only when the probe is on (no .bss when it is off) */
+#define IOS_XP_SNAP_N 65536
+static ULONG64 *ios_xp_snap;
+static struct { WCHAR mod[48]; ULONG rva; LONG done; } ios_xp_av[4];
+static unsigned int ios_xp_nav;
+
+/* [ptr-origin-1] heap ring: every RtlAllocateHeap/RtlFreeHeap of this process (all heaps, all threads), newest
+ * 16384. Only allocated when the probe is on. LOG ONLY. */
+#define IOS_PO_N 16384
+LONG ios_po_mode;
+static LONG ios_po_next;
+static struct ios_po_ent { ULONG seq, tid, tick, op; ULONG_PTR heap, size, ptr, caller; } *ios_po_ring;
+
+void ios_po_heap( ULONG op, void *heap, SIZE_T size, void *ptr, void *caller )
+{
+    struct ios_po_ent *e;
+    LONG n;
+
+    if (ios_po_mode != 2 || !ios_po_ring || ios_cmd_dumping || !ptr) return;
+    n = InterlockedIncrement( &ios_po_next );
+    e = &ios_po_ring[(n - 1) & (IOS_PO_N - 1)];
+    e->seq = 0;   /* a reader skips an entry that is being rewritten */
+    e->tid = ios_cmd_tid();
+    e->tick = NtGetTickCount();
+    e->op = op;
+    e->heap = (ULONG_PTR)heap;
+    e->size = size;
+    e->ptr = (ULONG_PTR)ptr;
+    e->caller = (ULONG_PTR)caller;
+    e->seq = n;
+}
+
+static void ios_xp_parse_av( const WCHAR *s, USHORT len )
+{
+    USHORT i = 0;
+
+    while (i < len && ios_xp_nav < ARRAY_SIZE(ios_xp_av))
+    {
+        unsigned int n = 0;
+        ULONG rva = 0;
+        BOOL ok = FALSE;
+
+        while (i < len && s[i] != '+' && s[i] != ';')
+        {
+            if (n < ARRAY_SIZE(ios_xp_av[0].mod) - 1) ios_xp_av[ios_xp_nav].mod[n++] = s[i];
+            i++;
+        }
+        ios_xp_av[ios_xp_nav].mod[n] = 0;
+        if (i < len && s[i] == '+')
+        {
+            for (i++; i < len && s[i] != ';'; i++)
+            {
+                WCHAR c = s[i];
+                if (c == 'x' || c == 'X') continue;
+                if (c >= '0' && c <= '9') rva = rva * 16 + (c - '0');
+                else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') rva = rva * 16 + ((c | 0x20) - 'a' + 10);
+                else continue;
+                ok = TRUE;
+            }
+        }
+        if (i < len && s[i] == ';') i++;
+        if (ok && n)
+        {
+            ios_xp_av[ios_xp_nav].rva = rva;
+            ios_xp_nav++;
+        }
+    }
+}
+
+/* first thread, from ios_cmd_read_switch (same lock-free environment read) */
+static void ios_xp_read_switch( WCHAR *env )
+{
+    static const WCHAR dflt[] = L"Overwatch_loader.dll+1d8b143;Overwatch_loader.dll+f03a09";
+    UNICODE_STRING var, value;
+    WCHAR buffer[256];
+    unsigned int i;
+
+    ios_xp_main_teb = NtCurrentTeb();
+    if (ios_cmd_mode != 2) { ios_xp_mode = 1; return; }
+    RtlInitUnicodeString( &var, L"MADEIRA_EC_EXIT_PROBE" );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = 2 * sizeof(WCHAR);
+    ios_xp_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                   value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    if (ios_xp_mode != 2) return;
+    RtlInitUnicodeString( &var, L"MADEIRA_EC_PTR_ORIGIN" );
+    value.Length = 0;
+    value.MaximumLength = 2 * sizeof(WCHAR);
+    if (!(!RtlQueryEnvironmentVariable_U( env, &var, &value ) && value.Length == sizeof(WCHAR) && buffer[0] == '0'))
+    {
+        void *pm = NULL;
+        SIZE_T psize = IOS_PO_N * sizeof(*ios_po_ring);
+        if (!NtAllocateVirtualMemory( NtCurrentProcess(), &pm, 0, &psize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
+        {
+            ios_po_ring = pm;
+            ios_po_mode = 2;
+            ERR( "[ptr-origin] rev=ptr-origin-1 on (MADEIRA_EC_PTR_ORIGIN=0 turns it off): heap ring %u entries\n", IOS_PO_N );
+        }
+    }
+    if (ios_po_mode != 2) ios_po_mode = 1;
+    {
+        void *mem = NULL;
+        SIZE_T size = IOS_XP_SNAP_N * sizeof(ULONG64);
+        if (NtAllocateVirtualMemory( NtCurrentProcess(), &mem, 0, &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
+        {
+            ERR( "[crashmailer-exit-probe] no memory for the snapshot buffer, probe off\n" );
+            ios_xp_mode = 1;
+            return;
+        }
+        ios_xp_snap = mem;
+    }
+    RtlInitUnicodeString( &var, L"MADEIRA_EC_EXIT_PROBE_AV" );
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    if (!RtlQueryEnvironmentVariable_U( env, &var, &value )) ios_xp_parse_av( buffer, value.Length / sizeof(WCHAR) );
+    else ios_xp_parse_av( dflt, ARRAY_SIZE(dflt) - 1 );
+    ERR( "[crashmailer-exit-probe] rev=crashmailer-exit-probe-2 on (MADEIRA_EC_EXIT_PROBE=0 turns it off), %u AV target(s)\n",
+         ios_xp_nav );
+    for (i = 0; i < ios_xp_nav; i++)
+        ERR( "[crashmailer-exit-probe] AV target %u: %s+0x%lx\n", i, debugstr_w( ios_xp_av[i].mod ), ios_xp_av[i].rva );
+}
+
+/* The last `want` entries of a ml1205 block ring, oldest first, into out[0..want). The ring's size is ring[-1]
+ * (an older FEX without it: 4096). Unused slots read as 0. */
+static BOOL ios_xp_ring_last( ULONG_PTR ring, ULONG64 idx, ULONG64 *out, ULONG want )
+{
+    ULONG64 n = 0;
+    ULONG first, a;
+
+    if (ios_cmd_read( ring - 8, &n, 8 ) != 8 || n < 4096 || n > 65536 || (n & (n - 1))) n = 4096;
+    memset( out, 0, want * sizeof(*out) );
+    if (want > n)
+    {
+        out += want - (ULONG)n;
+        want = (ULONG)n;
+    }
+    idx &= n - 1;
+    first = (ULONG)((idx + n - want) & (n - 1));   /* oldest wanted slot */
+    a = (ULONG)min( (ULONG64)want, n - first );
+    if (ios_cmd_read( ring + 8 + first * 8, out, a * 8 ) != a * 8) return FALSE;
+    if (a < want && ios_cmd_read( ring + 8, out + a, (want - a) * 8 ) != (want - a) * 8) return FALSE;
+    return TRUE;
+}
+
+/* the block snapshot of the thread whose TEB is teb */
+static void ios_xp_blocks( const char *why, TEB *teb )
+{
+    static struct { ULONG_PTR base, size; char name[48]; } mods[32];
+    unsigned int nmods = 0, cur = ~0u;
+    ULONG_PTR ring = 0;
+    ULONG64 idx = 0;
+    ULONG n = IOS_XP_SNAP_N, cnt, i, lines = 0;
+    char line[300], w[96];
+    int o = 0, tokens = 0;
+
+    if (!ios_xp_snap || !teb || ios_cmd_read( (ULONG_PTR)teb + 0x1710, &ring, sizeof(ring) ) != sizeof(ring) || !ring ||
+        ios_cmd_read( ring, &idx, 8 ) != 8 || !ios_xp_ring_last( ring, idx, ios_xp_snap, n ))
+    {
+        ERR( "[crashmailer-exit-probe] blocks (%s): no block ring on thread %04lx\n", why,
+             teb ? HandleToULong( teb->ClientId.UniqueThread ) : 0 );
+        return;
+    }
+    for (cnt = 0; cnt < n && !ios_xp_snap[cnt]; cnt++) ;   /* cnt = the first used slot */
+    ERR( "[crashmailer-exit-probe] blocks (%s): thread %04lx, last %lu of %lu block entries, oldest first; m<i>+rva "
+         "(modules listed after), else the address; /len = x86 bytes in the translation; *kxr = the previous k "
+         "entries repeated r more times\n", why, HandleToULong( teb->ClientId.UniqueThread ), n - cnt, n );
+    for (i = cnt; i < n && lines < 8192; )
+    {
+        ULONG64 ent = ios_xp_snap[i], rip = (ULONG_PTR)xlate_ios_jit_rev( (void *)(ULONG_PTR)(ent & 0xffffffffffffULL) );
+        ULONG k, best_k = 0, best_r = 0;
+
+        /* fold a cycle: entries i.. repeat the k before them */
+        for (k = 1; k <= 16 && i >= cnt + k; k++)
+        {
+            ULONG r = 0;
+            while (i + (r + 1) * k <= n && !memcmp( &ios_xp_snap[i + r * k], &ios_xp_snap[i - k], k * 8 )) r++;
+            if (r && r * k > best_r * best_k) { best_k = k; best_r = r; }
+        }
+        if (best_r && best_r * best_k >= 2)
+        {
+            o += sprintf( line + o, " *%lux%lu", best_k, best_r );
+            i += best_r * best_k;
+        }
+        else
+        {
+            if (cur == ~0u || rip - mods[cur].base >= mods[cur].size)
+            {
+                struct ios_cmd_mod *m = ios_cmd_module( (ULONG_PTR)rip );   /* rip is already the PE address */
+                unsigned int j;
+                cur = ~0u;
+                if (m)
+                {
+                    for (j = 0; j < nmods; j++) if (mods[j].base == m->base) break;
+                    if (j == nmods && nmods < ARRAY_SIZE(mods))
+                    {
+                        mods[nmods].base = m->base;
+                        mods[nmods].size = m->size;
+                        strcpy( mods[nmods].name, m->name );
+                        nmods++;
+                    }
+                    if (j < nmods) cur = j;
+                }
+            }
+            if (cur != ~0u) o += sprintf( line + o, " m%u+%I64x/%x", cur, rip - mods[cur].base, (UINT)(ent >> 48) );
+            else o += sprintf( line + o, " %I64x/%x", rip, (UINT)(ent >> 48) );
+            i++;
+        }
+        if (++tokens == 10 || i >= n)
+        {
+            ERR( "[crashmailer-exit-probe] b%lu:%s\n", lines, line );
+            lines++;
+            o = tokens = 0;
+        }
+    }
+    if (lines >= 8192) ERR( "[crashmailer-exit-probe] blocks: cut at 8192 lines\n" );
+    for (i = 0; i < nmods; i++)
+        ERR( "[crashmailer-exit-probe] m%lu = %s base %p size %Ix\n", i, mods[i].name, (void *)mods[i].base, mods[i].size );
+    for (i = n > 32 ? n - 32 : 0; i < n; i++)
+        if (ios_xp_snap[i])
+            ERR( "[crashmailer-exit-probe] blk -%lu %s\n", n - i,
+                 ios_cmd_where( (ULONG_PTR)(ios_xp_snap[i] & 0xffffffffffffULL), w, sizeof(w) ) );
+}
+
+static BOOL ios_xp_enter(void)
+{
+    if (ios_xp_mode != 2 || ios_cmd_dumping) return FALSE;
+    if (InterlockedCompareExchange( &ios_xp_busy, 1, 0 )) return FALSE;   /* one printer at a time */
+    ios_cmd_dumping = 1;   /* the rings do not record the probe's own reads */
+    return TRUE;
+}
+
+static void ios_xp_leave(void)
+{
+    ios_cmd_dumping = 0;
+    InterlockedExchange( &ios_xp_busy, 0 );
+}
+
+/* An exit-path hint (an SystemProcessorPerformanceInformation query, the winbrand.dll load): one line each, the
+ * first time only, and no snapshot. Overlays, CPU monitors and branding code cause these long before an exit. */
+static void ios_xp_exit_hint( LONG *latch, const char *why )
+{
+    if (ios_xp_mode != 2 || *latch || InterlockedExchange( latch, 1 )) return;
+    ERR( "[crashmailer-exit-probe] exit-path hint (log only): %s, on thread %04lx\n", why, ios_cmd_tid() );
+}
+
+/* The real exit (NtTerminateProcess): the main thread's block snapshot, once. A busy printer does not use up
+ * the latch. */
+static void ios_xp_exit_event( const char *why )
+{
+    if (ios_xp_mode != 2 || ios_xp_exit_done) return;
+    if (!ios_xp_enter()) return;
+    if (!InterlockedExchange( &ios_xp_exit_done, 1 ))
+    {
+        ERR( "[crashmailer-exit-probe] exit: %s, on thread %04lx (main thread %04lx)\n", why,
+             ios_cmd_tid(), ios_xp_main_teb ? HandleToULong( ios_xp_main_teb->ClientId.UniqueThread ) : 0 );
+        ios_xp_blocks( why, ios_xp_main_teb );
+    }
+    ios_xp_leave();
+}
+
+void ios_xp_dll_event( const UNICODE_STRING *name )   /* loader.c LdrLoadDll */
+{
+    if (ios_xp_mode == 2 && !ios_xp_brand_done && name && name->Buffer &&
+        ios_cmd_wcsistr( name->Buffer, name->Length / sizeof(WCHAR), "winbrand" ))
+        ios_xp_exit_hint( &ios_xp_brand_done, "LdrLoadDll winbrand.dll" );
+}
+
+/* a recorded exception with the context its handlers get (from ios_cmd_exc_ctx) */
+/* [ptr-origin-1] The AV target's address `a` (the read at loader+0xF03A09): which module/view it is relative to, what
+ * the system says it is, which heap blocks cover it, where else the value is stored, and the newest heap calls. */
+static void ios_po_report( const char *tag, ULONG64 a, const ULONG64 *g, ULONG_PTR sp )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    LIST_ENTRY *head, *l;
+    struct ios_po_ent snap;
+    char w[96];
+    LONG next = ios_po_next, i, hits = 0;
+    unsigned int k;
+    ULONG_PTR ldr_base = 0, ldr_size = 0;
+
+    if (ios_po_mode != 2) return;
+    ERR( "[ptr-origin] %s: target address %I64x\n", tag, a );
+    if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)a, MemoryBasicInformation, &mbi, sizeof(mbi), NULL ))
+        ERR( "[ptr-origin] %s: region base %p alloc base %p size %#Ix state %08lx protect %08lx type %08lx\n", tag,
+             mbi.BaseAddress, mbi.AllocationBase, mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type );
+    else
+        ERR( "[ptr-origin] %s: NtQueryVirtualMemory failed (unmapped)\n", tag );
+    head = &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList;
+    for (l = head->Flink; l != head; l = l->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY *m = CONTAINING_RECORD( l, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks );
+        LONG64 d = (LONG64)a - (LONG64)(ULONG_PTR)m->DllBase;
+        if (!m->BaseDllName.Buffer) continue;
+        if (!wcsnicmp( m->BaseDllName.Buffer, L"Overwatch_loader.dll", 20 ))
+        {
+            ldr_base = (ULONG_PTR)m->DllBase;
+            ldr_size = m->SizeOfImage;
+        }
+        if (d > -0x40000000LL && d < 0x40000000LL)
+            ERR( "[ptr-origin] %s: address = %s%s%#I64x (module %s base %p size %#lx)\n", tag, "base", d < 0 ? "-" : "+",
+                 d < 0 ? -d : d, debugstr_w( m->BaseDllName.Buffer ), m->DllBase, m->SizeOfImage );
+    }
+    /* heap blocks whose range holds the address (newest 8), newest first */
+    for (i = next; i > 0 && i > next - IOS_PO_N && hits < 8; i--)
+    {
+        struct ios_po_ent *e = &ios_po_ring[(i - 1) & (IOS_PO_N - 1)];
+        snap = *e;
+        if (snap.seq != (ULONG)i) continue;
+        if (a < snap.ptr || (snap.op == 0 && a >= snap.ptr + max( snap.size, 1 )) || (snap.op == 1 && a != snap.ptr)) continue;
+        ERR( "[ptr-origin] %s: heap %s #%lu tid=%04lx -%lums heap=%p ptr=%p size=%#Ix caller=%s\n", tag,
+             snap.op ? "FREE" : "ALLOC", snap.seq, snap.tid, NtGetTickCount() - snap.tick, (void *)snap.heap,
+             (void *)snap.ptr, snap.size, ios_cmd_where( snap.caller, w, sizeof(w) ) );
+        hits++;
+    }
+    if (!hits) ERR( "[ptr-origin] %s: no heap ring entry covers the address (ring holds the last %ld calls)\n", tag,
+                    min( next, (LONG)IOS_PO_N ) );
+    /* the newest 24 heap calls */
+    for (i = max( next - 24, 0 ); i < next; i++)
+    {
+        snap = ios_po_ring[i & (IOS_PO_N - 1)];
+        if (snap.seq != (ULONG)(i + 1)) continue;
+        ERR( "[ptr-origin] %s: recent heap %s #%lu tid=%04lx -%lums ptr=%p size=%#Ix caller=%s\n", tag,
+             snap.op ? "FREE" : "ALLOC", snap.seq, snap.tid, NtGetTickCount() - snap.tick, (void *)snap.ptr, snap.size,
+             ios_cmd_where( snap.caller, w, sizeof(w) ) );
+    }
+    /* where else is the value (or a value within 0x1000 of it) stored: registers, 4 KB of stack, the loader's image */
+    for (k = 0; k < 16; k++)
+        if (g[k] + 0x1000 >= a && g[k] <= a + 0x1000)
+            ERR( "[ptr-origin] %s: register #%u holds %I64x (%I64d from the address)\n", tag, k, g[k], (LONG64)(g[k] - a) );
+    for (k = 0; k < 512; k++)
+    {
+        ULONG64 v;
+        if (ios_cmd_read( sp + k * 8, &v, 8 ) != 8) break;
+        if (v + 0x1000 >= a && v <= a + 0x1000)
+            ERR( "[ptr-origin] %s: stack [rsp+%#x] holds %I64x (%I64d from the address)\n", tag, k * 8, v, (LONG64)(v - a) );
+    }
+    if (ldr_base && ldr_size)
+    {
+        static ULONG64 page[512];   /* the dump holds ios_xp_busy, so one buffer is enough */
+        ULONG_PTR off;
+        unsigned int found = 0;
+        for (off = 0; off < ldr_size && found < 16; off += sizeof(page))
+        {
+            SIZE_T got = ios_cmd_read( ldr_base + off, page, sizeof(page) );
+            for (k = 0; k < got / 8 && found < 16; k++)
+                if (page[k] + 0x1000 >= a && page[k] <= a + 0x1000)
+                {
+                    ERR( "[ptr-origin] %s: loader image rva %#lx holds %I64x (%I64d from the address)\n", tag,
+                         off + k * 8, page[k], (LONG64)(page[k] - a) );
+                    found++;
+                }
+        }
+        if (!found) ERR( "[ptr-origin] %s: the value is not stored anywhere in the loader image\n", tag );
+    }
+}
+
+static void ios_xp_av_check( const EXCEPTION_RECORD *rec, const CONTEXT *c )
+{
+    LDR_DATA_TABLE_ENTRY *mod;
+    ULONG_PTR addr = (ULONG_PTR)rec->ExceptionAddress, sp = c->Rsp;
+    ULONG64 g[16];
+    char w[96];
+    unsigned int i, t;
+
+    if (ios_xp_mode != 2 || !ios_xp_nav || rec->ExceptionCode != STATUS_ACCESS_VIOLATION) return;
+    if (LdrFindEntryForAddress( (void *)addr, &mod ) || !mod->BaseDllName.Buffer) return;
+    for (t = 0; t < ios_xp_nav; t++)
+    {
+        if (ios_xp_av[t].done || addr - (ULONG_PTR)mod->DllBase != ios_xp_av[t].rva) continue;
+        if (wcsnicmp( mod->BaseDllName.Buffer, ios_xp_av[t].mod, mod->BaseDllName.Length / sizeof(WCHAR) ) ||
+            ios_xp_av[t].mod[mod->BaseDllName.Length / sizeof(WCHAR)])
+            continue;
+        if (!ios_xp_enter()) return;   /* busy: the target stays armed for its next AV */
+        if (InterlockedExchange( &ios_xp_av[t].done, 1 ))
+        {
+            ios_xp_leave();
+            return;
+        }
+        ERR( "[crashmailer-exit-probe] AV at target %u %s+0x%lx (rip %p) on thread %04lx: %s %p, the context its "
+             "handlers get:\n", t, debugstr_w( ios_xp_av[t].mod ), ios_xp_av[t].rva, (void *)addr, ios_cmd_tid(),
+             rec->NumberParameters >= 1 && rec->ExceptionInformation[0] ? "write" : "read",
+             rec->NumberParameters >= 2 ? (void *)rec->ExceptionInformation[1] : NULL );
+        memcpy( g, &c->Rax, sizeof(g) );   /* Rax..R15 in CONTEXT order: rax rcx rdx rbx rsp rbp rsi rdi r8-r15 */
+        ios_cmd_regs( "probe-av", g );
+        ERR( IOS_CMD "probe-av eflags=%08lx mxcsr=%08lx\n", c->EFlags, c->MxCsr );
+        ios_cmd_xmm( "probe-av", (const ULONG64 (*)[2])&c->Xmm0, 0, 16 );
+        for (i = 0; i < 16; i++)
+        {
+            char what[128];
+            static const char * const names[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+            if (g[i] < 0x10000 || g[i] >= 0x800000000000ULL) continue;
+            snprintf( what, sizeof(what), "[%s-32] %s", names[i], ios_cmd_where( (ULONG_PTR)g[i], w, sizeof(w) ) );
+            ios_cmd_hexline( what, (ULONG_PTR)g[i] - 32, 64 );
+        }
+        for (i = 0; i < 32; i++)
+        {
+            ULONG64 v = 0;
+            if (ios_cmd_read( sp + i * 8, &v, 8 ) != 8) break;
+            ERR( IOS_CMD "probe-av [rsp+%#x]=%I64x %s\n", i * 8, v, ios_cmd_where( (ULONG_PTR)v, w, sizeof(w) ) );
+        }
+        if (rec->NumberParameters >= 2) ios_po_report( t ? "target-1" : "target-0", rec->ExceptionInformation[1], g, sp );   /* [ptr-origin-1] */
+        ios_xp_blocks( "AV target", NtCurrentTeb() );
+        ios_xp_leave();
+        return;
+    }
+}
+
+/* The first noncontinuable raise (0.2.95 tso log: Overwatch_loader+0x1c1643b raises 0xC00000E5 noncontinuable
+ * through kernelbase RaiseException): who raised it, what this thread asked the system just before, and the
+ * blocks of this thread and of the main thread. */
+static void ios_xp_noncontinuable( const EXCEPTION_RECORD *rec, const CONTEXT *c )
+{
+    const ULONG tid = ios_cmd_tid(), now = NtGetTickCount();
+    ULONG64 g[16];
+    char w[96];
+    ULONG n, first, i, shown = 0;
+
+    ERR( "[crashmailer-exit-probe] noncontinuable raise %08lx on thread %04lx; the caller's context (unwound from "
+         "RtlRaiseException) and the code addresses on its stack:\n", rec->ExceptionCode, tid );
+    memcpy( g, &c->Rax, sizeof(g) );
+    ios_cmd_regs( "probe-nc", g );
+    ERR( IOS_CMD "probe-nc rip=%p %s eflags=%08lx\n", (void *)c->Rip, ios_cmd_where( c->Rip, w, sizeof(w) ), c->EFlags );
+    for (i = 0; i < 512 && shown < 24; i++)
+    {
+        ULONG64 v = 0;
+        struct ios_cmd_mod *m;
+        if (ios_cmd_read( c->Rsp + i * 8, &v, 8 ) != 8) break;
+        if (!(m = ios_cmd_module( (ULONG_PTR)xlate_ios_jit_rev( (void *)(ULONG_PTR)v ) )) ||
+            !ios_cmd_in_exec( m, (ULONG_PTR)xlate_ios_jit_rev( (void *)(ULONG_PTR)v ) ))
+            continue;
+        ERR( IOS_CMD "probe-nc [rsp+%#lx]=%I64x %s\n", i * 8, v, ios_cmd_where( (ULONG_PTR)v, w, sizeof(w) ) );
+        ios_cmd_hexline( "code ret-64", (ULONG_PTR)v - 64, 64 );
+        shown++;
+    }
+    /* the information queries this thread made last (the crashmailer-dump ring; other syscalls are not recorded) */
+    n = (ULONG)ios_cmd_q_next;
+    first = n > IOS_CMD_Q_N ? n - IOS_CMD_Q_N : 0;
+    ERR( IOS_CMD "probe-nc this thread's last information queries, oldest first (of the last %lu of all threads):\n",
+         n - first );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_cmd_q *q = &ios_cmd_q[i % IOS_CMD_Q_N];
+        char hex[32 * 3 + 1];
+        if (q->seq != i + 1 || q->tid != tid) continue;
+        ios_cmd_hex( hex, q->data, sizeof(q->data), sizeof(q->data) );
+        ERR( IOS_CMD "probe-nc q #%lu -%lums %s h=%p class=%lx status=%08lx len=%lu retlen=%ld data=%s\n", i,
+             now - q->tick, ios_cmd_qname[q->fn < ARRAY_SIZE(ios_cmd_qname) ? q->fn : 0], (void *)q->handle, q->cls,
+             q->status, q->len, (long)q->retlen, hex );
+    }
+    /* [ptr-origin-1] the raising thread made no queries in 0.2.96 (its list printed empty): the newest 16 of any thread */
+    ERR( IOS_CMD "probe-nc newest information queries of ANY thread:\n" );
+    for (i = n > 16 ? n - 16 : 0; i < n; i++)
+    {
+        const struct ios_cmd_q *q = &ios_cmd_q[i % IOS_CMD_Q_N];
+        if (q->seq != i + 1) continue;
+        ERR( IOS_CMD "probe-nc any #%lu tid=%04lx -%lums %s class=%lx status=%08lx len=%lu\n", i, q->tid, now - q->tick,
+             ios_cmd_qname[q->fn < ARRAY_SIZE(ios_cmd_qname) ? q->fn : 0], q->cls, q->status, q->len );
+    }
+    ios_xp_blocks( "noncontinuable raise, raising thread", NtCurrentTeb() );
+    if (ios_xp_main_teb && ios_xp_main_teb != NtCurrentTeb())
+        ios_xp_blocks( "noncontinuable raise, main thread", ios_xp_main_teb );
+}
+
+/* RtlRaiseException, before dispatch (called from its asm) */
+void WINAPI ios_xp_raise( const EXCEPTION_RECORD *rec, const CONTEXT *c )
+{
+    LONG n;
+    char w[96], type[80] = "";
+
+    if (ios_xp_mode != 2 || ios_cmd_dumping || !rec) return;
+    n = InterlockedIncrement( &ios_xp_raise_n );
+    if (n > 64 && n % 256) return;
+    if (!ios_xp_enter()) return;
+    if (rec->ExceptionCode == 0xe06d7363 && rec->NumberParameters >= 4)
+    {
+        /* x64 C++ throw: [2] = ThrowInfo (image-relative fields), [3] = image base. ThrowInfo+0xc ->
+         * CatchableTypeArray, +4 the first CatchableType, its +4 the TypeDescriptor, whose name is at +0x10. */
+        ULONG_PTR base = rec->ExceptionInformation[3], ti = rec->ExceptionInformation[2];
+        int rva_cta = 0, rva_ct = 0, rva_td = 0;
+        SIZE_T got;
+        if (ti && base && ios_cmd_read( ti + 0xc, &rva_cta, 4 ) == 4 && rva_cta &&
+            ios_cmd_read( base + rva_cta + 4, &rva_ct, 4 ) == 4 && rva_ct &&
+            ios_cmd_read( base + rva_ct + 4, &rva_td, 4 ) == 4 && rva_td &&
+            (got = ios_cmd_read( base + rva_td + 0x10, type, sizeof(type) - 1 )))
+        {
+            type[got] = 0;
+            for (got = 0; type[got]; got++) if (type[got] < 0x20 || type[got] >= 0x7f) type[got] = '?';
+        }
+    }
+    ERR( "[crashmailer-exit-probe] raise #%ld tid=%04lx code=%08lx flags=%lx at %p %s nparams=%lu p0=%p p1=%p%s%s\n",
+         n, ios_cmd_tid(), rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
+         ios_cmd_where( (ULONG_PTR)rec->ExceptionAddress, w, sizeof(w) ), rec->NumberParameters,
+         rec->NumberParameters >= 1 ? (void *)rec->ExceptionInformation[0] : NULL,
+         rec->NumberParameters >= 2 ? (void *)rec->ExceptionInformation[1] : NULL,
+         type[0] ? " c++ type " : "", type );
+    if ((rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) && c && !InterlockedExchange( &ios_xp_nc_done, 1 ))
+        ios_xp_noncontinuable( rec, c );
+    ios_xp_leave();
+}
+
+static void ios_cmd_dump( const RTL_USER_PROCESS_PARAMETERS *params, const WCHAR *image, USHORT image_len,
+                          ULONG process_flags, ULONG thread_flags )
+{
+    static WCHAR cmdline[2048], cwd[300];
+    static const char * const gpr_names[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                                "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+    struct ios_cmd_fex_thread fex;
+    TEB *teb = NtCurrentTeb();
+    PEB *peb = teb->Peb;
+    ULONG_PTR stack_lo = (ULONG_PTR)teb->DeallocationStack, stack_hi = (ULONG_PTR)teb->Tib.StackBase;
+    ULONG_PTR caller_slot[24], caller_val[24], rsp;
+    ULONG now = NtGetTickCount(), n, first, i;
+    ULONG64 g[16];
+    CONTEXT ctx;
+    char w1[96], w2[96];
+    int frames, ncallers = 0, k;
+    BOOL have_fex;
+    LARGE_INTEGER sys_now;
+    USHORT len;
+
+    ERR( IOS_CMD "rev=crashmailer-dump-1 NtCreateUserProcess for %s (tid %04lx, pid %04lx, tick %lu); "
+         "MADEIRA_EC_CRASHMAILER_DUMP=0 turns this off\n", debugstr_wn( image, image_len ), ios_cmd_tid(),
+         HandleToULong( teb->ClientId.UniqueProcess ), now );
+    len = ios_cmd_pstr( params, &params->CommandLine, cmdline, ARRAY_SIZE(cmdline) );
+    ios_cmd_wline( "child command line", cmdline, len );
+    len = ios_cmd_pstr( params, &params->CurrentDirectory.DosPath, cwd, ARRAY_SIZE(cwd) );
+    ios_cmd_wline( "child current dir", cwd, len );
+    ERR( IOS_CMD "child process_flags=%lx thread_flags=%lx params->Flags=%lx\n", process_flags, thread_flags, params->Flags );
+
+    /* 1. x64 state */
+    memset( &ctx, 0, sizeof(ctx) );
+    frames = ios_cmd_x64_context( &ctx );
+    if (frames < 0)
+    {
+        /* no unwind: the first stack value that is x64 code in an image is the caller's return address */
+        ULONG_PTR sp = ctx.Rsp && ctx.Rsp >= stack_lo && ctx.Rsp < stack_hi ? ctx.Rsp : (ULONG_PTR)&ctx;
+        ULONG_PTR v = 0;
+        ERR( IOS_CMD "x64 state: unwinding through the EC frames FAILED; scanning from sp=%p for the x64 return address "
+             "(only rip/rsp below are meaningful)\n", (void *)sp );
+        memset( &ctx, 0, sizeof(ctx) );
+        for (sp &= ~(ULONG_PTR)7; sp + 8 <= stack_hi && sp < (ULONG_PTR)&ctx + 0x40000; sp += 8)
+        {
+            struct ios_cmd_mod *m;
+            if (ios_cmd_read( sp, &v, 8 ) != 8) break;
+            if ((m = ios_cmd_module( v )) && ios_cmd_in_exec( m, v ) && ios_cmd_is_x64_code( v ))
+            {
+                ctx.Rip = v;
+                ctx.Rsp = sp + 8;
+                break;
+            }
+        }
+    }
+    else ERR( IOS_CMD "x64 state of the caller, unwound through %d EC frames: rip, rsp, rbx, rbp, rsi, rdi, r12-r15 and "
+              "xmm6-15 are exact; rax, rcx, rdx, r8-r11, xmm0-5 and eflags are what the EC code left (volatile)\n", frames );
+    ERR( IOS_CMD "x64 rip=%I64x (%s) rsp=%I64x eflags=%08lx mxcsr=%08lx\n", ctx.Rip,
+         ios_cmd_where( ctx.Rip, w1, sizeof(w1) ), ctx.Rsp, ctx.EFlags, ctx.MxCsr );
+    memcpy( g, &ctx.Rax, sizeof(g) );
+    ios_cmd_regs( "x64", g );
+    ios_cmd_xmm( "x64", (const ULONG64 (*)[2])&ctx.Xmm0, 0, 16 );
+    have_fex = pBTCpu64IosCrashMailerData && pBTCpu64IosCrashMailerData( 0, &fex, sizeof(fex) ) && fex.version == 1;
+    if (have_fex)
+    {
+        ERR( IOS_CMD "fex state of this thread at its last JIT exit: rip=%I64x (%s) eflags=%08I64x fcw=%04I64x ftw=%02I64x "
+             "mxcsr=%08I64x dr0=%I64x dr1=%I64x dr2=%I64x dr3=%I64x dr6=%I64x dr7=%I64x\n", fex.rip,
+             ios_cmd_where( fex.rip, w1, sizeof(w1) ), fex.eflags, fex.fcw, fex.ftw, fex.mxcsr,
+             fex.dr[0], fex.dr[1], fex.dr[2], fex.dr[3], fex.dr[4], fex.dr[5] );
+        {
+            /* FEX order is rax rcx rdx rbx rsp rbp rsi rdi r8-r15 as well */
+            ios_cmd_regs( "fex", fex.gregs );
+            ios_cmd_xmm( "fex", (const ULONG64 (*)[2])fex.xmm, 0, 16 );
+        }
+    }
+    else ERR( IOS_CMD "fex state: not available (%s)\n", pBTCpu64IosCrashMailerData ? "no emulator state" : "export missing" );
+
+    /* 2. stack walk from the x64 rsp */
+    rsp = ctx.Rsp;
+    if (rsp < stack_lo || rsp >= stack_hi)
+        ERR( IOS_CMD "stack: x64 rsp %p is outside this thread's stack [%p,%p): no stack walk\n",
+             (void *)rsp, (void *)stack_lo, (void *)stack_hi );
+    else
+    {
+        ULONG_PTR slots = min( 2048, (stack_hi - rsp) / 8 ), chunk[64], s;
+        ERR( IOS_CMD "stack: %Iu slots from rsp=%p to the stack base %p; values in an executable section of an image "
+             "(at most 24):\n", slots, (void *)rsp, (void *)stack_hi );
+        for (s = 0; s < slots && ncallers < 24; s += 64)
+        {
+            ULONG_PTR cnt = min( 64, slots - s ), j;
+            if (ios_cmd_read( rsp + s * 8, chunk, cnt * 8 ) != cnt * 8)
+            {
+                ERR( IOS_CMD "stack: slot rsp+%Ix not readable, walk ends\n", s * 8 );
+                break;
+            }
+            for (j = 0; j < cnt && ncallers < 24; j++)
+            {
+                ULONG_PTR v = chunk[j], pe = (ULONG_PTR)xlate_ios_jit_rev( (void *)chunk[j] ), c;
+                struct ios_cmd_mod *m;
+                if (pe < 0x10000 || (pe >= stack_lo && pe < stack_hi)) continue;
+                if (!(m = ios_cmd_module( pe )) || !ios_cmd_in_exec( m, pe )) continue;
+                caller_slot[ncallers] = rsp + (s + j) * 8;
+                caller_val[ncallers] = v;
+                ERR( IOS_CMD "caller #%d slot rsp+%Ix = %p -> %s+0x%lx%s%s\n", ncallers, (s + j) * 8, (void *)v,
+                     m->name, (ULONG)(pe - m->base), pe != v ? " (pool alias)" : "",
+                     RtlIsEcCode( pe ) ? " [EC]" : " [x64]" );
+                for (c = 0; c < 9; c++)
+                {
+                    char what[24];
+                    int off = (int)(c * 64) - 512;
+                    sprintf( what, "  code ret%c%d", off < 0 ? '-' : '+', off < 0 ? -off : off );
+                    ios_cmd_hexline( what, pe - 512 + c * 64, 64 );
+                }
+                ncallers++;
+            }
+        }
+        ERR( IOS_CMD "stack: %d callers\n", ncallers );
+    }
+
+    /* 3. memory around the registers and the first 8 callers' frames */
+    for (k = 0; k < 16; k++)
+    {
+        char what[32];
+        if (g[k] < 0x10000 || g[k] >= 0x800000000000ULL) continue;
+        sprintf( what, "mem %s-64", gpr_names[k] );
+        ios_cmd_hexline( what, g[k] - 64, 64 );
+        sprintf( what, "mem %s", gpr_names[k] );
+        ios_cmd_hexline( what, g[k], 64 );
+    }
+    for (k = 0; k < ncallers && k < 8; k++)
+    {
+        char what[40];
+        ULONG_PTR saved_rbp = 0;
+        sprintf( what, "frame #%d slot-64", k );
+        ios_cmd_hexline( what, caller_slot[k] - 64, 64 );
+        sprintf( what, "frame #%d slot", k );
+        ios_cmd_hexline( what, caller_slot[k], 64 );
+        if (ios_cmd_read( caller_slot[k] - 8, &saved_rbp, 8 ) == 8 && saved_rbp >= stack_lo && saved_rbp + 64 <= stack_hi)
+        {
+            sprintf( what, "frame #%d [slot-8]=rbp-64", k );
+            ios_cmd_hexline( what, saved_rbp - 64, 64 );
+            sprintf( what, "frame #%d [slot-8]=rbp", k );
+            ios_cmd_hexline( what, saved_rbp, 64 );
+        }
+    }
+
+    /* 4. exceptions */
+    n = (ULONG)ios_xr_next;
+    first = n > 64 ? n - 64 : 0;
+    ERR( IOS_CMD "exceptions: last %lu of %lu in [exc-ring] (+%ld page-decrypt faults not listed), oldest first%s\n",
+         n - first, n, ios_xr_decrypt, ios_xr_mode == 2 ? "" : " (MADEIRA_EXC_RING=0: none recorded)" );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_xr_ent *e = &ios_xr[i % IOS_XR_N];
+        ERR( IOS_CMD "exc #%lu -%lums tid=%04lx code=%08lx addr=%p (%s) p0=%p p1=%p sp=%p x%lu handlers=%u took=%s %p (%s) "
+             "ret=%ld\n", i, now - e->tick, e->tid, e->code, (void *)e->addr, ios_cmd_where( e->addr, w1, sizeof(w1) ),
+             (void *)e->p0, (void *)e->p1, (void *)e->sp, e->reps + 1, e->nh, ios_cmd_hkind( e->hkind ),
+             (void *)e->handler, e->handler ? ios_cmd_where( e->handler, w2, sizeof(w2) ) : "-", (long)e->hret );
+    }
+    n = (ULONG)ios_cmd_xctx_next;
+    first = n > 12 ? n - 12 : 0;
+    ERR( IOS_CMD "exception contexts (x64, as handed to the handlers): last %lu, oldest first\n", n - first );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_cmd_xctx *x = &ios_cmd_xctx[i % IOS_CMD_XCTX_N];
+        if (!x->xr) continue;
+        ERR( IOS_CMD "ctx exc #%ld tid=%04lx code=%08lx ExceptionAddress=%p rip=%I64x (%s) delta=%I64d eflags=%08lx RF=%lu "
+             "TF=%lu ContextFlags=%08lx mxcsr=%08lx fcw=%04x\n", x->xr - 1, x->tid, x->code, (void *)x->addr, x->rip,
+             ios_cmd_where( x->rip, w1, sizeof(w1) ), (LONGLONG)(x->rip - x->addr), x->eflags, (x->eflags >> 16) & 1,
+             (x->eflags >> 8) & 1, x->ctxflags, x->mxcsr, x->fcw );
+        ios_cmd_regs( "ctx", x->gpr );
+        ERR( IOS_CMD "ctx dr0=%I64x dr1=%I64x dr2=%I64x dr3=%I64x dr6=%I64x dr7=%I64x\n",
+             x->dr[0], x->dr[1], x->dr[2], x->dr[3], x->dr[4], x->dr[5] );
+        ios_cmd_xmm( "ctx", (const ULONG64 (*)[2])x->xmm, 0, 16 );
+    }
+    if (pBTCpu64IosCrashMailerData)
+    {
+        UINT cnt = pBTCpu64IosCrashMailerData( 1, ios_cmd_fexr, sizeof(ios_cmd_fexr) );
+        ERR( IOS_CMD "fex delivered-context ring (assert-dump-2, all threads, JIT-raised only): %u entries, newest first, "
+             "contexts for the newest 12\n", cnt );
+        for (i = 0; i < cnt; i++)
+        {
+            const struct ios_cmd_fex_exc *e = &ios_cmd_fexr[i];
+            /* ARM64EC: rax=x8 rcx=x0 rdx=x1 rbx=x27 rsp=sp rbp=fp rsi=x25 rdi=x26 r8-r11=x2-x5 r12-r15=x19-x22 */
+            ULONG64 r[16] = { e->x[8], e->x[0], e->x[1], e->x[27], e->sp, e->x[29], e->x[25], e->x[26],
+                              e->x[2], e->x[3], e->x[4], e->x[5], e->x[19], e->x[20], e->x[21], e->x[22] };
+            ERR( IOS_CMD "fexexc seq=%I64u tid=%04x code=%08x rip=%I64x (%s) sp=%I64x x86eflags=%08x liveTF=%u cpsr=%08x "
+                 "fpcr=%08x fpsr=%08x flags=%08x\n", e->seq, e->tid, e->code, e->pc, ios_cmd_where( e->pc, w1, sizeof(w1) ),
+                 e->sp, e->eflags, e->live_tf, e->cpsr, e->fpcr, e->fpsr, e->ctxflags );
+            if (i >= 12) continue;
+            ios_cmd_regs( "fexexc", r );
+            ios_cmd_xmm( "fexexc", (const ULONG64 (*)[2])e->v, 0, 16 );
+        }
+    }
+
+    /* 5. the calling thread's last 4096 translated blocks (FEX ml1205 ring, pointer at TEB+0x1710) */
+    {
+        ULONG_PTR ring = 0;
+        ULONG64 idx = 0;
+        ios_cmd_read( (ULONG_PTR)teb + 0x1710, &ring, sizeof(ring) );
+        if (!ring || ios_cmd_read( ring, &idx, 8 ) != 8 || !ios_xp_ring_last( ring, idx, ios_cmd_blk, 4096 ))
+            ERR( IOS_CMD "blocks: no block ring on this thread (FEX turns it on for Overwatch.exe; MADEIRA_BLOCK_RING=1 "
+                 "elsewhere)\n" );
+        else
+        {
+            ULONG cnt = 4096, start, j;
+            idx = 0;   /* [crashmailer-exit-probe]: ios_xp_ring_last put them oldest first */
+            while (cnt && !ios_cmd_blk[(idx + 4096 - cnt) & 4095]) cnt--;
+            start = (ULONG)(idx + 4096 - cnt) & 4095;
+            ERR( IOS_CMD "blocks: last %lu translated blocks entered by this thread, oldest first, as rip/length; the "
+                 "newest 48 with module+rva first\n", cnt );
+            for (j = cnt > 48 ? cnt - 48 : 0; j < cnt; j++)
+            {
+                ULONG64 ent = ios_cmd_blk[(start + j) & 4095];
+                ERR( IOS_CMD "blk -%lu %I64x/%x %s\n", cnt - j, ent & 0xffffffffffffULL, (UINT)(ent >> 48),
+                     ios_cmd_where( (ULONG_PTR)(ent & 0xffffffffffffULL), w1, sizeof(w1) ) );
+            }
+            for (j = 0; j < cnt; j += 8)
+            {
+                char line[8 * 22 + 1];
+                int o = 0, b;
+                for (b = 0; b < 8 && j + b < cnt; b++)
+                {
+                    ULONG64 ent = ios_cmd_blk[(start + j + b) & 4095];
+                    o += sprintf( line + o, " %I64x/%x", ent & 0xffffffffffffULL, (UINT)(ent >> 48) );
+                }
+                ERR( IOS_CMD "blks -%lu:%s\n", cnt - j, line );
+            }
+        }
+    }
+
+    /* 6. queries */
+    n = (ULONG)ios_cmd_q_next;
+    first = n > IOS_CMD_Q_N ? n - IOS_CMD_Q_N : 0;
+    ERR( IOS_CMD "queries: last %lu of %lu information queries, oldest first (data = first 32 bytes of the result, or "
+         "of the input for a set)\n", n - first, n );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_cmd_q *q = &ios_cmd_q[i % IOS_CMD_Q_N];
+        char hex[32 * 3 + 1];
+        if (q->seq != i + 1) continue;
+        ios_cmd_hex( hex, q->data, sizeof(q->data), sizeof(q->data) );
+        ERR( IOS_CMD "q #%lu -%lums tid=%04lx %s h=%p class=%lx status=%08lx len=%lu retlen=%ld data=%s\n", i, now - q->tick,
+             q->tid, ios_cmd_qname[q->fn < ARRAY_SIZE(ios_cmd_qname) ? q->fn : 0], (void *)q->handle, q->cls,
+             q->status, q->len, (long)q->retlen, hex );
+    }
+    ERR( IOS_CMD "vm: NtQueryVirtualMemory calls by class: 0=%ld 1=%ld 2=%ld 3=%ld 4=%ld 5=%ld 6=%ld 7=%ld 8=%ld 9=%ld "
+         "10=%ld 11=%ld 12=%ld 13=%ld 14=%ld 15+=%ld\n", ios_cmd_vm_count[0], ios_cmd_vm_count[1], ios_cmd_vm_count[2],
+         ios_cmd_vm_count[3], ios_cmd_vm_count[4], ios_cmd_vm_count[5], ios_cmd_vm_count[6], ios_cmd_vm_count[7],
+         ios_cmd_vm_count[8], ios_cmd_vm_count[9], ios_cmd_vm_count[10], ios_cmd_vm_count[11], ios_cmd_vm_count[12],
+         ios_cmd_vm_count[13], ios_cmd_vm_count[14], ios_cmd_vm_count[15] );
+    n = (ULONG)ios_cmd_vm_next;
+    first = n > IOS_CMD_VM_N ? n - IOS_CMD_VM_N : 0;
+    for (i = first; i < n; i++)
+    {
+        const struct ios_cmd_vm *v = &ios_cmd_vm[i % IOS_CMD_VM_N];
+        if (v->seq != i + 1) continue;
+        ERR( IOS_CMD "vm #%lu -%lums tid=%04lx process=%p addr=%p (%s) class=%lx status=%08lx base=%p size=%Ix state=%lx "
+             "protect=%lx type=%lx\n", i, now - v->tick, v->tid, v->process, (void *)v->addr,
+             ios_cmd_where( v->addr, w1, sizeof(w1) ), v->cls, v->status, (void *)v->base, v->size, v->state, v->protect,
+             v->type );
+    }
+    for (i = 0; i < ARRAY_SIZE(ios_cmd_dbgq); i++)
+    {
+        char hex[16 * 3 + 1];
+        ios_cmd_hex( hex, ios_cmd_dbga[i].data, 16, 16 );
+        if (!ios_cmd_dbga[i].count) ERR( IOS_CMD "debug-query %s: never asked\n", ios_cmd_dbgq[i].name );
+        else ERR( IOS_CMD "debug-query %s: %ld calls, last -%lums tid=%04lx status=%08lx len=%lu data=%s\n",
+                  ios_cmd_dbgq[i].name, ios_cmd_dbga[i].count, now - ios_cmd_dbga[i].tick, ios_cmd_dbga[i].tid,
+                  ios_cmd_dbga[i].status, ios_cmd_dbga[i].len, hex );
+    }
+    {
+        ULONG heap_flags[2] = { ~0u, ~0u };
+        UCHAR kd = 0xff;
+        ios_cmd_read( (ULONG_PTR)peb->ProcessHeap + 0x70, heap_flags, sizeof(heap_flags) );
+        ios_cmd_read( (ULONG_PTR)user_shared_data + 0x2d4, &kd, 1 );
+        ERR( IOS_CMD "debugger fields now: PEB BeingDebugged=%u NtGlobalFlag=%08lx; heap %p Flags=%08lx ForceFlags=%08lx "
+             "(x64 offsets 0x70/0x74); KUSER_SHARED_DATA+0x2d4 KdDebuggerEnabled=%02x\n", peb->BeingDebugged,
+             peb->NtGlobalFlag, peb->ProcessHeap, heap_flags[0], heap_flags[1], kd );
+    }
+    n = (ULONG)ios_cmd_unw_next;
+    first = n > IOS_CMD_UNW_N ? n - IOS_CMD_UNW_N : 0;
+    ERR( IOS_CMD "unwinds by the game in or right after an exception handler: %ld in all, last %lu (regs: rip rsp rbx rbp rsi "
+         "rdi r12 r13 r14 r15; match bits rbx rbp rsi rdi r12-r15 xmm6 xmm7 = value equals the slot it was restored from)\n",
+         ios_cmd_unw_total, n - first );
+    for (i = first; i < n; i++)
+    {
+        const struct ios_cmd_unw *u = &ios_cmd_unw[i % IOS_CMD_UNW_N];
+        if (u->seq != i + 1) continue;
+        ERR( IOS_CMD "unw #%lu -%lums tid=%04lx %s handler-depth=%lu since-exc=%ldms pc=%p (%s) base=%p target=%p frame=%p "
+             "status=%08lx checked=%03lx match=%03lx\n", i, now - u->tick, u->tid,
+             u->kind == 2 ? "RtlUnwindEx" : "RtlVirtualUnwind", u->depth, (long)u->since_exc, (void *)u->pc,
+             ios_cmd_where( u->pc, w1, sizeof(w1) ), (void *)u->base, (void *)u->target, (void *)u->frame, u->status,
+             u->checked, u->match );
+        ERR( IOS_CMD "unw   pre  %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x xmm6=%016I64x%016I64x "
+             "xmm7=%016I64x%016I64x\n", u->pre[0], u->pre[1], u->pre[2], u->pre[3], u->pre[4], u->pre[5], u->pre[6],
+             u->pre[7], u->pre[8], u->pre[9], u->x6[0].High, u->x6[0].Low, u->x7[0].High, u->x7[0].Low );
+        ERR( IOS_CMD "unw   post %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x %I64x xmm6=%016I64x%016I64x "
+             "xmm7=%016I64x%016I64x\n", u->post[0], u->post[1], u->post[2], u->post[3], u->post[4], u->post[5], u->post[6],
+             u->post[7], u->post[8], u->post[9], u->x6[1].High, u->x6[1].Low, u->x7[1].High, u->x7[1].Low );
+    }
+    n = (ULONG)ios_cmd_gc_next;
+    first = n > IOS_CMD_GC_N ? n - IOS_CMD_GC_N : 0;
+    ERR( IOS_CMD "NtGetContextThread on other threads: %lu calls, last %lu (target and suspend are read now, at the "
+         "dump; 0000/-1 when the handle is gone)\n", n, n - first );
+    for (i = first; i < n; i++)
+    {
+        struct ios_cmd_gc *c = &ios_cmd_gc[i % IOS_CMD_GC_N];
+        THREAD_BASIC_INFORMATION tbi;
+        if (c->seq != i + 1) continue;
+        if (!syscall_NtQueryInformationThread( (HANDLE)c->handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ))
+            c->target = HandleToULong( tbi.ClientId.UniqueThread );
+        syscall_NtQueryInformationThread( (HANDLE)c->handle, ThreadSuspendCount, &c->suspend, sizeof(c->suspend), NULL );
+        ERR( IOS_CMD "getctx #%lu -%lums tid=%04lx target=%04lx suspend=%ld want=%08lx status=%08lx got=%08lx rip=%I64x (%s) "
+             "eflags=%08lx dr0=%I64x dr1=%I64x dr2=%I64x dr3=%I64x dr6=%I64x dr7=%I64x\n", i, now - c->tick, c->tid,
+             c->target, (long)c->suspend, c->want, c->status, c->ctxflags, c->rip, ios_cmd_where( c->rip, w1, sizeof(w1) ),
+             c->eflags, c->dr[0], c->dr[1], c->dr[2], c->dr[3], c->dr[4], c->dr[5] );
+        if (!c->status) ios_cmd_regs( "getctx", c->gpr );
+    }
+
+    /* 7. files */
+    for (k = 0; k < 2; k++)
+    {
+        const struct ios_cmd_file *ring = k ? ios_cmd_fw : ios_cmd_f;
+        ULONG cap = k ? IOS_CMD_FW_N : IOS_CMD_F_N;
+        n = (ULONG)(k ? ios_cmd_fw_next : ios_cmd_f_next);
+        first = n > cap ? n - cap : 0;
+        ERR( IOS_CMD "%s: last %lu of %lu NtCreateFile calls, oldest first\n", k ? "files-written" : "files", n - first, n );
+        for (i = first; i < n; i++)
+        {
+            const struct ios_cmd_file *f = &ring[i % cap];
+            if (f->seq != i + 1) continue;
+            ERR( IOS_CMD "%s #%lu -%lums tid=%04lx access=%08lx dispo=%lx options=%lx status=%08lx root=%p handle=%p %s\n",
+                 k ? "fw" : "f", i, now - f->tick, f->tid, f->access, f->dispo, f->options, f->status, (void *)f->root,
+                 (void *)f->handle, debugstr_wn( f->name, f->len ) );
+        }
+    }
+    {
+        ULONG ret = 0, shown = 0, mine = 0;
+        NTSTATUS st = syscall_NtQuerySystemInformation( SystemExtendedHandleInformation, &ios_cmd_handles,
+                                                        sizeof(ios_cmd_handles), &ret );
+        if (st) ERR( IOS_CMD "handles: SystemExtendedHandleInformation failed %08lx (needs %lu bytes)\n", st, ret );
+        else
+        {
+            ULONG_PTR pid = (ULONG_PTR)teb->ClientId.UniqueProcess, j;
+            ULONG_PTR count = min( ios_cmd_handles.info.NumberOfHandles,
+                                   (sizeof(ios_cmd_handles) - offsetof(SYSTEM_HANDLE_INFORMATION_EX, Handles)) /
+                                   sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX) );
+            for (j = 0; j < count && mine < 4096 && shown < 64; j++)
+            {
+                static struct { UNICODE_STRING str; WCHAR buf[520]; } on;
+                const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX *h = (const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX *)
+                    (ios_cmd_handles.buf + offsetof(SYSTEM_HANDLE_INFORMATION_EX, Handles)) + j;
+                ULONG got = 0;
+                if (h->UniqueProcessId != pid) continue;
+                mine++;
+                if (syscall_NtQueryObject( (HANDLE)h->HandleValue, ObjectNameInformation, &on, sizeof(on) - sizeof(WCHAR),
+                                           &got ) || !on.str.Buffer || on.str.Length < 8 * sizeof(WCHAR))
+                    continue;
+                /* files: \??\X:\... ; and named pipes */
+                if (!(on.str.Buffer[0] == '\\' && on.str.Buffer[1] == '?' && on.str.Buffer[2] == '?' && on.str.Buffer[5] == ':') &&
+                    !ios_cmd_wcsistr( on.str.Buffer, on.str.Length / sizeof(WCHAR), "\\device\\namedpipe" ))
+                    continue;
+                shown++;
+                ERR( IOS_CMD "handle %04Ix access=%08lx type=%u %s\n", h->HandleValue, h->GrantedAccess,
+                     h->ObjectTypeIndex, debugstr_wn( on.str.Buffer, on.str.Length / sizeof(WCHAR) ) );
+            }
+            ERR( IOS_CMD "handles: %lu of this process looked at, %lu file/pipe names shown (at most 64)\n", mine, shown );
+        }
+    }
+    if (!ioscmd_NtQuerySystemTime( &sys_now ))
+    {
+        static WCHAR exe_dir[300], temp[300];
+        LONGLONG since = sys_now.QuadPart - 60 * (LONGLONG)10000000;
+        USHORT dir_len = ios_cmd_pstr( peb->ProcessParameters, &peb->ProcessParameters->ImagePathName, exe_dir,
+                                       ARRAY_SIZE(exe_dir) );
+        UNICODE_STRING var, value;
+
+        while (dir_len && exe_dir[dir_len - 1] != '\\') dir_len--;
+        if (dir_len) dir_len--;
+        ios_cmd_scan_root( "the game folder", exe_dir, dir_len, 3, since, sys_now.QuadPart );
+        /* the folder above CrashMailer's x64\, when it is not under the game folder */
+        len = image_len;
+        for (k = 0; k < 2; k++)
+        {
+            while (len && image[len - 1] != '\\') len--;
+            if (len) len--;
+        }
+        if (len && (len < dir_len || memcmp( image, exe_dir, dir_len * sizeof(WCHAR) )))
+        {
+            const WCHAR *img = image;
+            if (len > 4 && img[0] == '\\' && img[1] == '?' && img[2] == '?' && img[3] == '\\') { img += 4; len -= 4; }
+            ios_cmd_scan_root( "CrashMailer's folder", img, len, 2, since, sys_now.QuadPart );
+        }
+        RtlInitUnicodeString( &var, L"TEMP" );
+        value.Buffer = temp;
+        value.Length = 0;
+        value.MaximumLength = sizeof(temp) - sizeof(WCHAR);
+        if (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) && value.Length)
+        {
+            USHORT tl = value.Length / sizeof(WCHAR);
+            if (tl && temp[tl - 1] == '\\') tl--;
+            ios_cmd_scan_root( "TEMP", temp, tl, 1, since, sys_now.QuadPart );
+        }
+    }
+    ERR( IOS_CMD "images seen by this dump (base size name):\n" );
+    for (i = 0; i < ios_cmd_nmods; i++)
+        ERR( IOS_CMD "image %p %08Ix %s\n", (void *)ios_cmd_mods[i].base, ios_cmd_mods[i].size, ios_cmd_mods[i].name );
+    ERR( IOS_CMD "end of dump (%lu ms)\n", NtGetTickCount() - now );
+}
+
+/* the NtCreateUserProcess hook: dumps when the image is CrashMailer and this is the process's first one */
+static void ios_cmd_check( const RTL_USER_PROCESS_PARAMETERS *params, ULONG process_flags, ULONG thread_flags )
+{
+    static WCHAR image[300];
+    USHORT len;
+    LONG internal;
+
+    if (ios_cmd_mode != 2 || !params || ios_cmd_done) return;
+    if (!ios_cmd_readable( (ULONG_PTR)params, sizeof(*params), NULL )) return;   /* the block itself is readable */
+    len = ios_cmd_pstr( params, &params->ImagePathName, image, ARRAY_SIZE(image) );
+    if (!ios_cmd_wcsistr( image, len, "crashmailer" ))
+    {
+        /* no image path in the block: the program is the start of the command line */
+        if (len) return;
+        len = ios_cmd_pstr( params, &params->CommandLine, image, ARRAY_SIZE(image) );
+        if (!ios_cmd_wcsistr( image, len, "crashmailer" )) return;
+    }
+    if (InterlockedExchange( &ios_cmd_done, 1 )) return;
+    internal = ios_cmd_internal_enter();
+    InterlockedExchange( &ios_cmd_dumping, 1 );
+    ios_cmd_dump( params, image, len, process_flags, thread_flags );
+    InterlockedExchange( &ios_cmd_dumping, 0 );
+    ios_cmd_internal_leave( internal );
+}
+
+NTSTATUS SYSCALL_API NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
+                                          ACCESS_MASK process_access, ACCESS_MASK thread_access,
+                                          OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr,
+                                          ULONG process_flags, ULONG thread_flags,
+                                          RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info,
+                                          PS_ATTRIBUTE_LIST *ps_attr )
+{
+    LONG dumped = ios_cmd_done;
+    NTSTATUS status;
+
+    ios_cmd_check( params, process_flags, thread_flags );   /* madeira [crashmailer-dump] */
+    status = syscall_NtCreateUserProcess( process_handle_ptr, thread_handle_ptr, process_access, thread_access,
+                                          process_attr, thread_attr, process_flags, thread_flags, params, info, ps_attr );
+    if (!dumped && ios_cmd_done)
+        ERR( IOS_CMD "NtCreateUserProcess for CrashMailer returned %08lx\n", status );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len )
+{
+    NTSTATUS status = syscall_NtQueryInformationProcess( handle, class, info, size, ret_len );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_QIP, handle, class, status, info, size, ret_len );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size )
+{
+    NTSTATUS status = syscall_NtSetInformationProcess( handle, class, info, size );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_SIP, handle, class, status, info, size, NULL );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len )
+{
+    NTSTATUS status = syscall_NtQueryInformationThread( handle, class, data, length, ret_len );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_QIT, handle, class, status, data, length, ret_len );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtSetInformationThread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length )
+{
+    NTSTATUS status = syscall_NtSetInformationThread( handle, class, data, length );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_SIT, handle, class, status, data, length, NULL );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len,
+                                                 void *info, ULONG size, ULONG *ret_size )
+{
+    NTSTATUS status = syscall_NtQuerySystemInformationEx( class, query, query_len, info, size, ret_size );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_QSIX, NULL, class, status, info, size, ret_size );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
+{
+    NTSTATUS status = syscall_NtQueryObject( handle, info_class, ptr, len, used_len );
+    if (ios_cmd_rec()) ios_cmd_q_record( IOS_CMD_QO, handle, info_class, status, ptr, len, used_len );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class,
+                                           PVOID buffer, SIZE_T len, SIZE_T *res_len )
+{
+    NTSTATUS status = syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
+    if (ios_cmd_rec()) ios_cmd_vm_record( process, addr, info_class, status, len >= sizeof(MEMORY_BASIC_INFORMATION) ? buffer : NULL );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io,
+                                   LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition,
+                                   ULONG options, void *ea_buffer, ULONG ea_length )
+{
+    NTSTATUS status = syscall_NtCreateFile( handle, access, attr, io, alloc_size, attributes, sharing, disposition,
+                                            options, ea_buffer, ea_length );
+    if (ios_cmd_rec() && status != STATUS_ACCESS_VIOLATION)
+        ios_cmd_file_record( handle, access, attr, disposition, options, status );
+    return status;
+}
+
+/* [crashmailer-dump]: after the existing NtGetContextThread wrapper, for another thread */
+/* no syscalls here (GC-style suspend/GetThreadContext loops call this per thread): the handle's thread id and
+ * suspend count are looked up at the dump */
+static void ios_cmd_getctx( HANDLE handle, const CONTEXT *context, ULONG want, NTSTATUS status )
+{
+    struct ios_cmd_gc *c;
+    ULONG n, target = 0, suspend = ~0u;
+
+    if (!ios_cmd_rec() || handle == GetCurrentThread()) return;
+    n = (ULONG)InterlockedIncrement( &ios_cmd_gc_next );
+    c = &ios_cmd_gc[(n - 1) % IOS_CMD_GC_N];
+    c->seq = 0;
+    c->tick = NtGetTickCount();
+    c->tid = ios_cmd_tid();
+    c->target = target;
+    c->suspend = suspend;
+    c->want = want;
+    c->status = status;
+    c->handle = (ULONG_PTR)handle;
+    c->ctxflags = status ? 0 : context->ContextFlags;
+    c->eflags = status ? 0 : context->EFlags;
+    if (!status)
+    {
+        memcpy( c->gpr, &context->Rax, sizeof(c->gpr) );
+        c->rip = context->Rip;
+        c->dr[0] = context->Dr0; c->dr[1] = context->Dr1; c->dr[2] = context->Dr2; c->dr[3] = context->Dr3;
+        c->dr[4] = context->Dr6; c->dr[5] = context->Dr7;
+    }
+    else
+    {
+        memset( c->gpr, 0, sizeof(c->gpr) );
+        memset( c->dr, 0, sizeof(c->dr) );
+        c->rip = 0;
+    }
+    c->seq = n;
+}
+
 
 NTSTATUS SYSCALL_API NtTerminateProcess( HANDLE handle, LONG exit_code )
 {
     NTSTATUS status;
+
+    if (!handle || handle == GetCurrentProcess())   /* [crashmailer-exit-probe] */
+        ios_xp_exit_event( exit_code ? "NtTerminateProcess (exit code not 0)" : "NtTerminateProcess" );
+    if (!handle || handle == GetCurrentProcess()) ios_xr_dump( "process exit", exit_code );   /* [exc-ring] */
 
     if (!handle && pProcessTerm && enter_syscall_callback())
     {
@@ -2912,8 +6127,272 @@ static void ios_fatal_probe( const CONTEXT *ctx )
          (unsigned)(got / sizeof(ULONG_PTR)), hits, printed - hits );
 }
 
+/* madeira-bcd [wild-exec] (env MADEIRA_WILD_EXEC_PROBE = 0 turns it off). Log only.
+ *
+ * Overwatch 2 on 0.2.60 (log 7747ade4) died on "AV EXEC of 1533C7640": x64 code went to an
+ * address that is in no loaded module of the process (it sits in JIT-pool space that earlier
+ * held another pseudo-process's DLL copies). The log has no guest registers or stack for it, so
+ * the producer (a ret, a call through a stale pointer, a table) can't be named. When an execute
+ * fault's target is outside every module, print the full guest register set and the first 24
+ * raw stack qwords (with module+offset when one matches), then the ml843 call-chain scan. Up to
+ * 4 reports per process; nothing is changed. */
+/* wild-exec v2: hex dump of guest memory, 32 bytes per line, never faults (NtReadVirtualMemory).
+ * Each line is read on its own so a locked page after a readable one doesn't hide the readable part. */
+static void ios_wild_exec_hex( const char *what, ULONG_PTR addr, SIZE_T len )
+{
+    static const char hx[] = "0123456789abcdef";
+    unsigned char buf[32];
+    SIZE_T got, off, j;
+    char line[3 * 32 + 1];
+
+    if (len > 0x200) len = 0x200;
+    for (off = 0; off < len; off += 32)
+    {
+        SIZE_T want = len - off < 32 ? len - off : 32;
+        got = 0;
+        if (addr + off < 0x10000 ||
+            NtReadVirtualMemory( GetCurrentProcess(), (void *)(addr + off), buf, want, &got ) || !got)
+        {
+            ERR( "[wild-exec]   %s @%p: unreadable\n", what, (void *)(addr + off) );
+            continue;
+        }
+        for (j = 0; j < got; j++)
+        {
+            line[j * 3] = hx[buf[j] >> 4];
+            line[j * 3 + 1] = hx[buf[j] & 15];
+            line[j * 3 + 2] = ' ';
+        }
+        line[j * 3] = 0;
+        ERR( "[wild-exec]   %s @%p: %s\n", what, (void *)(addr + off), line );
+    }
+}
+
+/* wild-exec v3: 1 when the module at base is a Windows system DLL (its full path has \windows\).
+ * Fills sec (64 bytes) with "+0xRVA sect=<name> ch=<characteristics> exec=<0|1>", or "sect=none"
+ * when the RVA is in a gap between sections. Headers are read with NtReadVirtualMemory, so a bad
+ * header prints instead of faulting. */
+static int ios_wild_exec_sysdll( ULONG_PTR addr, ULONG_PTR base, char sec[64] )
+{
+    static const WCHAR win[] = {'\\','w','i','n','d','o','w','s','\\'};
+    LIST_ENTRY *mark, *e;
+    unsigned n = 0, i, j, len, nsec;
+    PEB *peb = NtCurrentTeb()->Peb;
+    int sys = 0;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    IMAGE_SECTION_HEADER sh;
+    WCHAR path[260];
+    ULONG rva = (ULONG)(addr - base);
+    ULONG_PTR shoff;
+    SIZE_T got;
+
+    if (!peb || !peb->LdrData) return 0;
+    mark = &peb->LdrData->InLoadOrderModuleList;
+    for (e = mark->Flink; e && e != mark && n < 512; e = e->Flink, n++)
+    {
+        LDR_DATA_TABLE_ENTRY *m = CONTAINING_RECORD( e, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+        if ((ULONG_PTR)m->DllBase != base) continue;
+        len = m->FullDllName.Length / sizeof(WCHAR);
+        if (len > ARRAY_SIZE(path)) len = ARRAY_SIZE(path);
+        if (!m->FullDllName.Buffer ||
+            NtReadVirtualMemory( GetCurrentProcess(), m->FullDllName.Buffer, path, len * sizeof(WCHAR), &got ) ||
+            got != len * sizeof(WCHAR)) break;
+        for (i = 0; !sys && i + ARRAY_SIZE(win) <= len; i++)
+        {
+            for (j = 0; j < ARRAY_SIZE(win); j++)
+            {
+                WCHAR c = path[i + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != win[j]) break;
+            }
+            if (j == ARRAY_SIZE(win)) sys = 1;
+        }
+        break;
+    }
+    if (!sys) return 0;
+
+    sprintf( sec, " +0x%x sect=none", (unsigned)rva );
+    if (NtReadVirtualMemory( GetCurrentProcess(), (void *)base, &dos, sizeof(dos), &got ) || got != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x1000 ||
+        NtReadVirtualMemory( GetCurrentProcess(), (void *)(base + dos.e_lfanew), &nt, sizeof(nt), &got ) ||
+        got != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
+    {
+        sprintf( sec, " +0x%x headers unreadable", (unsigned)rva );
+        return 1;
+    }
+    nsec = nt.FileHeader.NumberOfSections < 64 ? nt.FileHeader.NumberOfSections : 64;
+    shoff = base + dos.e_lfanew + FIELD_OFFSET( IMAGE_NT_HEADERS64, OptionalHeader ) +
+            nt.FileHeader.SizeOfOptionalHeader;
+    for (i = 0; i < nsec; i++)
+    {
+        ULONG vs;
+        if (NtReadVirtualMemory( GetCurrentProcess(), (void *)(shoff + i * sizeof(sh)), &sh, sizeof(sh), &got ) ||
+            got != sizeof(sh))
+        {
+            sprintf( sec, " +0x%x sect=? (header read failed)", (unsigned)rva );
+            break;
+        }
+        vs = sh.Misc.VirtualSize ? sh.Misc.VirtualSize : sh.SizeOfRawData;
+        if (rva >= sh.VirtualAddress && rva - sh.VirtualAddress < vs)
+        {
+            char nm[9];
+            memcpy( nm, sh.Name, 8 );
+            nm[8] = 0;
+            for (j = 0; j < 8 && nm[j]; j++) if (nm[j] < 32 || nm[j] > 126) nm[j] = '?';
+            /* longest: " +0x" 8 " sect=" 8 " ch=" 8 " exec=" 1 = 4+8+6+8+4+8+6+1 = 45 < 64 */
+            sprintf( sec, " +0x%x sect=%s ch=%08x exec=%d", (unsigned)rva, nm,
+                     (unsigned)sh.Characteristics, (sh.Characteristics & IMAGE_SCN_MEM_EXECUTE) ? 1 : 0 );
+            break;
+        }
+    }
+    return 1;
+}
+
+static void ios_wild_exec_probe( const EXCEPTION_RECORD *rec, const CONTEXT *ctx )
+{
+    static LONG mode, reports;
+    ULONG_PTR target, base = 0, stk[24], from;
+    SIZE_T got = 0, i;
+    char name[40], sec[64] = "";
+    const char *where;
+    LONG n;
+
+    if (!ctx || reports >= 4) return;   /* skip the unlocked module walks once the cap is used up */
+    if (!mode)   /* v3: read the off switch before any module walk (int3s are frequent) */
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_WILD_EXEC_PROBE" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    if (mode != 2) return;
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT)
+        target = rec->ExceptionInformation[1];
+    else if (rec->ExceptionCode == STATUS_BREAKPOINT || rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
+        target = (ULONG_PTR)rec->ExceptionAddress;
+    else return;
+    if (ios_probe_module( target, &base, name, sizeof(name) ))
+    {
+        /* v3: inside a module is normal, except a Windows system DLL other than ntdll (the game's own
+         * loader raises int3 on purpose; system DLLs don't). 0.2.70 log ff1dc334: Overwatch died on
+         * "Unhandled exception code 80000003 flags 0 addr 0x70eedd7640" = win32u.dll+0x37640. */
+        if (!strcmp( name, "ntdll.dll" ) || !ios_wild_exec_sysdll( target, base, sec )) return;
+        where = "in system DLL ";
+    }
+    else if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION) return;   /* v1/v2 scope: EXEC faults only */
+    else
+    {
+        where = "in no module";
+        name[0] = 0;
+    }
+    if ((n = InterlockedIncrement( &reports )) > 4) return;
+
+    ERR( "[wild-exec] #%ld tid=%04x code=%08x target=%p (%s%s%s) Rip=%p Rsp=%p Rbp=%p EFlags=%08x rev=wild-exec-3\n",
+         n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, (unsigned)rec->ExceptionCode,
+         (void *)target, where, name, sec,
+         (void *)ctx->Rip, (void *)ctx->Rsp, (void *)ctx->Rbp, (unsigned)ctx->EFlags );
+    if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION)
+        ios_wild_exec_hex( "[target-0x20]", target - 0x20, 0x40 );   /* is it padding (cc cc) or real code? */
+    ERR( "[wild-exec]   Rax=%p Rbx=%p Rcx=%p Rdx=%p Rsi=%p Rdi=%p\n", (void *)ctx->Rax, (void *)ctx->Rbx,
+         (void *)ctx->Rcx, (void *)ctx->Rdx, (void *)ctx->Rsi, (void *)ctx->Rdi );
+    ERR( "[wild-exec]   R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p\n", (void *)ctx->R8,
+         (void *)ctx->R9, (void *)ctx->R10, (void *)ctx->R11, (void *)ctx->R12, (void *)ctx->R13,
+         (void *)ctx->R14, (void *)ctx->R15 );
+    /* from Rsp-0x10: after a ret the popped target sits at rsp-8 (if the dispatch frame left it) */
+    from = (ULONG_PTR)ctx->Rsp - 0x10;
+    if (NtReadVirtualMemory( GetCurrentProcess(), (void *)from, stk, sizeof(stk), &got ) || got < 8)
+        ERR( "[wild-exec]   stack at %p unreadable\n", (void *)from );
+    else
+        for (i = 0; i < got / sizeof(ULONG_PTR); i++)
+        {
+            if (ios_probe_module( stk[i], &base, name, sizeof(name) ))
+                ERR( "[wild-exec]   rsp%+04d = %p  %s+0x%llx\n", (int)(i * 8) - 0x10, (void *)stk[i], name,
+                     (unsigned long long)(stk[i] - base) );
+            else
+                ERR( "[wild-exec]   rsp%+04d = %p\n", (int)(i * 8) - 0x10, (void *)stk[i] );
+        }
+
+    /* v2: the data the registers point at (jump tables / decoded pointers), and the code of the
+     * function that made the jump: the first CALL-validated return address on the stack names its
+     * caller, and an E8 rel32 there names the callee's entry. Code pages the game keeps
+     * NOACCESS print "unreadable". */
+    ios_wild_exec_hex( "[rax-0x20]", (ULONG_PTR)ctx->Rax - 0x20, 0x60 );
+    ios_wild_exec_hex( "[rbx]", (ULONG_PTR)ctx->Rbx, 0x40 );
+    ios_wild_exec_hex( "[rdx]", (ULONG_PTR)ctx->Rdx, 0x40 );
+    ios_wild_exec_hex( "[r12]", (ULONG_PTR)ctx->R12, 0x40 );
+    {
+        /* optional extra address from the game's config: env.MADEIRA_WILD_EXEC_DUMP = <hex> (0x80 bytes) */
+        UNICODE_STRING var, value;
+        WCHAR buffer[24];
+        ULONG_PTR extra = 0;
+        unsigned k;
+        RtlInitUnicodeString( &var, L"MADEIRA_WILD_EXEC_DUMP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        if (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ))
+            for (k = 0; k < value.Length / sizeof(WCHAR); k++)
+            {
+                WCHAR c = buffer[k];
+                if (k == 1 && (c == 'x' || c == 'X') && buffer[0] == '0') { extra = 0; continue; }
+                if (c >= '0' && c <= '9') extra = extra * 16 + (c - '0');
+                else if (c >= 'a' && c <= 'f') extra = extra * 16 + (c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') extra = extra * 16 + (c - 'A' + 10);
+                else { extra = 0; break; }
+                if (k >= 17) { extra = 0; break; }   /* more than 16 hex digits */
+            }
+        if (extra) ios_wild_exec_hex( "[extra]", extra, 0x80 );
+        else if (value.Length) ERR( "[wild-exec]   MADEIRA_WILD_EXEC_DUMP ignored (want plain hex, e.g. 141C5CFC0)\n" );
+    }
+    if (got >= 8)
+        for (i = 2; i < got / sizeof(ULONG_PTR); i++)   /* 2 = Rsp itself (the dump starts at Rsp-0x10) */
+        {
+            unsigned char b[6];
+            SIZE_T g2 = 0;
+            ULONG_PTR ret = stk[i];
+            if (!ios_probe_module( ret, &base, name, sizeof(name) )) continue;
+            if (NtReadVirtualMemory( GetCurrentProcess(), (void *)(ret - 6), b, sizeof(b), &g2 ) || g2 != 6) continue;
+            if (b[1] == 0xE8)
+            {
+                LONG rel = (LONG)((ULONG)b[2] | ((ULONG)b[3] << 8) | ((ULONG)b[4] << 16) | ((ULONG)b[5] << 24));
+                ULONG_PTR callee = ret + (LONG_PTR)rel;
+                ERR( "[wild-exec]   caller ret %p (%s+0x%llx) at rsp+%03x calls %p directly\n", (void *)ret, name,
+                     (unsigned long long)(ret - base), (unsigned)((i - 2) * 8), (void *)callee );
+                ios_wild_exec_hex( "[caller]", ret - 0x40, 0x48 );
+                ios_wild_exec_hex( "[callee]", callee, 0x200 );
+                break;
+            }
+            if (b[0] == 0xFF && b[1] == 0x15)
+            {
+                ERR( "[wild-exec]   caller ret %p (%s+0x%llx) at rsp+%03x calls through [rip+disp32]\n", (void *)ret, name,
+                     (unsigned long long)(ret - base), (unsigned)((i - 2) * 8) );
+                ios_wild_exec_hex( "[caller]", ret - 0x40, 0x48 );
+                break;
+            }
+        }
+    /* v3: only an EXEC fault spends ios_fatal_probe's 2-report budget; a breakpoint the game
+     * may still handle must not use up the real fatal's report */
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) ios_fatal_probe( ctx );
+}
+
 static void ios_tlswatch_pe_arm( const char *where );
+/* madeira [crashmailer-dump]: ntdll's own SEH walk; its unwinds are not the game's */
+static NTSTATUS call_seh_handlers_impl( EXCEPTION_RECORD *rec, CONTEXT *orig_context );
 NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+{
+    LONG internal = ios_cmd_internal_enter();
+    NTSTATUS status = call_seh_handlers_impl( rec, orig_context );
+
+    ios_cmd_internal_leave( internal );
+    return status;
+}
+
+static NTSTATUS call_seh_handlers_impl( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 {
     if (rec && rec->ExceptionCode == 0x406D1388) ios_tlswatch_pe_arm( "call_seh_handlers entry" );
     EXCEPTION_REGISTRATION_RECORD *teb_frame = NtCurrentTeb()->Tib.ExceptionList;
@@ -2934,8 +6413,11 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if (sehent_n < 60 && InterlockedIncrement( &sehent_n ) <= 60)
             ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
                  (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
+        ios_wild_exec_probe( rec, orig_context );   /* madeira-bcd [wild-exec], log only */
 
     }
+    else if (rec->ExceptionCode == STATUS_BREAKPOINT || rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
+        ios_wild_exec_probe( rec, orig_context );   /* wild-exec v3: int3 / ud in a system DLL, log only */
 
     /* iOS-Madeira ml633: ESTABLISH THE GUEST-STACK WINDOW IN PHASE ONE TOO.
      * ec_stack_window_begin() was only called on the phase-two unwind path, yet phase
@@ -3499,6 +6981,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
             {
                 PEXCEPTION_ROUTINE handler = dispatch.LanguageHandler;
                 BOOLEAN is_ec = RtlIsEcCode( (ULONG_PTR)handler );
+                LONG cmd_saved;   /* madeira [crashmailer-dump] */
 
                 if (is_ec)
                 {
@@ -3507,8 +6990,11 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                 }
                 ios_seh_xlate_note( dispatch.LanguageHandler, handler, is_ec );
 
+                cmd_saved = ios_cmd_handler( rec, 2, dispatch.LanguageHandler, 0, 0 );
                 res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
                                         &dispatch, handler );
+                ios_cmd_handler( rec, 2, dispatch.LanguageHandler, res, 1 );
+                ios_cmd_internal_leave( cmd_saved );
             }
             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
             TRACE( "handler at %p returned %lu\n", dispatch.LanguageHandler, res );
@@ -3538,8 +7024,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         {
             TRACE( "calling TEB handler %p (rec=%p frame=%p context=%p dispatch=%p) sp=%I64x\n",
                    teb_frame->Handler, rec, teb_frame, orig_context, &dispatch, context.Sp );
-            res = call_seh_handler( rec, (ULONG_PTR)teb_frame, orig_context,
-                                    &dispatch, (PEXCEPTION_ROUTINE)teb_frame->Handler );
+            {
+                LONG cmd_saved = ios_cmd_handler( rec, 3, teb_frame->Handler, 0, 0 );   /* madeira [crashmailer-dump] */
+                res = call_seh_handler( rec, (ULONG_PTR)teb_frame, orig_context,
+                                        &dispatch, (PEXCEPTION_ROUTINE)teb_frame->Handler );
+                ios_cmd_handler( rec, 3, teb_frame->Handler, res, 1 );
+                ios_cmd_internal_leave( cmd_saved );
+            }
             TRACE( "TEB handler at %p returned %lu\n", teb_frame->Handler, res );
 
             switch (res)
@@ -3572,13 +7063,44 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 }
 
 
+static void init_xcontext( struct xcontext *ctx, ARM64_NT_CONTEXT *arm_ctx )
+{
+    XSTATE *xs = (XSTATE *)(((ULONG_PTR)ctx->xs + 63) & ~63ull);
+
+    if (ios_xstate_revert())
+    {
+        /* madeira [xstate-revert]: Wine 11.21's context_arm_to_x64(): no XSTATE, flags taken
+         * from the ARM context. CONTEXT_EX and the XSTATE area are left zeroed. */
+        memset( &ctx->c_ex, 0, sizeof(*ctx) - FIELD_OFFSET( struct xcontext, c_ex ) );
+        context_arm_to_x64( &ctx->c, arm_ctx, ctx_flags_arm_to_x64( arm_ctx->ContextFlags ) );
+        return;
+    }
+
+    ctx->c_ex.Legacy.Length = sizeof(CONTEXT);
+    ctx->c_ex.Legacy.Offset = -(LONG)sizeof(CONTEXT);
+    ctx->c_ex.XState.Length = sizeof(*xs);
+    ctx->c_ex.XState.Offset = (char *)xs - (char *)&ctx->c_ex;
+    ctx->c_ex.All.Offset = ctx->c_ex.Legacy.Offset;
+    ctx->c_ex.All.Length = sizeof(CONTEXT) + ctx->c_ex.XState.Offset + ctx->c_ex.XState.Length;
+
+    xs->Mask = XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+    xs->CompactionMask = 0;
+    memset( xs->Reserved, 0, sizeof(xs->Reserved) );
+
+    context_arm_to_x64( &ctx->c, arm_ctx, CONTEXT_AMD64_FULL | CONTEXT_AMD64_XSTATE );
+}
+
+
 /*******************************************************************
  *		KiUserEmulationDispatcher (NTDLL.@)
  */
 void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
 {
-    context_arm_to_x64( get_arm64ec_cpu_area()->ContextAmd64, arm_ctx );
-    get_arm64ec_cpu_area()->InSimulation = 1;
+    struct xcontext *context = (void *)get_arm64ec_cpu_area()->ContextAmd64;
+
+    init_xcontext( context, arm_ctx );
+    ios_pfaf_apply( (CONTEXT *)&context->c );   /* madeira [pfaf-keep] */
+    ios_df_apply( (CONTEXT *)&context->c );     /* madeira [df-ctx] */
     pBeginSimulation();
 }
 __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
@@ -3603,101 +7125,86 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
     else context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
 
     /* return to x64 code so that the syscall entry thunk is invoked properly */
+    get_arm64ec_cpu_area()->InSimulation = 1;
     dispatch_emulation( context );
 }
 
 
-/* Stellar Blade: skip a null pixel-stage uniform buffer (MADEIRA_SB_NULL_UB_SKIP=1, off by default).
+/* madeira-bcd [ccall-peek] (env MADEIRA_CCALL_PEEK_FIXUP = 0 turns it off).
  *
- * The crash (SB-Win64-Shipping.exe+0x2e3ec81, AV read of 0x18) is in Unreal's D3D11 RHI,
- * SetResourcesFromTables for the pixel stage. It walks the set bits of
- *   Shader->ShaderResourceTable.ResourceTableBits ([rbp+0x30]) & DirtyUniformBuffers ([rbx+0x43ce])
- * and dereferences BoundUniformBuffers[stage][index] ([rbx+0x4278+index*8]) with the check
- * compiled out of the shipping build:
- *   +0x2e3ec79  mov r8,[rbx+rax*8+0x4278]
- *   +0x2e3ec81  mov rcx,[r8+0x18]      <- r8 == 0
- *   ...
- *   +0x2e3ecdb  test edi,edi / jnz loop  (edi already has this index cleared)
- * In the captured log the game bound slots 0,1,2 just before the draw while the shader's mask
- * was 0x0d (slots 0,2,3): slot 3 was never written. This does not find out why; it moves the
- * faulting thread to the loop's next-index test, as if the bit were clear, so the draw goes on
- * without that buffer's textures and samplers (wrong-looking output for those draws at worst).
- * The x86 bytes on both sides are checked so another build of the game is left alone.
- * Each distinct shader seen here is logged once ([sb-ub-skip] new shader). */
-static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
-{
-    static const BYTE before[16] = { 0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00,   /* mov r8,[rbx+rax*8+0x4278] */
-                                     0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 }; /* mov rcx,[r8+0x18]; add rcx,0x78 */
-    static const BYTE resume[4] = { 0x85,0xff,0x75,0x81 };                     /* test edi,edi; jnz -0x7f */
-    static const ULONG64 resume_off = 0x5a;  /* 0x2e3ecdb - 0x2e3ec81 */
-    static LONG mode;  /* 0 not read yet, 1 off, 2 on */
-    static LONG skips, nshaders;
-    static ULONG64 shaders[64];  /* log-only; a racing duplicate just logs a shader twice */
-    BYTE code[16], tail[4];
-    ULONG64 slots[16], shader = ctx->Rbp, owner = ctx->Rbx;
-    DWORD res_bits = 0;
-    WORD dirty = 0;
-    SIZE_T got;
-    LONG n, i, slot_mask = -1;
-    BOOL known = FALSE;
+ * arm64x_check_call reads the first bytes of an x64 call target to spot the
+ * fast-forward, syscall and "jmp [rip+x]" sequences. That is an optimisation
+ * only: a target that is not one of them takes the exit thunk and the emulator
+ * runs it. Overwatch 2 keeps Overwatch.exe .text PAGE_NOACCESS and decrypts a
+ * page when x64 code first faults on it. On 0.2.57 (log 90020f6b) the peek hit
+ * such a page from native ntdll code: "Exception: Code: C0000005 Address:
+ * 70F0179074 AV READ of 1405431E0", host insn f9400170 = ldr x16,[x11], view
+ * vprot 20 (NOACCESS). The loader's x64 hook can't handle a fault in native
+ * code (it stepped Rip by 2: "AV EXEC of 154101076") and the game died 0xc0000005.
+ * So a read fault on one of those peeks resumes at the exit-thunk path, as if
+ * the bytes matched nothing; the emulator then fetches the target itself and
+ * the fault is an ordinary x64 one at the target, which is what the guest's
+ * handler expects. x11 still holds the target at every peek (it is only
+ * overwritten by a load that completed). Only this ntdll's own peek range is
+ * matched; Pc and the labels are both addresses in the code copy that ran. */
+extern const char madeira_ccall_peek_begin[], madeira_ccall_peek_exit[];
 
-    if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters < 2) return FALSE;
-    if (rec->ExceptionInformation[0] != 0 || rec->ExceptionInformation[1] != 0x18) return FALSE;
-    if (ctx->R8 != 0 || ctx->Rip < 8) return FALSE;
+static void ccall_peek_fixup( EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *arm_ctx )
+{
+    static LONG mode;   /* 0 not read yet, 1 off, 2 on */
+    ULONG_PTR pc = arm_ctx->Pc;
+
+    if (pc < (ULONG_PTR)madeira_ccall_peek_begin || pc >= (ULONG_PTR)madeira_ccall_peek_exit) return;
+    if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0) return;   /* read faults only */
     if (!mode)
     {
         UNICODE_STRING name, value;
         WCHAR buffer[2];
 
-        RtlInitUnicodeString( &name, L"MADEIRA_SB_NULL_UB_SKIP" );
+        RtlInitUnicodeString( &name, L"MADEIRA_CCALL_PEEK_FIXUP" );
         value.Buffer = buffer;
         value.Length = 0;
         value.MaximumLength = sizeof(buffer);
         mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
-                value.Length == sizeof(WCHAR) && buffer[0] == '1') ? 2 : 1;
-        if (mode == 2) ERR( "[sb-ub-skip] on (MADEIRA_SB_NULL_UB_SKIP=1)\n" );
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
     }
-    if (mode != 2) return FALSE;
-    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip - 8), code, sizeof(code), &got ) ||
-        got != sizeof(code) || memcmp( code, before, sizeof(code) )) return FALSE;
-    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip + resume_off), tail, sizeof(tail), &got ) ||
-        got != sizeof(tail) || memcmp( tail, resume, sizeof(tail) )) return FALSE;
-
-    n = InterlockedIncrement( &skips );
-    for (i = 0; i < min( nshaders, (LONG)ARRAY_SIZE(shaders) ); i++)
-        if (shaders[i] == shader) { known = TRUE; break; }
-    if (!known)
+    if (mode != 2) return;
     {
-        LONG idx;
-
-        /* Diagnostic reads only; a failed read leaves that field shown as unknown (ffff / -1). */
-        if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(shader + 0x30), &res_bits, sizeof(res_bits), &got ) ||
-            got != sizeof(res_bits)) res_bits = ~0u;
-        if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(owner + 0x43ce), &dirty, sizeof(dirty), &got ) ||
-            got != sizeof(dirty)) dirty = 0xffff;
-        if (!NtReadVirtualMemory( NtCurrentProcess(), (void *)(owner + 0x4278), slots, sizeof(slots), &got ) &&
-            got == sizeof(slots))
-            for (slot_mask = 0, i = 0; i < 16; i++) if (slots[i]) slot_mask |= 1 << i;
-        idx = InterlockedIncrement( &nshaders ) - 1;
-        if (idx < (LONG)ARRAY_SIZE(shaders)) shaders[idx] = shader;
-        ERR( "[sb-ub-skip] new shader #%ld %p: wants slots %04lx, bound non-null %04lx%s, dirty %04x, "
-             "missing %04lx (skip #%ld, rip=%p, tid=%04lx)\n",
-             idx + 1, (void *)shader, (unsigned long)(res_bits & 0xffff), (unsigned long)(slot_mask & 0xffff),
-             slot_mask < 0 ? " (unreadable)" : "", dirty,
-             slot_mask < 0 ? 0ul : (unsigned long)(res_bits & 0xffff & ~slot_mask), n,
-             (void *)ctx->Rip, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
+        static LONG n;
+        if (n < 16 && InterlockedIncrement( &n ) <= 16)
+            ERR( "[ccall-peek] #%ld read fault at %p on target %p (read of %p) -> exit thunk path rev=ccall-peek\n",
+                 n, (void *)pc, (void *)(ULONG_PTR)arm_ctx->X11, (void *)rec->ExceptionInformation[1] );
     }
-    else if (n <= 8 || !(n % 1000))
-        ERR( "[sb-ub-skip] skip #%ld shader %p (%ld distinct so far)\n", n, (void *)shader, nshaders );
-
-    ctx->Rip += resume_off;
-    return TRUE;
+    arm_ctx->Pc = (ULONG_PTR)madeira_ccall_peek_exit;
+    syscall_NtContinue( arm_ctx, FALSE );   /* returns only on failure: then dispatch as before */
+    arm_ctx->Pc = pc;
 }
 
-static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
+static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, struct xcontext *context, ARM64_NT_CONTEXT *arm_ctx )
 {
+    LONG xr_index;   /* madeira [crashmailer-dump] */
+
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
-    context_arm_to_x64( context, arm_ctx );
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) ccall_peek_fixup( rec, arm_ctx );
+    xr_index = ios_xr_record( rec, arm_ctx->Sp );   /* madeira-bcd [exc-ring], before note_av so the arm is not counted */
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) ios_sp_note_av( rec, arm_ctx->Sp );   /* madeira-bcd [subpage-sweep] */
+    init_xcontext( context, arm_ctx );
+    if (rec->ExceptionCode != STATUS_EMULATION_SYSCALL)
+        ios_pfaf_int3( (CONTEXT *)&context->c );   /* madeira [pfaf-int3] */
+    ios_dr_fill( (CONTEXT *)&context->c );   /* madeira [dr-pass]: real x64 exception contexts carry Dr0-Dr7 */
+    ios_ctx_x64_fields( (CONTEXT *)&context->c );   /* madeira [ctx-x64-fields] */
+    /* rtcs-diag: the first 6 non-syscall exceptions whose hook pointer is NULL or differs from the value stored at init. */
+    if (rtcs_diag_enabled() && (!pResetToConsistentState || (void *)pResetToConsistentState != rtcs_diag_init) &&
+        rec->ExceptionCode != STATUS_EMULATION_SYSCALL && rtcs_diag_hits < 6 && InterlockedIncrement( &rtcs_diag_hits ) <= 6)
+    {
+        ERR( "[rtcs-ptr] exception #%d: code=%08x pc=%p pointer=%p stored-at-init=%p export=%p %s rev=rtcs-diag\n",
+             (int)rtcs_diag_hits, (unsigned int)rec->ExceptionCode, (void *)(ULONG_PTR)arm_ctx->Pc,
+             (void *)pResetToConsistentState, rtcs_diag_init, rtcs_diag_raw,
+             !pResetToConsistentState ? (rtcs_diag_init ? "NULL NOW, was set at init (cleared later)"
+                                                        : "NULL here (all three statics 0: page cleared or another ntdll instance)")
+                                      : "CHANGED since init" );
+        rtcs_diag_where( "exception" );
+    }
     /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
      * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
      * so trace the guest-exception conversion from the wine side. Rate-
@@ -3782,7 +7289,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                         !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
                     {
-                        ULONG64 grsp = context->AMD64_Context.Rsp;
+                        ULONG64 grsp = context->c.AMD64_Context.Rsp;
                         SIZE_T qlen = 0;
                         MEMORY_BASIC_INFORMATION smbi;
 
@@ -4070,23 +7577,20 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
             }
             ERR( "[rtcs] pre: code=%08x addr=%p armPc=%p ecRip=%p rtcs=%p insim=%u\n",
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
-                 (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                 (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->c.AMD64_Context.Rip,
                  pResetToConsistentState, get_arm64ec_cpu_area()->InSimulation );
     }
-    if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
+    if (pResetToConsistentState) pResetToConsistentState( rec, &context->c.AMD64_Context, arm_ctx );
     {
         static LONG rtcs_m;
         if (rtcs_m < 40 && InterlockedIncrement( &rtcs_m ) <= 40)
             ERR( "[rtcs] post: code=%08x addr=%p ecRip=%p ecRsp=%p armPc=%p\n",
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
-                 (void *)(ULONG_PTR)context->AMD64_Context.Rip, (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
+                 (void *)(ULONG_PTR)context->c.AMD64_Context.Rip, (void *)(ULONG_PTR)context->c.AMD64_Context.Rsp,
                  (void *)(ULONG_PTR)arm_ctx->Pc );
     }
-    /* After ResetToConsistentState, so Rip is the exact faulting x86 instruction (the
-     * [rtcs] post line for the Stellar Blade crash shows ecRip=...142E3EC81). Before any
-     * guest VEH/SEH runs, so the game's crash reporter never sees a skipped fault. */
-    if (ios_sb_null_ub_skip( rec, &context->AMD64_Context ))
-        NtContinue( &context->AMD64_Context, FALSE );
+    if (rec->ExceptionCode != STATUS_EMULATION_SYSCALL)   /* madeira [crashmailer-dump]: the context handlers get */
+        ios_cmd_exc_ctx( xr_index, rec, &context->c.AMD64_Context );
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     /* iOS-Madeira ml409 (#66): the fatal [bogus-ctx] walks a context whose Rsp
      * high dword became exactly 1 and whose Rip/Rbp/R12 turned into FEX-band
@@ -4106,15 +7610,89 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
             if (kipath_n < 60 && InterlockedIncrement( &kipath_n ) <= 60)
                 ERR( "[ki-path] code=%08x ctx=%p Rsp=%p Rip=%p -> %s (patched=%d wow64=%p)\n",
                      (unsigned int)rec->ExceptionCode, context,
-                     (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
-                     (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                     (void *)(ULONG_PTR)context->c.AMD64_Context.Rsp,
+                     (void *)(ULONG_PTR)context->c.AMD64_Context.Rip,
                      (pWow64PrepareForException || patched) ? "x64-THUNK (guest hook runs)" : "direct dispatch",
                      patched, pWow64PrepareForException );
         }
         if (pWow64PrepareForException || patched)
+        {
+            if (patched) ios_cmd_note_ki( rec, KiUserExceptionDispatcher_thunk );   /* madeira [crashmailer-dump] */
             return KiUserExceptionDispatcher_thunk;
+        }
     }
     return NULL;
+}
+
+/* madeira-bcd [ki-legacy-frame] (env MADEIRA_KI_LEGACY_FRAME = 0 turns it off).
+ *
+ * Wine 11.x grew the KiUserExceptionDispatcher frame from ARM64EC_NT_CONTEXT
+ * (0x4d0) to struct xcontext (0x670: + CONTEXT_EX + XSTATE), so for x64 code
+ * the ARM64 context now sits at rsp+0x670 and the EXCEPTION_RECORD at
+ * rsp+0xa20 instead of rsp+0x4d0 / rsp+0x880. Overwatch 2's loader hooks the
+ * x64 dispatcher (it sets Wow64PrepareForException and handles its own int3
+ * checks there). On bnettest23 (old frame) the hook handled the first int3 and
+ * resumed ("[pool-rip-fix] #8 ... invoke_arm64ec_syscall", then "[set-ctx]");
+ * on 0.2.47 (new frame) it declines the same int3 at Overwatch_loader+0x871be0,
+ * the loader's SEH handler writes a dump and the process ends 0x80000003.
+ * So when the x64 hook path is taken, hand x64 code the old frame: move the
+ * CONTEXT up by 0x1a0 so it ends right where the ARM64 context starts, and drop
+ * CONTEXT_XSTATE from it (its CONTEXT_EX is overwritten). Only the hooked path
+ * changes; the native dispatcher keeps the 11.x frame. Returns the shift.
+ * The 11.x frame also sets CONTEXT_XSTATE and fills CONTEXT_EX, which is the
+ * other suspected cause: MADEIRA_KI_LEGACY_FRAME = 2 keeps the new frame and only
+ * drops CONTEXT_XSTATE. */
+static LONG ki_legacy_frame_mode;   /* 0 not read yet, 1 off, 2 on (shift + no XSTATE), 3 XSTATE flag only */
+
+static ULONG_PTR __attribute__((used)) ki_legacy_frame_enter( struct xcontext *ctx )
+{
+    CONTEXT *moved;
+
+    if (!ki_legacy_frame_mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_KI_LEGACY_FRAME" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ki_legacy_frame_mode = 2;
+        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length == sizeof(WCHAR))
+        {
+            if (buffer[0] == '0') ki_legacy_frame_mode = 1;
+            else if (buffer[0] == '2') ki_legacy_frame_mode = 3;
+        }
+    }
+    if (ki_legacy_frame_mode == 1) return 0;
+    if (ki_legacy_frame_mode == 3)
+    {
+        /* = 2: keep the 11.x frame, only drop CONTEXT_XSTATE (tells the two
+         * suspected causes apart). */
+        ctx->c.AMD64_Context.ContextFlags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+        return 0;
+    }
+
+    moved = (CONTEXT *)((char *)ctx + sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT));
+    memmove( moved, &ctx->c, sizeof(ARM64EC_NT_CONTEXT) );
+    moved->ContextFlags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+    {
+        static LONG kl_n;
+        if (kl_n < 8 && InterlockedIncrement( &kl_n ) <= 8)
+            ERR( "[ki-legacy-frame] #%ld x64 hook gets the 0x4d0 frame: ctx %p -> %p rec at %p rev=ki-legacy-frame\n",
+                 kl_n, ctx, moved, (char *)moved + sizeof(ARM64EC_NT_CONTEXT) + 0x3b0 );
+    }
+    return sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT);
+}
+
+/* The x64 hook returned instead of resuming (not expected; Windows gives it no
+ * return address). Put the CONTEXT back so the native dispatcher below sees a
+ * normal frame; XSTATE stays dropped. */
+static void __attribute__((used)) ki_legacy_frame_leave( struct xcontext *ctx )
+{
+    CONTEXT *moved = (CONTEXT *)((char *)ctx + sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT));
+
+    memmove( &ctx->c, moved, sizeof(ARM64EC_NT_CONTEXT) );
 }
 
 /*******************************************************************
@@ -4124,12 +7702,12 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
 {
     asm( ".seh_proc \"#KiUserExceptionDispatcher\"\n\t"
          ".seh_context\n\t"
-         "sub sp, sp, #0x4d0\n\t"       /* sizeof(ARM64EC_NT_CONTEXT) */
-         ".seh_stackalloc 0x4d0\n\t"
+         "sub sp, sp, #0x670\n\t"       /* sizeof(xcontext) */
+         ".seh_stackalloc 0x670\n\t"
          ".seh_endprologue\n\t"
-         "add x0, sp, #0x3b0+0x4d0\n\t" /* rec */
+         "add x0, sp, #0x3b0+0x670\n\t" /* rec */
          "mov x1, sp\n\t"               /* context */
-         "add x2, sp, #0x4d0\n\t"       /* arm_ctx (context + 1) */
+         "add x2, sp, #0x670\n\t"       /* arm_ctx (context + 1) */
          "bl \"#prepare_exception_arm64ec\"\n\t"
          "cbz x0, 1f\n\t"
          /* bypass exit thunk to avoid messing up the stack */
@@ -4143,9 +7721,25 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
           * optimization; label 1 (dispatch_exception) is the full, correct
           * ARM64EC SEH dispatcher. So if the slot is NULL, fall through to it. */
          "cbz x16, 1f\n\t"
-         "mov x9, x0\n\t"
-         "blr x16\n"
-         "1:\tadd x0, sp, #0x3b0+0x4d0\n\t" /* rec */
+         /* madeira-bcd [ki-legacy-frame]: x19/x20 hold the target and the
+          * dispatch helper across the C call, x21 the shift (x19-x22 are
+          * r12-r15 for x64 code, preserved if it ever returns). This function
+          * never returns, so the callee-saved registers are free here. */
+         "mov x19, x0\n\t"
+         "mov x20, x16\n\t"
+         "mov x0, sp\n\t"
+         "bl \"#ki_legacy_frame_enter\"\n\t"
+         "mov x21, x0\n\t"
+         "add sp, sp, x21\n\t"
+         "mov x9, x19\n\t"
+         "mov x16, x20\n\t"
+         "mov x0, x19\n\t"                /* x64 code sees rcx = target, as before */
+         "blr x16\n\t"
+         "sub sp, sp, x21\n\t"
+         "cbz x21, 1f\n\t"
+         "mov x0, sp\n\t"
+         "bl \"#ki_legacy_frame_leave\"\n"
+         "1:\tadd x0, sp, #0x3b0+0x670\n\t" /* rec */
          "mov x1, sp\n\t"                   /* context */
          "bl #dispatch_exception\n\t"
          "brk #1\n\t"
@@ -4160,11 +7754,11 @@ static void __attribute__((used)) dispatch_apc( void (CALLBACK *func)(ULONG_PTR,
                                                 ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                                 BOOLEAN alertable, ARM64_NT_CONTEXT *arm_ctx )
 {
-    ARM64EC_NT_CONTEXT context;
+    struct xcontext context;
 
-    context_arm_to_x64( &context, arm_ctx );
-    func( arg1, arg2, arg3, &context.AMD64_Context );
-    NtContinue( &context.AMD64_Context, alertable );
+    init_xcontext( &context, arm_ctx );
+    func( arg1, arg2, arg3, &context.c.AMD64_Context );
+    NtContinue( &context.c.AMD64_Context, alertable );
 }
 __ASM_GLOBAL_FUNC( "#KiUserApcDispatcher",
                    ".seh_context\n\t"
@@ -4285,6 +7879,53 @@ static ULONG_PTR ec_code_map_limit( void )
     return cached;
 }
 
+/* madeira [isec-bound] (env MADEIRA_EC_ISEC_BOUND = 0 turns it off). rev=isec-bound-1.
+ *
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine 554d343543 (0135) "ntdll: Bound
+ * RtlIsEcCode to the user address space, and end a frame walk at a return address that isn't user code"
+ * (LGPL-2.1, https://github.com/metalsharp/MetalSharp-Wine). Overwatch's stack walk reached a frame whose
+ * return address was data (0x80e300a70070) and faulted inside ntdll, again and again. As on Windows, an
+ * address past the user address space is no EC code, and RtlWalkFrameChain() ends the walk at a return
+ * address that can't be user code instead of recording it and unwinding past it.
+ * Ours keeps Madeira's own bound (ec_code_map_limit(), the bitmap's real coverage, which already rejects
+ * Overwatch's address) and adds his on top; the frame-walk stop is the part that is new here. */
+static LONG ios_isec_mode;   /* 0 not read, 1 off, 2 on */
+
+static BOOL ios_isec_bound(void)
+{
+    if (!ios_isec_mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        PEB *peb = NtCurrentTeb()->Peb;
+        WCHAR *env;
+
+        /* no environment yet (not expected): answer with the default, read it on a later call */
+        if (!peb->FastPebLock && !peb->ProcessParameters) return TRUE;
+        /* as in ios_xstate_revert(): before loader_init() FastPebLock is NULL, so read the block itself */
+        env = peb->FastPebLock ? NULL : peb->ProcessParameters->Environment;
+        RtlInitUnicodeString( &var, L"MADEIRA_EC_ISEC_BOUND" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ios_isec_mode = (!RtlQueryEnvironmentVariable_U( env, &var, &value ) &&
+                         value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+        ERR( "[isec-bound] rev=isec-bound-1 %s\n", ios_isec_mode == 2 ? "on" : "off (MADEIRA_EC_ISEC_BOUND=0)" );
+    }
+    return ios_isec_mode == 2;
+}
+
+/* [isec-bound]: the highest address of the user address space of a 64-bit process on x64 Windows.
+ * Ours: a constant, not SystemBasicInformation as in his patch. Madeira's HighestUserAddress
+ * is a REPORT that can sit far below where code really lives (env.MADEIRA_USER_VA_GB = n tells a
+ * process n GiB while its PE images are at 0x71..-0x73..), so bounding by it would call real EC
+ * code "not EC" and end every frame walk at its first frame. Nothing on iOS can be mapped this
+ * high, so the constant drops no real frame; it also takes no syscall on the first RtlIsEcCode call. */
+static inline ULONG_PTR ios_highest_user_address(void)
+{
+    return 0x7ffffffeffff;
+}
+
 BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
@@ -4293,6 +7934,9 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
        any pointer beyond that — a legal Windows address above our VA, or a corrupted
        one from a damaged unwind context — must not segfault. */
     if (!map || ptr >= ec_code_map_limit()) return FALSE;
+    /* madeira [isec-bound] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine 554d343543
+     * (LGPL-2.1): an address past the user address space is no EC code, as on Windows */
+    if (ptr > ios_highest_user_address() && ios_isec_bound()) return FALSE;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
@@ -4318,27 +7962,34 @@ static BOOL unwind_one_frame( CONTEXT *context )
     ULONG_PTR lookup_pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)pc );
     RUNTIME_FUNCTION *func = RtlLookupFunctionEntry( lookup_pc, &base, NULL );
 
+    LONG internal;
+
     if (!func) return FALSE;
+    internal = ios_cmd_internal_enter();   /* madeira [crashmailer-dump]: ntdll's own unwind */
     RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, lookup_pc, func, context, &data, &frame, NULL );
+    ios_cmd_internal_leave( internal );
     return TRUE;
+}
+
+static void __attribute__((used)) unwind_entry_thunk( CONTEXT *context )
+{
+    CONTEXT unwind_context = *context;
+    unwind_one_frame( &unwind_context );
+    /* if the caller is emulated, we're in an entry thunk, so use the caller's context instead */
+    if (!RtlIsEcCode( unwind_context.Rip ))
+        memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
 }
 
 /* capture context information; helper for RtlCaptureContext */
 static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, UINT fpcr, UINT fpsr )
 {
-    CONTEXT unwind_context;
-
     context->ContextFlags = CONTEXT_AMD64_FULL;
     context->EFlags = cpsr_to_eflags( cpsr );
     context->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
     context->FltSave.ControlWord = 0x27f;
     context->FltSave.StatusWord = 0;
     context->FltSave.MxCsr = context->MxCsr;
-
-    /* unwind one level to get register values from caller function */
-    unwind_context = *context;
-    unwind_one_frame( &unwind_context );
-    memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
+    unwind_entry_thunk( context );
 }
 
 /***********************************************************************
@@ -4392,7 +8043,7 @@ void __attribute__((naked)) RtlCaptureContext( CONTEXT *context )
 /* fixup jump buffer information; helper for _setjmpex */
 static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT fpsr )
 {
-    CONTEXT context = { .ContextFlags = CONTEXT_FULL };
+    CONTEXT context = { .ContextFlags = CONTEXT_AMD64_FULL };
 
     buf->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
     buf->FpCsr = 0x27f;
@@ -4510,6 +8161,9 @@ static void __attribute__((naked,noreturn)) consolidate_callback( CONTEXT *conte
          "stp x6, x7, [x4], #16\n\t"
          "subs x5, x5, #1\n\t"
          "b.ne 1b\n\t"
+         "ldr w5, [sp, #0x30]\n\t"  /* ContextFlags */
+         "and w5, w5, #~0x40\n\t"
+         "str w5, [sp, #0x30]\n\t"
          "mov x0, x2\n\t"           /* rec */
          "b invoke_callback\n\t"
          ".seh_endproc\n\t"
@@ -4621,8 +8275,12 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
     ULONG_PTR frame;
     DWORD i, res;
     BOOL is_target_ec = RtlIsEcCode( (ULONG_PTR)target_ip );
+    int cmd_tok;          /* madeira [crashmailer-dump] */
+    LONG cmd_internal;
 
     RtlCaptureContext( context );
+    cmd_tok = ios_cmd_unwind_pre( 2, 0, (ULONG_PTR)target_ip, context );
+    cmd_internal = ios_cmd_internal_enter();
     new_context.AMD64_Context = *context;
     if (rec && rec->ExceptionCode == 0x406D1388) ios_tlswatch_pe_arm( "RtlUnwindEx entry" );
 
@@ -4805,6 +8463,8 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
     if (is_target_ec) context->Rcx = (ULONG64)retval;
     else context->Rax = (ULONG64)retval;
+    ios_cmd_internal_leave( cmd_internal );   /* madeira [crashmailer-dump] */
+    ios_cmd_unwind_post( cmd_tok, context, 0, NULL, (ULONG_PTR)target_ip, (ULONG_PTR)end_frame );
     RtlRestoreContext( context, rec );
 }
 
@@ -4815,7 +8475,12 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 NTSTATUS WINAPI RtlGetNativeSystemInformation( SYSTEM_INFORMATION_CLASS class,
                                                void *info, ULONG size, ULONG *ret_size )
 {
-    return syscall_NtQuerySystemInformation( class, info, size, ret_size );
+    NTSTATUS status = syscall_NtQuerySystemInformation( class, info, size, ret_size );
+
+    /* madeira [cpu-x64-identity] (see ios_x64_identity): GetNativeSystemInfo says AMD64, as on Windows on ARM */
+    if (!status && class == SystemCpuInformation && pUpdateProcessorInformation && ios_x64_identity())
+        pUpdateProcessorInformation( info );
+    return status;
 }
 
 
@@ -4864,6 +8529,16 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
 }
 
 
+/**********************************************************************
+ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
+ */
+ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
+{
+    if (!emulated_processor_features[PF_AVX_INSTRUCTIONS_AVAILABLE]) return 0;
+    return user_shared_data->XState.EnabledFeatures & feature_mask;
+}
+
+
 /*************************************************************************
  *		RtlWalkFrameChain (NTDLL.@)
  */
@@ -4876,6 +8551,7 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
     CONTEXT context;
     void *data;
     ULONG i, skip = flags >> 8, num_entries = 0;
+    LONG internal = ios_cmd_internal_enter();   /* madeira [crashmailer-dump]: ntdll's own unwind */
 
     RtlCaptureContext( &context );
 
@@ -4888,10 +8564,15 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
                                &data, &frame, NULL, NULL, NULL, &handler, 0 ))
             break;
         if (!context.Rip) break;
+        /* madeira [isec-bound] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine
+         * 554d343543 (LGPL-2.1): a return address that can't be user code ends the walk, as on Windows:
+         * past it the frames are data */
+        if ((context.Rip < 0x10000 || context.Rip > ios_highest_user_address()) && ios_isec_bound()) break;
         if (!frame || !is_valid_frame( frame )) break;
         if (context.Rsp == (ULONG_PTR)NtCurrentTeb()->Tib.StackBase) break;
         if (i >= skip) buffer[num_entries++] = (void *)context.Rip;
     }
+    ios_cmd_internal_leave( internal );
     return num_entries;
 }
 
@@ -5014,11 +8695,12 @@ static void __attribute__((naked)) arm64x_check_call(void)
          /* check if dest is aligned */
          "tst x11, #15\n\t"                 /* dest & 15 */
          "b.ne .Ljmp\n\t"
+         "madeira_ccall_peek_begin:\n\t"   /* [ccall-peek]: loads from [x11] start here */
          "ldr x16, [x11]\n\t"               /* dest code */
          /* check for fast-forward sequence */
          "ldr x17, .Lffwd_seq\n\t"
          "cmp x16, x17\n\t"
-         "b.ne .Lsyscall\n\t"
+         "b.ne .Lhotpatch\n\t"
          "ldr x16, [x11, #8]\n\t"
          "ldr x17, .Lffwd_seq + 8\n\t"
          "eor x17, x16, x17\n\t"            /* compare only first two bytes */
@@ -5028,6 +8710,19 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "lsr x9, x16, #16\n\t"
          "add x11, x11, w9, sxtw\n\t"       /* add offset */
          "ret\n"
+         /* Madeira [hotpatch-thunks]: hotpatch prologue (lea 0x0(%rsp),%rsp) that the loader puts
+          * before x64 export thunks when env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1; step over it to
+          * the jmp, only when an ff 25 jmp follows (idea: DroidDeck-Proton 269ca79) */
+         ".Lhotpatch:\n\t"
+         "ldr x17, .Lhotpatch_seq\n\t"
+         "cmp x16, x17\n\t"
+         "b.ne .Lsyscall\n\t"
+         "ldrh w17, [x11, #8]\n\t"
+         "mov w9, #0x25ff\n\t"             /* ff 25 */
+         "cmp w17, w9\n\t"
+         "b.ne .Lsyscall\n\t"
+         "add x11, x11, #8\n\t"
+         "b .Ljmp\n"
          /* check for syscall sequence */
          ".Lsyscall:\n\t"
          "ldr w17, .Lsyscall_seq\n\t"
@@ -5060,6 +8755,7 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "ldr x11, [x16, w9, sxtw]\n\t"
          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
          /* not a special sequence, call the exit thunk */
+         "madeira_ccall_peek_exit:\n\t"    /* [ccall-peek]: a faulting peek resumes here */
          ".Lexit:\n\t"
          "mov x9, x11\n\t"
          "mov x11, x10\n\t"
@@ -5067,6 +8763,9 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "ret\n"
          ".seh_endproc\n\t"
 
+         ".balign 8\n"                      /* keep the 8-byte literals aligned */
+         ".Lhotpatch_seq:\n\t"
+         ".byte 0x48, 0x8d, 0xa4, 0x24, 0, 0, 0, 0\n"  /* lea 0x0(%rsp),%rsp */
          ".Lffwd_seq:\n\t"
          ".byte 0x48, 0x8b, 0xc4\n\t"       /* mov  %rsp,%rax */
          ".byte 0x48, 0x89, 0x58, 0x20\n\t" /* mov  %rbx,0x20(%rax) */
@@ -5149,13 +8848,24 @@ void __attribute((naked)) RtlRaiseException( EXCEPTION_RECORD *rec )
          ".seh_endprologue\n\t"
          "add x0, sp, #0x20\n\t"
          "bl \"#RtlCaptureContext\"\n\t"
-         "add x1, sp, #0x20\n\t"       /* context pointer */
+         "add x0, sp, #0x20\n\t"       /* context pointer */
+         "add x1, x0, #0x4d0\n\t"      /* orig stack pointer */
+         "str x1, [x0, #0x98]\n\t"     /* context->Rsp */
+         "ldr x1, [sp, #0x10]\n\t"     /* rec */
+         "str x1, [x0, #0x80]\n\t"     /* context->Rcx */
+         "ldr x1, [sp, #0x08]\n\t"     /* return address */
+         "str x1, [x0, #0xf8]\n\t"     /* context->Rip */
+         "ldr w1, [x0, #0x30]\n\t"     /* context->ContextFlags */
+         "orr w1, w1, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */
+         "str w1, [x0, #0x30]\n\t"
+         "bl \"#unwind_entry_thunk\"\n\t"
          "ldr x0, [sp, #0x10]\n\t"     /* rec */
-         "ldr x2, [x1, #0xf8]\n\t"     /* context->Rip */
+         "add x1, sp, #0x20\n\t"       /* context pointer */
+         "ldr x2, [x1, #0xf8]\n\t"     /* ctx->Rip */
          "str x2, [x0, #0x10]\n\t"     /* rec->ExceptionAddress */
-         "ldr w2, [x1, #0x30]\n\t"     /* context->ContextFlags */
-         "orr w2, w2, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */
-         "str w2, [x1, #0x30]\n\t"
+         "bl \"#ios_xp_raise\"\n\t"   /* madeira [crashmailer-exit-probe]: log only */
+         "ldr x0, [sp, #0x10]\n\t"     /* rec */
+         "add x1, sp, #0x20\n\t"       /* context pointer */
          "ldr x3, [x18, #0x60]\n\t"    /* peb */
          "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
          "cbnz w2, 1f\n\t"
@@ -5228,7 +8938,7 @@ void __attribute__((naked)) RtlUserThreadStart( PRTL_THREAD_START_ROUTINE entry,
  */
 void WINAPI LdrInitializeThunk( CONTEXT *arm_context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
 {
-    ARM64EC_NT_CONTEXT context;
+    struct xcontext context;
 
     if (!__os_arm64x_check_call)
     {
@@ -5239,10 +8949,11 @@ void WINAPI LdrInitializeThunk( CONTEXT *arm_context, ULONG_PTR unk2, ULONG_PTR 
         __os_arm64x_set_x64_information = LdrpSetX64Information;
     }
 
-    context_arm_to_x64( &context, (ARM64_NT_CONTEXT *)arm_context );
-    loader_init( &context.AMD64_Context, (void **)&context.X0 );
-    TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context.X0, (void *)context.X1 );
-    NtContinue( &context.AMD64_Context, TRUE );
+    init_xcontext( &context, (ARM64_NT_CONTEXT *)arm_context );
+    ios_cmd_read_switch();   /* madeira [crashmailer-dump]: first thread, before loader_init() */
+    loader_init( &context.c.AMD64_Context, (void **)&context.c.X0 );
+    TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context.c.X0, (void *)context.c.X1 );
+    NtContinue( &context.c.AMD64_Context, TRUE );
 }
 
 
@@ -5255,9 +8966,9 @@ __ASM_GLOBAL_FUNC( "#process_breakpoint",
                    "brk #0xf000\n\t"
                    "ret\n"
                    "process_breakpoint_handler:\n\t"
-                   "ldr x4, [x2, #0x108]\n\t" /* context->Pc */
+                   "ldr x4, [x2, #0xf8]\n\t"  /* context->Rip */
                    "add x4, x4, #4\n\t"
-                   "str x4, [x2, #0x108]\n\t"
+                   "str x4, [x2, #0xf8]\n\t"
                    "mov w0, #0\n\t"           /* ExceptionContinueExecution */
                    "ret" )
 

@@ -1,9 +1,9 @@
-Source for: Madeira Test 29 Nov 17.ipa (bundle id com.willfaust.madeora, build 90)
-Made: 2026-11-17 01:17 MST
+Source for: Madeira Nightly 0.2.100 og.ipa (bundle id com.willfaust.madeora, build 178)
+Made: 2026-11-24 17:29 MST
 
-Madeira: branch test/test29b, commit 2134682c1286afcafbfd036ef0673b352379863e
+Madeira: branch test/wine-1201, commit c0a60ea6d62b09aa345c1c37880dd048eadab276
 Submodules (commit, path):
-   2f610441c11cc30fc9b18b49808a2515e6619b46 FEX (heads/queue/t13-fex)
+   a43e0b919bf0d44ce4e5e30fee50b436db56da0a FEX (FEX-2611.1-212-ga43e0b919)
    b3fb4b9feafcd8d91c5cb510a4775143fdbef02f FEX/External/Catch2 (b3fb4b9)
    ee2ec5fd83dafce291024683b50dc89219333076 FEX/External/Vulkan-Headers (v1.4.362)
    3e49836995c1dcb3df709440ad2f270b569c6a5f FEX/External/drm-headers (heads/v5.11-12-g3e49836)
@@ -19,26 +19,20 @@ Submodules (commit, path):
    9bfadd6a55fc92dbd37fa3ba089bf8b36622df4f FEX/External/zydis (9bfadd6)
    75a36c45ae1ad382b0f4e0ede0af84c11ee69928 FEX/External/zydis/dependencies/zycore (v1.5.2-7-g75a36c4)
    9f94388a339fcbb0bc95c17768eb786c85988f6e FEX/Source/Common/cpp-optparse (heads/master)
-   0c5edfa966daacd8a1d3b70098466bc287934f3d dxmt (heads/queue/d3d9-draw-trace)
+   7dd7a422d6ba8186c31e802fd4decec5a452afa8 dxmt (heads/queue/dxmt-viewkey-2-g7dd7a42)
    d08488fcc82eef313b0464db37d2955709691e94 dxmt/external/nvapi (d08488f)
    9df86f2341616ef1888ae59919feaa6d4fad693d dxmt/include/native/directx (heads/main)
    9ce5d634fd7c72ad32292d007d533de84beb6a56 madeira-dock (upstream-pr/10)
-   a25fc5fdb702f4c42158dc8bd3fbfed0adad889d wine (heads/queue/t29b-mirage)
+   0489b6ff8f870c29056743f982f21ebc97d09da9 wine (heads/queue/wine-1199)
 
-The files here are the working tree the IPA was built from, so they include these local
-changes on top of the commits above (diffs in local-changes/):
-   M app/Madeira/ConfigCatalog.generated.swift
-   M build/gnutls-ios/build.sh
-   M build/luajit-x64/build.sh
-   M build/win32u-unix/build.sh
-   M build/wineserver/build.sh
-   m dxmt
-   m madeira-dock
-   M tools/build/build-runtime-component.sh
-   M tools/build/build-wine.sh
-   M tools/build/runtime-components.py
-   m wine
-
+Release copy (published on GitHub with Nightly 0.2.100 og): the Madeira tree as built. Madeira's FEX patches
+(build/fex-patches/0001-0024) and Dock patches (build/dock-patches/0001-0006) are already applied to the FEX and
+madeira-dock folders, as the DLLs were built (the patch files are kept in build/ as well). The PC build scripts and the
+diffs of built files are left out; build/ and BUILDING.md describe the build. The IPA is the Nightly 0.2.100 build
+with its bundle ID changed to the original com.willfaust.madeora (build number 178); no code differs.
+This build contains code ported from MetalSharp (AGPL-3.0), written by BOR1NG (Avery Felts,
+https://github.com/aaf2tbz): section views, debug registers, XSAVE state revert and Intel flags. It also contains
+code from MetalSharp-Wine (LGPL-2.1) and MetalSharp's FEX patches (MIT), and code from Mullion (LGPL-2.1-or-later,
+https://github.com/dttdrv/mullion). See THIRD-PARTY-NOTICES.md.
 Left out: built libraries/DLLs/IPAs, FEX prebuilt test binaries, the private Get Help key.
 MoltenVK in the IPA comes from the official Madeira 0.2.0 release IPA (Apache-2.0).
-build-shims/ holds the scripts used to cross-build on Linux (WSL) with xtool.

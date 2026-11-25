@@ -394,14 +394,17 @@ struct GestureZonePanel: View {
                 Button {
                     if let i { z.zones[i].locked = zone.locked == true ? nil : true }
                 } label: { Image(systemName: zone.locked == true ? "lock.fill" : "lock.open") }
+                .iconLabel(zone.locked == true ? "Unlock zone" : "Lock zone")
                 // A locked zone has no delete button.
                 if zone.locked != true {
                     Button(role: .destructive) {
                         if let i { z.zones.remove(at: i) }
                         z.selected = nil
                     } label: { Image(systemName: "trash") }
+                    .iconLabel("Delete zone")
                 }
                 Button { z.selected = nil } label: { Image(systemName: "xmark") }
+                .iconLabel("Close")
             }
             Picker("Kind", selection: binding(\.kind)) {
                 ForEach(GestureZoneKind.allCases, id: \.self) { Text($0.title) }

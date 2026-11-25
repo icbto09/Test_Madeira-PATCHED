@@ -135,12 +135,20 @@ HGDIOBJ get_full_gdi_handle( HGDIOBJ obj )
  *
  * GDI initialization.
  */
+/* Madeira gdi-dllinit-leaf, see GdiDllInitialize. Set only in a gdi32 the loader loaded. */
+static BOOL gdi_dllinit_fixme;
+
 BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
 
     DisableThreadLibraryCalls( inst );
     gdi32_module = inst;
+    {
+        WCHAR buf[4];
+        if (GetEnvironmentVariableW( L"MADEIRA_GDI_DLLINIT_LEAF", buf, sizeof(buf) / sizeof(buf[0]) ) == 1 && buf[0] == '0')
+            gdi_dllinit_fixme = TRUE;
+    }
     return TRUE;
 }
 
@@ -1091,6 +1099,13 @@ BOOL WINAPI LineDDA( INT x_start, INT y_start, INT x_end, INT y_end,
  */
 BOOL WINAPI GdiDllInitialize( HINSTANCE inst, DWORD reason, LPVOID reserved )
 {
+    /* Madeira gdi-dllinit-leaf: Black Ops III maps gdi32.dll from disk itself and calls this export in
+     * that copy (Wine bug 48171, Remi Bernon: "if the implementation uses external symbols, the call
+     * will also fail"). That copy was never loaded, so its imports and ARM64EC helper pointers are
+     * not filled in, and the FIXME's debug-channel call jumped to address 0 (0.2.79 run). This must
+     * stay a leaf: no calls, no imports. env MADEIRA_GDI_DLLINIT_LEAF=0 brings the FIXME back,
+     * but only in the loader-loaded gdi32 (a raw copy's flag is always the file default). */
+    if (!gdi_dllinit_fixme) return TRUE;
     FIXME( "stub\n" );
     return TRUE;
 }

@@ -392,7 +392,7 @@ final class DepotDownloader {
     }
 
     /// Whether a previous attempt left resumable progress for this app.
-    static func hasPartialDownload(appID: UInt32, steamApps: URL) -> Bool {
+    nonisolated static func hasPartialDownload(appID: UInt32, steamApps: URL) -> Bool {
         let dir = steamApps.appendingPathComponent("downloading/\(appID)", isDirectory: true)
         return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).contains { $0.hasSuffix(".journal") }
     }

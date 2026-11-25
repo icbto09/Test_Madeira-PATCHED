@@ -280,35 +280,35 @@ var canvasControl = TouchControl()
 editor.controls = [canvasControl]
 var canvasZone = GestureZone(); canvasZone.x = 0.4; canvasZone.w = 0.4
 editorZones.zones = [canvasZone]
-let area = editorCanvas(canvasScreen, top: 0)
+let area = editorCanvas(canvasScreen)
 require(!area.contains(CGPoint(x: 400, y: 200)), "a control overlapping a zone is excluded from canvas taps")
 require(!area.contains(CGPoint(x: 600, y: 300)), "zone taps stay with the zone editor")
 require(area.contains(CGPoint(x: 720, y: 380)), "empty space takes dismissal taps")
 EditorZones.enabled = false
-require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
+require(editorCanvas(canvasScreen).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
 EditorZones.enabled = true; editorZones.zones = []
-require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
+require(editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
 editor.controls[0].scale = 3
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
 editor.controls[0].action = .pad("RT"); editor.controls[0].scale = 1
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
 editor.controls = []; editor.selected = nil; editorZones.selected = nil
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 30)), "the top bar's taps never reach the dismissal")
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 10, y: 60)), "the top bar strip spans the screen")
-require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 80)), "below the top bar dismisses")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: 400, y: 30)), "the top bar's taps never reach the dismissal")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: 10, y: 60)), "the top bar strip spans the screen")
+require(editorCanvas(canvasScreen).contains(CGPoint(x: 400, y: 80)), "below the top bar dismisses")
 var panelControl = TouchControl(); panelControl.nx = 0.2; panelControl.ny = 0.2
 editor.controls = [panelControl]; editor.selected = panelControl.id
 let panelFrame = MappingPanel.frame(control: panelControl, screen: canvasScreen)
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "an open control panel's taps stay with the panel")
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.minX + 2, y: panelFrame.maxY - 2)), "the panel's corner stays with the panel")
-require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 790, y: 390)), "outside the panel still dismisses")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "an open control panel's taps stay with the panel")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.minX + 2, y: panelFrame.maxY - 2)), "the panel's corner stays with the panel")
+require(editorCanvas(canvasScreen).contains(CGPoint(x: 790, y: 390)), "outside the panel still dismisses")
 editor.selected = nil
-require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "a closed panel does not block dismissal")
+require(editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "a closed panel does not block dismissal")
 var panelZone = GestureZone(); panelZone.x = 0.0; panelZone.w = 0.2
 editorZones.zones = [panelZone]; editorZones.selected = panelZone.id
 let column = GestureZonePanel.column(zone: panelZone, screen: canvasScreen)
 require(column.minX > 400, "a zone on the left gets its panel on the right")
-require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: column.midX, y: 200)), "an open zone panel's taps stay with the panel")
+require(!editorCanvas(canvasScreen).contains(CGPoint(x: column.midX, y: 200)), "an open zone panel's taps stay with the panel")
 #endif
 '''
 tests = tests.replace('__EDITOR_SIZE_TESTS__', editor_tests)
@@ -328,8 +328,11 @@ for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_EDI
     assert f'.flag("{flag}")' in where, flag + ' is a kill switch'
 # Defaults an existing user would notice are opt-in: the built-in is never applied
 # automatically and player 1 is not reserved unless the switch is set to 1.
-for flag, where in (('MADEIRA_CONTROLS_XBOX_DEFAULT', presets), ('MADEIRA_PAD_EARLY_SLOT', gamepad)):
-    assert f'.optIn("{flag}")' in where and f'.flag("{flag}")' not in where, flag + ' is opt-in'
+assert '.optIn("MADEIRA_CONTROLS_XBOX_DEFAULT")' in presets and '.flag("MADEIRA_CONTROLS_XBOX_DEFAULT")' not in presets, 'MADEIRA_CONTROLS_XBOX_DEFAULT is opt-in'
+# early-pad-default (Nov 19): MADEIRA_PAD_EARLY_SLOT is ON by default for a pad that is already paired when the game starts;
+# env.MADEIRA_PAD_EARLY_SLOT = 0 turns it off. A game folder's value wins, then madeira.cfg, then the process environment.
+assert 'MadeiraConfig.gameValue("env.MADEIRA_PAD_EARLY_SLOT")' in gamepad and 'MadeiraConfig.get("env.MADEIRA_PAD_EARLY_SLOT")' in gamepad \
+    and 'environment["MADEIRA_PAD_EARLY_SLOT"]' in gamepad and 'env.MADEIRA_PAD_EARLY_SLOT = 0 turns this off' in gamepad, 'MADEIRA_PAD_EARLY_SLOT is default-on with a 0 off switch'
 assert '!= "0"' in function(gamepad, 'static func flag('), 'only "0" disables'
 assert '== "1"' in function(gamepad, 'static func optIn('), 'only "1" enables'
 assert 'Self.xboxDefault' in function(presets, 'var defaultPending: Bool {'), 'the automatic built-in needs the opt-in'
@@ -364,7 +367,7 @@ window = function(content, 'final class ControlsWindow: UIWindow {')
 assert window.index('if m.editing {') < window.index('!hit.isDescendant(of: root)') \
     < window.index('guard m.hitsInteractive('), 'menu and dialog presentations take their touches in play mode'
 reserve = function(gamepad, '@MainActor func reserveSessionSlot(touchControls: Bool) {')
-assert reserve.index('guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
+assert reserve.index('if setting == "0" { return }') < reserve.index('touchState.reserved = true')   # early-pad-default: 0 is the off switch
 run = function(content, 'private func runWineFullSequence(profile: LibraryEntry? = nil) {')
 assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('DispatchQueue.global'), 'reserved before Wine starts'
 

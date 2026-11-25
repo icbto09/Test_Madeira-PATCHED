@@ -91,6 +91,7 @@ static void initialize_providers( void )
 
     HidD_GetHidGuid( &guid );
 
+    i = 0;
     while (SetupDiEnumDeviceInterfaces( set, NULL, &guid, i++, &iface ))
     {
         detail->cbSize = sizeof(*detail);
@@ -127,8 +128,8 @@ static DWORD WINAPI monitor_thread_proc( void *param )
     RegisterClassExW( &wndclass );
     hwnd = CreateWindowExW( 0, wndclass.lpszClassName, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL );
     devnotify = RegisterDeviceNotificationW( hwnd, &filter, DEVICE_NOTIFY_ALL_INTERFACE_CLASSES );
-    initialize_providers();
     SetEvent( start_event );
+    initialize_providers();
 
     do
     {

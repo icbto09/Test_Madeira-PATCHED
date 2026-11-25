@@ -32,7 +32,7 @@ check('restartEntry = entry.id' in library and library.count('restartEntry = ') 
       'only holdForRestart sets the held game')
 check(content.count('library.holdForRestart(') == 2 and 'library.restartNotice = LibraryModel.restartMessage' not in content,
       'both held launches (library Play and Dock) go through holdForRestart')
-close = content[content.index('Button("Close Madeira") {\n                    LogStore.shared.log("[session-once] closed'):]
+close = content[content.index('Button("Close Madeira") {\n                        LogStore.shared.log("[session-once] closed'):]
 close = close[:close.index('exit(0)')]
 check('NextLibraryGame.set(id)' in close, 'Close Madeira keeps the held game before exit')
 check('library.restartNotice = nil; library.restartEntry = nil' in content, 'Later forgets the held game')

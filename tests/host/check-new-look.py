@@ -11,7 +11,7 @@ no focus.
 Source checks only (no Swift compiler here); the PC's typecheck and the build compile it.
 """
 from pathlib import Path
-import json, re, struct, sys
+import json, os, re, struct, sys
 
 root = Path(__file__).resolve().parents[2]
 app = root / 'app/Madeira'
@@ -46,7 +46,7 @@ check('LibrarySidebar' not in project and not (app / 'LibrarySidebar.swift').exi
 check('struct SettingsSplit' not in pages and 'SettingsSplit(' not in library, "and its iPad Settings split")
 
 # 2. One UI: no switch, no old look.
-app_swift = ''.join(f.read_text(encoding='utf-8') for f in sorted(app.glob('*.swift')) if f.name != 'ConfigCatalog.generated.swift')
+app_swift = ''.join(f.read_text(encoding='utf-8') for f in sorted(app.glob('*.swift')) if f.name not in ('ConfigCatalog.generated.swift', 'KillList.swift'))   # KillList.swift only lists MADEIRA_NEW_LOOK as a name no list may touch
 check('MADEIRA_NEW_LOOK"' not in app_swift and 'NewLook.enabled' not in app_swift and 'NewLook.allowed' not in app_swift
       and 'Toggle("New look"' not in app_swift, 'no New look switch anywhere (no toggle, no env.MADEIRA_NEW_LOOK)')
 check('var body: some View {\n        // Apple\'s tab bar with a page stack in every tab (newLookBody, below).\n        newLookBody\n' in library,
@@ -77,7 +77,9 @@ check('window.addGestureRecognizer(PadTouchWatch { PadHighlight.shared.hide() })
 check('GamepadEventClaim.install(on: window)' in pad, "iOS's own focus never gets the pad")
 pop = pad[pad.index('    func pop(_ name: String'):pad.index('    /// A tab became the root page')]
 check('layers.remove(at: i)' in pop and 'guard wasTop else {' in pop and 'returnTo' in pop
-      and "if let back, items[back]?.layer == top.name { move(to: back, scroll: true) }" in pop,
+      # (stock-apple, pad-pop-keep) the move back is skipped when the highlight is already on the new top layer.
+      and "let already = PadPopKeep.on && focus.flatMap { items[$0]?.layer } == top.name" in pop
+      and "if let back, items[back]?.layer == top.name, !already { move(to: back, scroll: true) }" in pop,
       'Back restores the highlight; closing a layer under another leaves the top one alone (unless its row is on top again)')
 
 # 4. Sheets trap focus and start on the safe choice.
@@ -137,7 +139,9 @@ check("ownsInput: open || model.startingScreen)" in library, 'closing the Sessio
 steamgames = (app / 'SteamGames.swift').read_text(encoding='utf-8')
 # 0045 (Cameron, Nov 9: "Switch to Apple's own tab bar"): a page stack per tab.
 check('TabView(selection: lookSelection)' in library and library.count('NavigationStack(path: $') >= 5
-      and library.count('.navigationDestination(for: NewLookRoute.self) { lookRoute($0) }') == 5,
+      # stock-apple-stage3: the Stores tab's stack has two first pages (the Store list, or the
+      # store pages with env.MADEIRA_STORE_LIST = 0), each with the same destinations: 6.
+      and library.count('.navigationDestination(for: NewLookRoute.self) { lookRoute($0) }') == 6,
       "Apple's tab bar: every tab has its own page stack")
 check('Tab(value: NewLookTab.search, role: .search)' in library, "iOS 18: Search is the system's search tab")
 check('ContentNavigation(stack: !(library.enabled && library.current == nil))' in (app / 'ContentView.swift').read_text(encoding='utf-8'),
@@ -155,7 +159,8 @@ check('if new == lookTab { lookReselect(new) } else { lookTab = new }' in librar
 for store, section in [('steam', 'SteamGamesSection('), ('epic', 'EpicGamesSection('), ('gog', 'GOGGamesSection('),
                        ('itch', 'ItchGamesSection('), ('ea', 'EAGamesSection(')]:
     check(f'case .{store}: {section}' in look, f'the {store} page is the store\'s own section')
-check('.padLayer("store", back: { dismiss() }, page: true)' in look and '"sp-back"' not in look,
+check('FluxPageLayer(name: "store", embedded: embedded, back: { dismiss() })' in look and '"sp-back"' not in look
+      and 'content.padLayer(name, back: back, page: true)' in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'app/Madeira/FluxScreens.swift')).read(),
       "B on a store's page goes back a page (the system Back button; no home-made one)")
 check('static var collapsible: Bool { false }' in steamgames, "a store's page never hides its games under a folded title")
 check('if let pad, PadHighlight.enabled { buttonStyle(PadCardStyle(id: pad, grid: grid)) }' in library
@@ -194,16 +199,17 @@ check('.modifier(NewLookOverlays())' in library, "the icon's Photos and Files pi
 # 6c. Stage 3: Settings and Search.
 pages_src = pages
 check('NewLookSettingsList(top: lookTop[.settings, default: 0], enableJIT: enableJIT,\n'
-      '                                        open: { settingsPath.append(NewLookRoute.settings($0)) })' in library,
+      '                                            open: { settingsPath.append(NewLookRoute.settings($0)) })' in library
+      and 'FluxSettingsRoot(title: item.title, top: lookTop[.settings, default: 0], enableJIT: enableJIT,' in library,
       "the Settings tab is Apple's grouped list of pages")
 check('SettingsPagesList(startDock: startDock).scrollContentBackground(.hidden)' not in library, 'the old Settings list is gone from the new look')
 check('case .settings(let page):\n            SettingsPageView(page: page, startDock: startDock)' in library,
       'a Settings page is the same page as before, pushed inside its tab (the tab bar stays)')
-check('.modifier(NewLookSettingsChrome())' in pages_src and '.padLayer("settings-page", back: { dismiss() }, page: true)' in look,
+check('.modifier(NewLookSettingsChrome(embedded: embedded))' in pages_src and 'FluxPageLayer(name: "settings-page", embedded: embedded, back: { dismiss() })' in look,
       'a Settings page: B goes back')
 check('NewLookLinkRow(id: "set-" + page.key, title: L(page.title), action: { open(page) }) {\n'
       '                                NewLookBadge(symbol: page.symbol, color: page.color)' in look
-      and '.padItem(id, cornerRadius: 12, inset: -6, press: action)' in look,
+      and '.padItem(id, cornerRadius: 12, inset: -6, opens: true, press: action)' in look,   # pad-pages: D-pad right opens the page
       "Settings rows: the page's coloured icon, a chevron, and the highlight")
 check("let banner = picked.isEmpty ? all.first.flatMap { $0.played != nil ? $0 : nil } : nil" in look
       and "grid(banner.map { top in games.filter { $0.id != top.id } } ?? games)" in look,
@@ -267,12 +273,15 @@ check('if let back = top.back { back() } else if layers.count == 1 { rootBack?()
 check('.scrollDismissesKeyboard(.immediately)' in look, 'Search: a drag puts the keyboard away')
 check('.searchable(text: $lookSearch, placement: .navigationBarDrawer(displayMode: .always)' in library and 'content.searchFocused(field)' in look and '"search-field"' in look,
       "Search: Apple's own field; the controller puts the keyboard up from a button")
-check('ContentUnavailableView.search(text: query)' in look and look.count('ContentUnavailableView {') == 2 and 'NewLookTypeButton' not in look,
+# stock-apple-stage3: the Store list has its own empty screen too ("No games yet"): 3.
+check('ContentUnavailableView.search(text: query)' in look and look.count('ContentUnavailableView {') == 3 and 'NewLookTypeButton' not in look,
       "Apple's empty screens: no results, nothing downloading, nothing installed")
 check('.navigationBarTitleDisplayMode(.large)' in library[library.index('struct NewLookTabRoot'):],
       "every tab: Apple's large title")
 check('guard pressed.0 == id, last.visible else { return }' in pad and 'if owner == nil || items[id]?.owner == owner' in pad
-      and 'PadHighlight.shared.pop(name, token: token)' in pad,
+      # (stock-apple-stage2) A page's layer leaves through leave(), which pops it unless a page over it covers it.
+      and ('PadHighlight.shared.pop(name, token: token)' in pad
+           or ('PadHighlight.shared.leave(name, token: token)' in pad and 'pop(name, token: token)' in pad)),
       "a hidden tab's items and pages never take the controller from the open tab")
 check('if command == "accept" || command == "menu", onGhost {' in pad and 'UIScreen.main' not in pad.replace('?? UIScreen.main.bounds.size', ''),
       'A on an item that is gone puts the highlight somewhere real first; the window, not the screen, is measured')
@@ -317,7 +326,10 @@ check('NewLook.coverWidth(coverWidth * Double(pinch ?? 1), wide: wide)' in look 
 check('if pinch == nil, Date().timeIntervalSince(pinchEnded) > 0.4 { open(game.entry) }' in look, 'a pinch never opens the cover under it')
 check('func detail(_ row: Row) -> String?' in look and 'L("about %@ left")' in look and 'downloads.detail(row)' in look,
       'Downloads: "1.2 GB of 13 GB · about 5 min left"')
-check('Capsule().strokeBorder(Color.accentColor, lineWidth: 3)' in pad and 'NewLookColor' not in pad + look + library,
+# (stock-apple) The ring's color is StockApple.ring: the label color with the switch on, the accent color with it off.
+check('Capsule().strokeBorder(StockApple.ring, lineWidth: 3)' in pad
+      and 'static var ring: Color { on ? Color.primary : Color.accentColor }' in pad
+      and 'NewLookColor' not in pad + look + library,
       'a capsule item\'s highlight is a capsule, in the app\'s accent color (no colors of our own)')
 check('if let back, items[back] == nil { move(to: back, scroll: false); pending = back; return }' in pad
       and 'if id == pending { pending = nil;' in pad and 'register(id, .init(frame: last.frame,' in pad,
@@ -380,7 +392,7 @@ check('func isPaused(_ row: Row) -> Bool { flipped[row.id] ?? row.paused }' in l
 # 0053: Test 6 controller (LB/RB stuck over a pushed page; one stick push moved 2-3 rows).
 check('private var onTabPage: Bool { layers.dropFirst().allSatisfy(\\.page) }' in pad
       and 'if onTabPage { tabs?(command == "next" ? 1 : -1) }' in pad and 'if onTabPage { search?() }' in pad
-      and '.padLayer("store", back: { dismiss() }, page: true)' in look and '.padLayer("settings-page", back: { dismiss() }, page: true)' in look
+      and 'FluxPageLayer(name: "store", embedded: embedded, back: { dismiss() })' in look and 'FluxPageLayer(name: "settings-page", embedded: embedded, back: { dismiss() })' in look
       and '.padLayer("game", start: lookReturn ?? "gp-play", back: { lookBack() }, play: { start() }, page: true)' in library
       and '.padLayer("popup", back: close)' in look and 'page: true' not in look[look.index('struct NewLookPopupLayer'):look.index('// MARK: - Library')],
       'LB/RB and Y change tabs over a page pushed in a tab, never under a popup')

@@ -109,6 +109,80 @@ static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR 
 }
 
 
+/* [pc-header-dyntable-1] Madeira: is [addr, addr+size) committed and readable? */
+static BOOL madeira_dyn_readable( const void *addr, SIZE_T size )
+{
+    const char *p = addr, *end = (const char *)addr + size;
+
+    while (p < end)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+
+        if (NtQueryVirtualMemory( NtCurrentProcess(), p, MemoryBasicInformation, &mbi, sizeof(mbi), NULL ))
+            return FALSE;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mbi.Protect)
+            return FALSE;
+        p = (const char *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return TRUE;
+}
+
+/* [pc-header-dyntable-1] Madeira: size of the PE image whose headers sit at base, 0 if base holds none.
+ * Headers are checked for readability first, and read under a page-fault guard. */
+static ULONG_PTR madeira_dyn_image_size( ULONG_PTR base )
+{
+    ULONG_PTR ret = 0;
+
+    if (!base || !madeira_dyn_readable( (const void *)base, sizeof(IMAGE_DOS_HEADER) )) return 0;
+    __TRY
+    {
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 && dos->e_lfanew <= 0x10000 &&
+            madeira_dyn_readable( nt, sizeof(*nt) ) &&
+            nt->Signature == IMAGE_NT_SIGNATURE && nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR_MAGIC &&
+            nt->OptionalHeader.SizeOfImage && nt->OptionalHeader.SizeOfImage <= 0x80000000u)
+            ret = nt->OptionalHeader.SizeOfImage;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        ret = 0;
+    }
+    __ENDTRY
+    return ret;
+}
+
+/***********************************************************************
+ *              madeira_dyntable_image_base
+ *
+ * [pc-header-dyntable-1] Madeira: the base of a dynamic function table (RtlAddFunctionTable,
+ * RtlAddGrowableFunctionTable, RtlInstallFunctionTableCallback) whose base holds a PE image
+ * (headers at the base) that covers pc. Used by
+ * RtlPcToFileHeader for images a program maps itself (they are not on the loader list), so C++
+ * throw/catch can find a ThrowInfo in that image's .rdata. 0 if no table covers pc.
+ */
+ULONG_PTR madeira_dyntable_image_base( ULONG_PTR pc )
+{
+    struct dynamic_unwind_entry *entry;
+    ULONG_PTR ret = 0;
+
+    RtlEnterCriticalSection( &dynamic_unwind_section );
+    LIST_FOR_EACH_ENTRY( entry, &dynamic_unwind_list, struct dynamic_unwind_entry, entry )
+    {
+        ULONG_PTR size;
+
+        /* only tables whose base holds a PE image: JIT tables (V8, .NET) have none, and
+         * Windows returns NULL for them, so they keep doing so */
+        if (pc < entry->base) continue;
+        if (!(size = madeira_dyn_image_size( entry->base ))) continue;
+        if (pc - entry->base < size) { ret = entry->base; break; }
+    }
+    RtlLeaveCriticalSection( &dynamic_unwind_section );
+    return ret;
+}
+
+
 /**********************************************************************
  *              RtlInstallFunctionTableCallback   (NTDLL.@)
  */
@@ -407,16 +481,16 @@ static void restore_any_reg( int reg, int count, int type, int pos, ARM64_NT_CON
 
 static void do_pac_auth( ARM64_NT_CONTEXT *context )
 {
-    register DWORD64 x17 __asm__( "x17" ) = context->Lr;
-    register DWORD64 x16 __asm__( "x16" ) = context->Sp;
+    register DWORD64 x30 __asm__( "x30" ) = context->Lr;
 
-    /* This is the autib1716 instruction. The hint instruction is used here
-     * as gcc does not assemble autib1716 for pre armv8.3a targets. For
-     * pre-armv8.3a targets, this is just treated as a hint instruction, which
-     * is ignored. */
-    __asm__( "hint 0xe" : "+r"(x17) : "r"(x16) );
+    /* This is the xpaclri instruction. Assemble it through the hint
+     * instruction to make sure it builds with any toolchain, even if it
+     * doesn't support pointer authentication instructions, or if it might not
+     * know to emit them as hint instructions when targeting older versions
+     * than armv8.3. */
+    __asm__( "hint 0x7" : "+r"(x30) );
 
-    context->Lr = x17;
+    context->Lr = x30;
 }
 
 static void process_unwind_codes( BYTE *ptr, BYTE *end, ARM64_NT_CONTEXT *context,
@@ -821,25 +895,46 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
                                    PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
 {
     BOOLEAN final_pc_from_lr = TRUE;
+    PEXCEPTION_ROUTINE handler;
+    void *data = NULL;
+
     TRACE( "type %lx base %I64x pc %I64x rva %I64x sp %I64x\n", type, base, pc, pc - base, context->Sp );
     if (limit_low || limit_high) FIXME( "limits not supported\n" );
 
     if (!func && pc == context->Lr) return STATUS_BAD_FUNCTION_TABLE;  /* invalid leaf function */
 
-    *handler_data = NULL;
     context->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
 
     if (!func)  /* leaf function */
-        *handler_ret = NULL;
-    else if (func->Flag)
-        *handler_ret = unwind_packed_data( base, pc, func, context, ctx_ptr );
-    else
-        *handler_ret = unwind_full_data( base, pc, func, context, handler_data, ctx_ptr, &final_pc_from_lr );
+    {
+        context->Pc = context->Lr;
+        *frame_ret = context->Sp;
+        if (handler_ret) *handler_ret = NULL;
+        *handler_data = NULL;
+        return STATUS_SUCCESS;
+    }
 
-    if (final_pc_from_lr) context->Pc = context->Lr;
+    __TRY
+    {
+        if (func->Flag)
+            handler = unwind_packed_data( base, pc, func, context, ctx_ptr );
+        else
+            handler = unwind_full_data( base, pc, func, context, &data, ctx_ptr, &final_pc_from_lr );
 
-    TRACE( "ret: pc=%I64x lr=%I64x sp=%I64x handler=%p\n", context->Pc, context->Lr, context->Sp, *handler_ret );
-    *frame_ret = context->Sp;
+        if (final_pc_from_lr) context->Pc = context->Lr;
+        *frame_ret = context->Sp;
+
+        if (handler_ret) *handler_ret = handler;
+        *handler_data = data;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        WARN( "Access violation.\n" );
+        return STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+
+    TRACE( "ret: pc=%I64x lr=%I64x sp=%I64x handler=%p\n", context->Pc, context->Lr, context->Sp, handler );
     return STATUS_SUCCESS;
 }
 
@@ -2056,6 +2151,55 @@ static RUNTIME_FUNCTION *find_function_info( ULONG_PTR pc, ULONG_PTR base,
 }
 
 
+#ifdef __arm64ec__
+/* madeira [crashmailer-dump] (signal_arm64ec.c): unwinds the game makes from, or right after, an exception
+ * handler, with a check of the nonvolatile registers they restore. Log only. */
+extern int ios_cmd_unwind_pre( ULONG kind, ULONG_PTR base, ULONG_PTR pc, const CONTEXT *context );
+extern void ios_cmd_unwind_post( int tok, const CONTEXT *context, NTSTATUS status, const KNONVOLATILE_CONTEXT_POINTERS *ptrs,
+                                 ULONG_PTR target, ULONG_PTR frame );
+static NTSTATUS WINAPI rtl_virtual_unwind2_x64( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                                RUNTIME_FUNCTION *function, CONTEXT *context,
+                                                BOOLEAN *mach_frame_unwound, void **data,
+                                                ULONG_PTR *frame_ret, KNONVOLATILE_CONTEXT_POINTERS *ctx_ptr,
+                                                ULONG_PTR *limit_low, ULONG_PTR *limit_high,
+                                                PEXCEPTION_ROUTINE *handler_ret, ULONG flags );
+
+/**********************************************************************
+ *              RtlVirtualUnwind2   (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                   RUNTIME_FUNCTION *function, CONTEXT *context,
+                                   BOOLEAN *mach_frame_unwound, void **data,
+                                   ULONG_PTR *frame_ret, KNONVOLATILE_CONTEXT_POINTERS *ctx_ptr,
+                                   ULONG_PTR *limit_low, ULONG_PTR *limit_high,
+                                   PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
+{
+    KNONVOLATILE_CONTEXT_POINTERS ptrs;
+    NTSTATUS status;
+    unsigned int i;
+    int tok = ios_cmd_unwind_pre( 1, base, pc, context );
+
+    if (tok < 0) return rtl_virtual_unwind2_x64( type, base, pc, function, context, mach_frame_unwound, data,
+                                                 frame_ret, ctx_ptr, limit_low, limit_high, handler_ret, flags );
+    /* our own pointer block, so the check also runs when the caller passes none; the caller's gets the
+     * entries the unwind filled, as it would have */
+    memset( &ptrs, 0, sizeof(ptrs) );
+    status = rtl_virtual_unwind2_x64( type, base, pc, function, context, mach_frame_unwound, data,
+                                      frame_ret, &ptrs, limit_low, limit_high, handler_ret, flags );
+    if (ctx_ptr)
+    {
+        for (i = 0; i < 16; i++)
+        {
+            if (ptrs.IntegerContext[i]) ctx_ptr->IntegerContext[i] = ptrs.IntegerContext[i];
+            if (ptrs.FloatingContext[i]) ctx_ptr->FloatingContext[i] = ptrs.FloatingContext[i];
+        }
+    }
+    ios_cmd_unwind_post( tok, context, status, &ptrs, 0, frame_ret ? *frame_ret : 0 );
+    return status;
+}
+#define RtlVirtualUnwind2 rtl_virtual_unwind2_x64
+#endif
+
 /**********************************************************************
  *              RtlVirtualUnwind2   (NTDLL.@)
  */
@@ -2096,11 +2240,11 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
         ARM64_NT_CONTEXT arm_context;
         NTSTATUS status;
 
-        context_x64_to_arm( &arm_context, (ARM64EC_NT_CONTEXT *)context );
+        if ((status = context_x64_to_arm( &arm_context, (ARM64EC_NT_CONTEXT *)context ))) return status;
         status = RtlVirtualUnwind2_arm64( type, base, pc, (ARM64_RUNTIME_FUNCTION *)function,
                                           &arm_context, NULL, data, frame_ret, NULL,
                                           limit_low, limit_high, handler_ret, flags );
-        context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_context );
+        context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_context, context->ContextFlags );
         context->ContextFlags = flags | (arm_context.ContextFlags & CONTEXT_UNWOUND_TO_CALL);
         return status;
     }
@@ -2175,8 +2319,8 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
         }
         context->Rip = *(ULONG64 *)context->Rsp;
         context->Rsp += sizeof(ULONG64);
-        *data = NULL;
-        *handler_ret = NULL;
+        if (type) *data = NULL;
+        if (handler_ret) *handler_ret = NULL;
         return STATUS_SUCCESS;
     }
 
@@ -2211,7 +2355,7 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
                 TRACE("inside epilog.\n");
                 interpret_epilog( (BYTE *)pc, context, ctx_ptr );
                 *frame_ret = info->frame_reg ? context->Rsp - 8 : frame;
-                *handler_ret = NULL;
+                if (handler_ret) *handler_ret = NULL;
                 return STATUS_SUCCESS;
             }
         }
@@ -2292,15 +2436,18 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
         context->Rsp += sizeof(ULONG64);
     }
 
-    *handler_ret = NULL;
+    if (handler_ret) *handler_ret = NULL;
 
     if (!(info->flags & type)) return STATUS_SUCCESS;  /* no matching handler */
     if (prolog_offset != ~0) return STATUS_SUCCESS;  /* inside prolog */
 
-    *handler_ret = (PEXCEPTION_ROUTINE)((char *)base + handler_data->handler);
+    if (handler_ret) *handler_ret = (PEXCEPTION_ROUTINE)((char *)base + handler_data->handler);
     *data = &handler_data->handler + 1;
     return STATUS_SUCCESS;
 }
+#ifdef __arm64ec__
+#undef RtlVirtualUnwind2   /* madeira [crashmailer-dump]: RtlVirtualUnwind goes through the wrapper above */
+#endif
 
 
 /**********************************************************************

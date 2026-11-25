@@ -49,7 +49,7 @@ enum LoopbackProbe {
         var isLocalDevVPN: Bool { isVPN && address.hasPrefix("10.7.") }
     }
 
-    private static func target() -> sockaddr_in? {
+    private static func target(port: UInt16 = LoopbackProbe.port) -> sockaddr_in? {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -100,8 +100,9 @@ enum LoopbackProbe {
     }
 
     /// Blocks for at most `timeout`; use `check(timeout:completion:)` from the main thread.
-    /// `requireVPN` is false only for host tests, whose listeners are on lo0.
-    static func check(timeout: TimeInterval = 0.4, requireVPN: Bool = true) -> Result {
+    /// `requireVPN` is false only for host tests, whose listeners are on lo0. `port` is lockdownd's
+    /// (62078) unless a caller asks about another port on the same address (the JIT port, 49152).
+    static func check(timeout: TimeInterval = 0.4, requireVPN: Bool = true, port: UInt16 = LoopbackProbe.port) -> Result {
         let start = CFAbsoluteTimeGetCurrent()
         func done(_ ok: Bool, _ detail: String) -> Result {
             Result(reachable: ok, milliseconds: (CFAbsoluteTimeGetCurrent() - start) * 1000, detail: detail)
@@ -111,7 +112,7 @@ enum LoopbackProbe {
         if requireVPN, !route.isLocalDevVPN {
             return done(false, "routed via \(route.interface) \(route.address): another VPN, not LocalDevVPN")
         }
-        guard var addr = target() else { return done(false, "bad address") }
+        guard var addr = target(port: port) else { return done(false, "bad address") }
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return done(false, "socket: \(String(cString: strerror(errno)))") }
         defer { close(fd) }
@@ -211,6 +212,17 @@ enum JITShortcutFile {
     }
 
     enum Outcome { case done(String), failed(String) }
+
+    /// quiet-false-errors: what Enable JIT says when the shortcut stopped. "Shortcuts could
+    /// not be opened" (GET-HELP-LOGS-1D4) means the Shortcuts app itself would not open,
+    /// so "check its steps" was no help: name the two ways out instead.
+    /// env.MADEIRA_QUIET_FALSE_ERRORS = 0 keeps the old wording.
+    static func stoppedMessage(_ why: String) -> String {
+        if StikJITHelper.quietFalseErrors, why == "Shortcuts could not be opened" {
+            return "Madeira couldn't open the Shortcuts app. Install Shortcuts from the App Store, or turn off \(name) shortcut in Settings › JIT and connect LocalDevVPN yourself."
+        }
+        return "Your \(name) shortcut stopped: \(why) Check its steps in Shortcuts, then try again."
+    }
 
     /// Cellular data is carrying traffic and there is no Wi-Fi: the case LocalDevVPN's
     /// loopback cannot work in. From the system's network path, kept current.

@@ -21,6 +21,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <stddef.h>
 #include <utility>
@@ -251,6 +252,25 @@ public:
     return false;
   }
 
+  // MADEIRA fex-moffs-marker: on unless MADEIRA_FEX_MOFFS_MARK=0. Read once per process.
+  static bool MoffsMarkerEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = getenv("MADEIRA_FEX_MOFFS_MARK");
+      return !(Env && Env[0] == '0' && Env[1] == '\0');
+    }();
+    return Enabled;
+  }
+
+  // MADEIRA multiblock-fault-rip: on unless MADEIRA_FEX_MB_FAULT_RIP=0. Read once per process; the JIT side
+  // (JIT.cpp, IosMbFaultRipEnabled) reads the same variable and logs the rev line.
+  static bool MbFaultRipMarkEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = getenv("MADEIRA_FEX_MB_FAULT_RIP");
+      return !(Env && Env[0] == '0' && Env[1] == '\0');
+    }();
+    return Enabled;
+  }
+
   static bool CanHaveSideEffects(const FEXCore::X86Tables::X86InstInfo* TableInfo, FEXCore::X86Tables::DecodedOp Op) {
     if (TableInfo) {
       if (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) {
@@ -261,6 +281,24 @@ public:
 
       if (TableInfo->Flags & (X86Tables::InstFlags::FLAGS_SETS_RIP | X86Tables::InstFlags::FLAGS_BLOCK_END)) {
         // Cooperative suspend interrupts can be triggered at any back-edge, the RIP must be reconstructed correctly in such cases
+        return true;
+      }
+
+      // MADEIRA fex-moffs-marker: MOV between AL/AX/EAX/RAX and an absolute address (A0-A3) reaches
+      // memory through its literal operand, which the operand test below does not count, so it got
+      // no guest-opcode marker. A fault on it (a self-modifying-code write trap on a page FEX has
+      // translated code from, a guard page, a write watch) then resumed at the previous marked
+      // instruction and ran the unmarked ones in between a second time. 32-bit code uses this form
+      // for every global it reads or writes. Idea from MetalSharp Wine's FEX patch 0036 (read only,
+      // not copied). MADEIRA_FEX_MOFFS_MARK=0 restores the old behaviour.
+      if ((TableInfo->Flags & X86Tables::InstFlags::FLAGS_MEM_OFFSET) && MoffsMarkerEnabled()) {
+        return true;
+      }
+
+      // MADEIRA multiblock-fault-rip: PUSHF (9C) stores to [rsp-8] but has no operand and, unlike PUSH, POP,
+      // PUSH FS and the others with an implicit stack access, no FLAGS_DEBUG_MEM_ACCESS, so it got no marker:
+      // a stack fault on it was reported at, and resumed from, the previous marked instruction.
+      if (TableInfo == &X86Tables::BaseOps[0x9C] && MbFaultRipMarkEnabled()) {
         return true;
       }
     }
@@ -329,12 +367,6 @@ public:
   }
   bool HasHandledLock() const {
     return HandledLock;
-  }
-
-  // madeira kuser-remap: Core.cpp sets this per guest instruction (IosKuserWantsInsn); the
-  // window itself (IosKu, private below) is filled in BeginFunction.
-  void SetIosKuserInsn(bool Want) {
-    IosKu.On = Want && IosKu.Known;
   }
 
   void SetForceTSO(ForceTSOMode Mode) {
@@ -722,6 +754,19 @@ public:
   void VZEROOp(OpcodeArgs);
 
   // X87 Ops
+  // madeira [x87-flags] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0006 (MIT)
+  // env MADEIRA_FEX_X87_FLAGS = 0 turns it off; on by default. With it on, the x87 exception flags DE..ES (FSW bits
+  // 1-7) survive FLDENV/FRSTOR/FXRSTOR and FNSTSW/FSTENV/FSAVE/FXSAVE, and FNCLEX/FNINIT clear them; before, only IE did.
+  // Affects code generation: read once per process.
+  static bool MadeiraX87Flags() {
+    static const bool On = [] {
+      const char* E = getenv("MADEIRA_FEX_X87_FLAGS");
+      const bool V = !(E && E[0] == '0' && E[1] == '\0');
+      LogMan::Msg::EFmt("[x87-flags] rev=x87-flags-1 {}", V ? "on" : "off (MADEIRA_FEX_X87_FLAGS=0)");
+      return V;
+    }();
+    return On;
+  }
   Ref ReconstructFSW_Helper(Ref T = nullptr);
   // Returns new x87 stack top from FSW.
   Ref ReconstructX87StateFromFSW_Helper(Ref FSW);
@@ -792,6 +837,8 @@ public:
   void FSUBF64(OpcodeArgs, IR::OpSize Width, bool Integer, bool Reverse, OpResult ResInST0);
   void FTSTF64(OpcodeArgs);
   void X87FLDCWF64(OpcodeArgs);
+  // iOS-Madeira-GTM: FCW.PC = single precision (24 bits) in reduced-precision (F64) mode
+  void X87PrecisionControlF64(uint8_t StackLoc);
   void X87FXTRACTF64(OpcodeArgs);
   void X87LDENVF64(OpcodeArgs);
 
@@ -1339,7 +1386,7 @@ protected:
       /* On ASIMD platforms, the emulation happens to preserve NZCV, unlike the
        * more optimal SVE implementation that clobbers.
        */
-      if (!CTX->HostFeatures.SupportsSVE128 && !CTX->HostFeatures.SupportsSVE256) {
+      if (!CTX->HostFeatures.SupportsSVE()) {
         return;
       }
 
@@ -1686,7 +1733,7 @@ private:
   }
 
   constexpr OpSize GetGuestVectorLength() const {
-    return (CTX->HostFeatures.SupportsSVE256 && CTX->HostFeatures.SupportsAVX) ? OpSize::i256Bit : OpSize::i128Bit;
+    return (CTX->HostFeatures.SupportsSVE256() && CTX->HostFeatures.SupportsAVX()) ? OpSize::i256Bit : OpSize::i128Bit;
   }
 
   [[nodiscard]]
@@ -1932,6 +1979,40 @@ private:
   }
 
   void ZeroPF_AF();
+
+  // madeira [intel-flags] (env MADEIRA_FEX_INTEL_FLAGS = 1 turns it on; off by default).
+  // Ported, with credit, from BOR1NG's (Avery Felts, https://github.com/aaf2tbz) MetalSharp-Wine FEX patch 0031
+  // "FEXCore: Match x86 results for flags left undefined by the ISA", https://github.com/metalsharp/MetalSharp-Wine
+  // (AGPL-3.0; a build carrying this must post its source). Where x86 leaves a flag undefined, Intel hardware and
+  // Rosetta 2 still leave it in a fixed state, and protected code that hashes pushfq results depends on that.
+  // Read once per process.
+  static bool MadeiraIntelFlags() {
+    static const bool On = [] {
+      const char* E = getenv("MADEIRA_FEX_INTEL_FLAGS");
+      return E && E[0] == '1' && E[1] == '\0';
+    }();
+    return On;
+  }
+
+  // [intel-flags] AF where x86 leaves it undefined: cleared, as on Intel hardware. AF reads as AF[4] ^ PF[4],
+  // so copying PF's raw value zeroes it. Call after PF is set. With the switch off: undefined, as before.
+  void ZeroAF() {
+    if (MadeiraIntelFlags()) {
+      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(GetRFLAG(FEXCore::X86State::RFLAG_PF_RAW_LOC));
+    } else {
+      InvalidateAF();
+    }
+  }
+
+  // [intel-flags] PF and AF where x86 leaves them undefined: PF of Value and a clear AF, as on Intel hardware.
+  void UndefPF_ZeroAF(Ref Value) {
+    if (MadeiraIntelFlags()) {
+      CalculatePF(Value);
+      ZeroAF();
+    } else {
+      InvalidatePF_AF();
+    }
+  }
 
   void InvalidateAF() {
     _InvalidateFlags((1u << X86State::RFLAG_AF_RAW_LOC));
@@ -2208,8 +2289,29 @@ private:
     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);
   }
 
+  // madeira [df-ctx] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0004 (MIT)
+  // env MADEIRA_EC_DF_CTX = 0 turns it off (here and in xtajit64/ntdll, where it is logged); on by default.
+  // Affects code generation: read once per process.
+  static bool MadeiraDfCtx() {
+    static const bool On = [] {
+      const char* E = getenv("MADEIRA_EC_DF_CTX");
+      return !(E && E[0] == '0' && E[1] == '\0');
+    }();
+    return On;
+  }
+
   void StoreDF(Ref Value) {
+    if (!MadeiraDfCtx()) {
+      StoreContext(DFIndex, Value);
+      return;
+    }
+    // madeira [df-ctx]: write DF through immediately. Cached context values are only flushed at block exits, so a
+    // fault later in the block (e.g. std; movs to a bad address) would otherwise see, report in its exception
+    // context and resume with a stale direction flag. STD/CLD/POPF are rare, the store is cheap. Still cached for
+    // the LoadDF()s that follow, but not left Written, so FlushRegisterCache doesn't store it again.
+    _StoreContextGPR(OpSize::i8Bit, Value, offsetof(Core::CPUState, flags[X86State::RFLAG_DF_RAW_LOC]));
     StoreContext(DFIndex, Value);
+    RegCache.Written &= ~(1ull << DFIndex);
   }
 
   Ref GetRFLAG(unsigned BitOffset, bool Invert = false) {
@@ -2358,8 +2460,27 @@ private:
 
     auto OldPF = GetRFLAG(X86State::RFLAG_PF_RAW_LOC);
 
+    if (!MadeiraIntelFlags()) {
+      HandleNZCV_RMW();
+      CalculatePF(_ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted));
+      StoreResultGPR(Op, Result);
+      return;
+    }
+
+    // madeira [intel-flags] (BOR1NG, MetalSharp FEX 0031): AF is cleared as on Intel unless the masked count is
+    // zero, which leaves every flag alone. Without a compare, as NZCV is live: bit 4 of (count + 63) >> 2 is set
+    // exactly when count (<= 63) is nonzero, and AF reads as AF[4] ^ PF[4], so AF = OldAF ^ ((OldAF ^ NewPF) & that).
+    auto OldAF = GetRFLAG(X86State::RFLAG_AF_RAW_LOC);
     HandleNZCV_RMW();
-    CalculatePF(_ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted));
+    auto NewPF = _ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, OldPF, CFInverted);
+    CalculatePF(NewPF);
+    {
+      const auto Size = OpSizeFromSrc(Op);
+      auto Count = _And(OpSize::i32Bit, Src, Constant(Size == OpSize::i64Bit ? 0x3f : 0x1f));
+      auto NonZero4 = _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Add(OpSize::i32Bit, Count, 63), Constant(2)), Constant(0x10));
+      auto Diff = _Xor(OpSize::i64Bit, OldAF, NewPF);
+      SetRFLAG<X86State::RFLAG_AF_RAW_LOC>(_Xor(OpSize::i64Bit, OldAF, _And(OpSize::i64Bit, Diff, NonZero4)));
+    }
     StoreResultGPR(Op, Result);
   }
 
@@ -2602,36 +2723,20 @@ private:
     bool On {false};
     uint64_t Low {0}, Size {0}, Delta {0};
   } IosXl;
-  /* madeira kuser-remap: the KUSER_SHARED_DATA window (0x7ffe0000), applied to the LOADS of
-   * guest instructions FEX has learned read it (IosKuserWantsInsn, set per instruction from
-   * Core.cpp). Window known = Known; this instruction wants it = On. Never stores. */
-  struct {
-    bool Known {false};
-    bool On {false};
-    uint64_t Low {0}, Size {0}, Delta {0};
-  } IosKu;
-  Ref IosWindow(Ref EA, uint64_t Low, uint64_t Size, uint64_t Delta) {
-    Ref T = Sub(OpSize::i64Bit, EA, Constant(Low));                // >= 2^63 when EA < Low
-    Ref U = Sub(OpSize::i64Bit, T, Constant(Size));                // top bit set when T < Size (or T huge)
-    Ref M = _Andn(OpSize::i64Bit, U, T);                           // U & ~T: top bit set only for 0 <= T < Size
-    Ref S = _Ashr(OpSize::i64Bit, M, Constant(63));                // all ones inside the window, else zero
-    Ref D = _And(OpSize::i64Bit, S, Constant(Delta));
-    return Add(OpSize::i64Bit, EA, D);
-  }
-  // Stores: the sub-floor image window only.
   Ref IosXlate(Ref EA) {
     if (!IosXl.On) return EA;
-    return IosWindow(EA, IosXl.Low, IosXl.Size, IosXl.Delta);
+    Ref T = Sub(OpSize::i64Bit, EA, Constant(IosXl.Low));          // >= 2^63 when EA < Low
+    Ref U = Sub(OpSize::i64Bit, T, Constant(IosXl.Size));          // top bit set when T < Size (or T huge)
+    Ref M = _Andn(OpSize::i64Bit, U, T);                           // U & ~T: top bit set only for 0 <= T < Size
+    Ref S = _Ashr(OpSize::i64Bit, M, Constant(63));                // all ones inside the window, else zero
+    Ref D = _And(OpSize::i64Bit, S, Constant(IosXl.Delta));
+    return Add(OpSize::i64Bit, EA, D);
   }
-  // Loads: the image window, then the KUSER window for a learned instruction.
-  Ref IosXlateLoad(Ref EA) {
-    EA = IosXlate(EA);
-    if (IosKu.On) EA = IosWindow(EA, IosKu.Low, IosKu.Size, IosKu.Delta);
-    return EA;
-  }
-  bool IosXlateLoadOn() const {
-    return IosXl.On || IosKu.On;
-  }
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+  // madeira [kuser-rebase]: a load from a constant address inside KUSER_SHARED_DATA (0x7ffe0000) goes to
+  // the page's real, relocated address. Definition and credit in OpcodeDispatcher.cpp.
+  void IosKuserRebase(AddressMode& A, IR::OpSize Size);
+#endif
   IROp_IRHeader* CurrentHeader {};
 
   [[nodiscard]]
@@ -2663,7 +2768,7 @@ private:
   }
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, Ref ssa0, OpSize Align = OpSize::i8Bit) {
-    ssa0 = IosXlateLoad(ssa0);
+    ssa0 = IosXlate(ssa0);
     if (IsTSOEnabled(Class)) {
       return _LoadMemTSO(Class, Size, ssa0, Invalid(), Align, MemOffsetType::SXTX, 1);
     } else {
@@ -2679,8 +2784,8 @@ private:
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    if (IosXlateLoadOn()) {   // ml1057 / kuser-remap: the window test needs the EFFECTIVE address, so materialise it
-      Ref EA = IosXlateLoad(LoadEffectiveAddress(this, A, GetGPROpSize(), true));
+    if (IosXl.On) {   // ml1057: the window test needs the EFFECTIVE address, so materialise it
+      Ref EA = IosXlate(LoadEffectiveAddress(this, A, GetGPROpSize(), true));
       return AtomicTSO ? _LoadMemTSO(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1)
                        : _LoadMem(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1);
     }
@@ -2785,6 +2890,18 @@ private:
   }
   void _StoreMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, Ref Value1, Ref Value2, OpSize Align = OpSize::i8Bit) {
     return _StoreMemPairAutoTSO(RegClass::FPR, Size, A, Value1, Value2, Align);
+  }
+
+  // madeira [pop-rsp-fault] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine FEX patch 0003 (MIT)
+  // env MADEIRA_FEX_POP_RSP_FAULT = 0 turns it off; on by default. Affects code generation: read once per process.
+  static bool MadeiraPopRspFault() {
+    static const bool On = [] {
+      const char* E = getenv("MADEIRA_FEX_POP_RSP_FAULT");
+      const bool V = !(E && E[0] == '0' && E[1] == '\0');
+      LogMan::Msg::EFmt("[pop-rsp-fault] rev=pop-rsp-fault-1 {}", V ? "on" : "off (MADEIRA_FEX_POP_RSP_FAULT=0)");
+      return V;
+    }();
+    return On;
   }
 
   Ref Pop(IR::OpSize Size, Ref SP_RMW) {

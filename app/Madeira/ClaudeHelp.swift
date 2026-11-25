@@ -83,7 +83,7 @@ enum ClaudeHelp {
 
         let guide = bestGuide()
         let log = logFor(title: entry?.title, in: docs).map(HelpReport.read)
-        let cfg = try? String(contentsOf: docs.appendingPathComponent(MadeiraConfig.fileName), encoding: .utf8)
+        let cfg = MadeiraConfig.readText(docs.appendingPathComponent(MadeiraConfig.fileName))  // [cfg-lossy-help] upstream PR 629
         let report = HelpReport.text(build: BuildStamp.text, device: device, log: log,
                                      game: game, cfg: cfg, title: entry?.title)
         let header = """
@@ -241,6 +241,17 @@ enum ClaudeHelp {
             "# Bits: \(entry.bits)",
         ]
         if let appID = entry.steamAppID { lines.append("# Steam App ID: \(appID)") }
+        // A stable game ID (the same game gets the same ID on every phone, whatever its title says) and
+        // the game's "Steam starts" choice, so Get Help and Sentry can group reports and see the swap.
+        // Off: env.MADEIRA_REPORT_GAME_FIELDS = 0 in madeira.cfg leaves both lines out.
+        if MadeiraConfig.flag("MADEIRA_REPORT_GAME_FIELDS") {
+            lines.append("# Game ID: " + gameID(entry))
+            if let appID = entry.steamAppID {
+                lines.append("# Steam starts: " + (entry.startsSteamGameDirectly
+                    ? "not used (this game starts directly, not through Madeira Dock)"
+                    : (DockStartProgram.chosen(appID) ?? "default (Steam's own program)")))
+            }
+        }
         lines.append("")
         lines.append("## This game's config (Game details > Advanced > This game's config)")
         lines.append("# This is the file as it is when the report is made. Lines under \"Added by Madeira\" may have been added AFTER the run in this report. What the game launched with is the [game-cfg] line in the log below.")
@@ -257,6 +268,12 @@ enum ClaudeHelp {
             lines.append(json(fields.filter { !skippedEntryKeys.contains($0.key) }) ?? "(could not be read)")
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// "steam:22380" for a Steam game, else "name:" plus the same title key shared configs use.
+    static func gameID(_ entry: LibraryEntry) -> String {
+        if let appID = entry.steamAppID { return "steam:\(appID)" }
+        return "name:" + SharedConfigs.gameKey(entry.title)
     }
 
     private static func json(_ value: [String: Any]) -> String? {

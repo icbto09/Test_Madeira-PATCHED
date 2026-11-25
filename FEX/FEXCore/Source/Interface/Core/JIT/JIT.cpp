@@ -716,9 +716,9 @@ void Arm64JITCore::Op_NoOp(const IR::IROp_Header* IROp, IR::Ref Node) {}
 Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread)
   : CPUBackend(*ctx, Thread)
   , Arm64Emitter(ctx)
-  , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128 != 0}
-  , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256 != 0}
-  , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
+  , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128()}
+  , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256()}
+  , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX() && ctx->HostFeatures.SupportsSVE256()}
   , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
   , CTX {ctx}
@@ -934,17 +934,45 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
     if (RingOn < 0) {
       const char* E = getenv("MADEIRA_BLOCK_RING");
       RingOn = (E && *E && *E != '0') ? 1 : 0;
+#if defined(ARCHITECTURE_arm64ec)
+      if (FEXCore::Core::IosBlockRingForce) {
+        RingOn = 1; /* madeira [crashmailer-dump]: Overwatch.exe, see ARM64EC Module.cpp */
+      }
+#endif
+    }
+    /* ml1207 [ring-first] (env MADEIRA_BLOCK_RING_FIRST = 1, log-only, needs MADEIRA_BLOCK_RING):
+     * record a translated block only the first time it runs in the process, so the 4096-entry
+     * ring spans the distinct code path instead of being filled by one hot loop (BO3: each API
+     * name-hash walk alone is ~3500 entries). One byte per translation in a static table; when
+     * the table is full, blocks are recorded every time as before. */
+    static int RingFirst = -1;
+    static uint8_t RingFirstSeen[1u << 21];
+    static std::atomic<uint32_t> RingFirstNext {0};
+    if (RingFirst < 0) {
+      const char* E = getenv("MADEIRA_BLOCK_RING_FIRST");
+      RingFirst = (E && *E == '1') ? 1 : 0;
     }
     if (RingOn) {
       ARMEmitter::ForwardLabel l_NoRing;
       ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosBlockRing));
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NoRing);
+      /* after the null-ring check: a block first run on a thread without a ring stays unseen */
+      if (RingFirst) {
+        const uint32_t Idx = RingFirstNext.fetch_add(1, std::memory_order_relaxed);
+        if (Idx < sizeof(RingFirstSeen)) {
+          LoadConstant(ARMEmitter::Size::i64Bit, TMP3, reinterpret_cast<uint64_t>(&RingFirstSeen[Idx]));
+          ldrb(TMP4.W(), TMP3, 0);
+          (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &l_NoRing);
+          LoadConstant(ARMEmitter::Size::i32Bit, TMP4, 1);
+          strb(TMP4.W(), TMP3, 0);
+        }
+      }
       ldr(TMP2, TMP1, 0);
       LoadConstant(ARMEmitter::Size::i64Bit, TMP3, IosRingEntryRIP);
       add(ARMEmitter::Size::i64Bit, TMP4, TMP1, 8);
       str(TMP3, TMP4, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
       add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
-      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntries - 1);
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntriesRT - 1); /* [crashmailer-exit-probe] */
       str(TMP2, TMP1, 0);
       (void)Bind(&l_NoRing);
     }
@@ -1021,6 +1049,34 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   return AllocatedInfo;
 }
 
+/* madeira [multiblock-fault-rip] rev=multiblock-fault-rip-1, env MADEIRA_FEX_MB_FAULT_RIP = 0 (off switch, default on).
+ *
+ * A block whose emission is restarted (a b.cond/cbz/tbz/adr that cannot reach its label: EnableFarARM64Jumps, or
+ * the temporary buffer's guard page: NeedsLargerJITSpace) is emitted again from the start, and the restart
+ * resets the jump targets, the entry points and (upstream fc8ef0e72) the relocations, but not DebugData. The
+ * GuestOpcode markers of the abandoned attempt stay in DebugData->GuestOpcodes, the second attempt appends its
+ * own, and the block tail's host-PC -> guest-RIP table is written from both. RestoreRIPFromHostPC (and the
+ * ml885 diagnostic, which walks the same table) stops at the first entry past the host PC, which is in the stale
+ * prefix whenever the abandoned attempt got that far: it answers with the instruction that sat at that host
+ * offset in the abandoned layout. Far jumps make every conditional branch one instruction longer, so that is a
+ * later instruction than the one that faulted, and the guest's SEH scope does not match it.
+ *
+ * Only large blocks reach a restart (a tbz/tbnz reaches +-32 KB; the taken exits of a multiblock's jcc/jp/js
+ * are placed at its end), which is why this shows with FEX_MULTIBLOCK=1. Overwatch 0.2.93: a loader byte probe
+ * (movzx eax, byte [rax] at rva 0xf03a09) faulted 76 KB into a multiblock and was reported at rva 0xf0532e,
+ * a jno; with multiblock off the same probe was reported exactly and its handler ran.
+ *
+ * Upstream FEX has the same gap (main 123706543). MADEIRA_FEX_MB_FAULT_RIP=0: the stale entries are kept. */
+static bool IosMbFaultRipEnabled() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("MADEIRA_FEX_MB_FAULT_RIP");
+    const bool On = !(Env && Env[0] == '0' && Env[1] == '\0');
+    LogMan::Msg::EFmt("[multiblock-fault-rip] rev=multiblock-fault-rip-1 {}", On ? "on" : "off (MADEIRA_FEX_MB_FAULT_RIP=0)");
+    return On;
+  }();
+  return Enabled;
+}
+
 CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
   FEXCORE_PROFILE_SCOPED("Arm64::EmitJITCode");
@@ -1056,6 +1112,23 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
 
   CodeData.EntryPoints.clear();
+
+  // madeira [multiblock-fault-rip]: a restarted attempt starts with the RIP table and subblocks of the abandoned
+  // one still in DebugData; drop them as the relocations above are dropped. Empty on a first attempt.
+  const bool MbFaultRip = IosMbFaultRipEnabled(); // also logs the rev line once, at the first compile
+  if (DebugData && (!DebugData->GuestOpcodes.empty() || !DebugData->Subblocks.empty())) {
+    static std::atomic<uint32_t> MbFaultRipLogged {0};
+    if (MbFaultRipLogged.fetch_add(1, std::memory_order_relaxed) < 8) {
+      LogMan::Msg::EFmt("[multiblock-fault-rip] rev=multiblock-fault-rip-1 restart entry={:#x} far={} ssa_mul={}: {} {} stale "
+                        "RIP entries, {} subblocks",
+                        Entry, RequiresFarARM64Jumps ? 1 : 0, SSANodeMultiplier, MbFaultRip ? "dropped" : "KEPT (switch off)",
+                        DebugData->GuestOpcodes.size(), DebugData->Subblocks.size());
+    }
+    if (MbFaultRip) {
+      DebugData->GuestOpcodes.clear();
+      DebugData->Subblocks.clear();
+    }
+  }
 
   // Fairly excessive buffer range to make sure we don't overflow
   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.

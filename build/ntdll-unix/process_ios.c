@@ -281,19 +281,11 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
     memset( info, 0, sizeof(*info) );
     if (!(status = get_nt_and_unix_names( attr, nt_name, unix_name, FILE_OPEN, FALSE )))
     {
-        status = open_unix_file( handle, *unix_name, GENERIC_READ, attr, 0,
+        status = open_unix_file( handle, *unix_name, GENERIC_READ | SYNCHRONIZE, attr, 0,
                                  FILE_SHARE_READ | FILE_SHARE_DELETE,
                                  FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
     }
-    if (status)
-    {
-        if (is_builtin_path( attr->ObjectName, &info->machine ))
-        {
-            TRACE( "assuming %04x builtin for %s\n", info->machine, debugstr_us(attr->ObjectName));
-            return STATUS_SUCCESS;
-        }
-        return status;
-    }
+    if (status) goto done;
 
     if (!(status = NtCreateSection( &mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
                                     SECTION_MAP_READ | SECTION_MAP_EXECUTE,
@@ -319,6 +311,13 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
             status = get_non_pe_file_info( unix_fd, info );
             if (needs_close) close( unix_fd );
         }
+    }
+
+ done:
+    if (status && is_prefix_bootstrap && is_system_dir_path( attr->ObjectName, &info->machine ))
+    {
+        TRACE( "assuming %04x builtin for %s\n", info->machine, debugstr_us(attr->ObjectName));
+        return STATUS_SUCCESS;
     }
     return status;
 }
@@ -1113,7 +1112,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     {
         if (!(pid = fork()))  /* grandchild */
         {
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+            if ((peb && peb->ProcessParameters &&
+                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
                 params->ConsoleHandle == NULL)
@@ -1299,7 +1299,8 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         {
             close( fd[0] );
 
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+            if ((peb && peb->ProcessParameters &&
+                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
                 params->ConsoleHandle == NULL)
@@ -1929,7 +1930,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     ULONG startup_info_size, env_size;
     int unixdir, socketfd[2] = { -1, -1 };
     struct pe_image_info pe_info;
-    CLIENT_ID id;
+    ULONG process_id, thread_id;
     USHORT machine = 0;
     HANDLE parent = 0, debug = 0, token = 0;
     UNICODE_STRING nt_name, path = {0};
@@ -2112,6 +2113,75 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                              madeira_debugstr_cmdline_us( &params->CommandLine ), appid );
                     wine_steam_run_requested( appid );
                     return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
+        /* A game asks Windows to open a web page (ShellExecute starts winebrowser.exe <address>), for
+         * example DREDGE's Epic sign-in, https://www.epicgames.com/activate?userCode=... (Sentry
+         * GET-HELP-LOGS-133, 0.2.26): winebrowser found no browser here and ended with code 1 ("could not
+         * find a suitable app to open"), so the page was never shown. The address now also goes to the app
+         * (wine_open_link_requested, WineProcessBridge.m), which opens it in Safari. winebrowser.exe is
+         * still started exactly as before, so the game sees the same result it saw. Only http:// and
+         * https:// addresses. env.MADEIRA_OPEN_LINKS=0 does not hand the address to the app. */
+        {
+            extern void wine_open_link_requested( const char *url ) __attribute__((weak));
+            const char *ol = getenv( "MADEIRA_OPEN_LINKS" );
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+
+            const char *sb = getenv( "MADEIRA_SPAWN_BLOCK" );
+
+            if (wine_open_link_requested && cl && !(ol && ol[0] == '0' && !ol[1]) &&
+                !(sb && strcasestr( sb, "winebrowser" )) &&
+                ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                   "winebrowser.exe" ))
+            {
+                static const char * const schemes[] = { "https://", "http://" };
+                char url[1024];
+                int k, j, n = 0, found = 0;
+                unsigned p;
+
+                for (p = 0; p < 2 && !found; p++)
+                {
+                    int pl = (int)strlen( schemes[p] );
+                    for (k = 0; k + pl <= cl_len && !found; k++)
+                    {
+                        if (k && cl[k - 1] != ' ' && cl[k - 1] != '\t' && cl[k - 1] != '"') continue;
+                        for (j = 0; j < pl; j++)
+                        {
+                            WCHAR c = cl[k + j];
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if (c != (WCHAR)schemes[p][j]) break;
+                        }
+                        if (j < pl) continue;
+                        /* the address ends at a quote, a blank or the end; any character outside printable
+                         * ASCII ends the search for this one (the app would not open it anyway) */
+                        for (n = 0, j = k; j < cl_len && n < (int)sizeof(url) - 1; j++, n++)
+                        {
+                            if (cl[j] <= ' ' || cl[j] > '~' || cl[j] == '"') break;
+                            url[n] = (char)cl[j];
+                        }
+                        url[n] = 0;
+                        found = n > pl && (j == cl_len || cl[j] <= ' ' || cl[j] == '"');
+                    }
+                }
+                if (found)
+                {
+                    char shown[96];
+                    int q = 0;
+
+                    /* the log keeps only the host and path: a sign-in code after '?' stays out of it */
+                    while (url[q] && url[q] != '?' && url[q] != '#' && q < (int)sizeof(shown) - 1)
+                    {
+                        shown[q] = url[q];
+                        q++;
+                    }
+                    shown[q] = 0;
+                    dprintf( 2, "[open-link] winebrowser.exe asks to open %s (%d characters): handed to the app, "
+                             "which opens it in Safari (env.MADEIRA_OPEN_LINKS=0 does not hand it over)\n",
+                             shown, n );
+                    wine_open_link_requested( url );
                 }
             }
         }
@@ -2912,7 +2982,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     env_size = get_env_size( params, &winedebug );
 
-    if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
+    if ((status = wine_server_alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
 
     if ((status = alloc_handle_list( handles_attr, &handles, &handles_size )))
     {
@@ -2969,7 +3039,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             process_handle = wine_server_ptr_handle( reply->handle );
-            id.UniqueProcess = ULongToHandle( reply->pid );
+            process_id     = reply->pid;
         }
         process_info = wine_server_ptr_handle( reply->info );
     }
@@ -2994,7 +3064,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     }
 
-    if ((status = alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
+    if ((status = wine_server_alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
 
     SERVER_START_REQ( new_thread )
     {
@@ -3006,7 +3076,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             thread_handle = wine_server_ptr_handle( reply->handle );
-            id.UniqueThread = ULongToHandle( reply->tid );
+            thread_id     = reply->tid;
         }
     }
     SERVER_END_REQ;
@@ -3081,8 +3151,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 
     TRACE( "%s pid %04x tid %04x handles %p/%p\n", debugstr_us(&path),
-           HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread),
-           process_handle, thread_handle );
+           process_id, thread_id, process_handle, thread_handle );
 
     /* update output attributes */
 
@@ -3092,6 +3161,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         {
         case PS_ATTRIBUTE_CLIENT_ID:
         {
+            CLIENT_ID id = make_client_id( process_id, thread_id );
             SIZE_T size = min( ps_attr->Attributes[i].Size, sizeof(id) );
             memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
             if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
@@ -4047,6 +4117,793 @@ static void ios_guest_branch_history_dump( const void *frame, uint64_t fault_rip
     }
 }
 
+
+/* madeira [term-hooks] (part of [term-trace], env.MADEIRA_TERM_TRACE = 1; off with
+ * env.MADEIRA_TERM_HOOKS = 0). BO3 0.2.89: the quitting thread calls kernel32
+ * VirtualProtect, that call never reaches the unix NtProtectVirtualMemory log, and
+ * ~2 us later its own stub calls NtTerminateProcess(self, 0). One full-depth dump at
+ * the quit: the current bytes of the protect/query/debug/exit entry points in ntdll,
+ * kernelbase and kernel32 (hooked or not, and where each jump leads, up to 3 hops),
+ * the IAT slots kernelbase/kernel32 call ntdll through, the last 32 protect calls that
+ * reached unix, raw bytes and region info around every recorded branch, the guest
+ * stack, the memory at RBP and the stub page. Reads only (Mach reads, no guest
+ * calls); nothing is changed, so it cannot alter what the game decides. */
+struct tt_mod { uint64_t base, size; char name[40]; WCHAR full[300]; };
+static struct tt_mod tt_mods[160];
+static unsigned tt_nmods;
+
+static size_t tt_rd( uint64_t address, void *buffer, size_t length )
+{
+    mach_vm_size_t got = 0;
+    if (address < 0x10000 || address >= UINT64_C(0x800000000000) || length > UINT64_C(0x800000000000) - address)
+        return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), address, length, (mach_vm_address_t)buffer, &got ) != KERN_SUCCESS)
+    {
+        /* partial: try 16-byte pieces so a window crossing into a free page still shows its readable part */
+        size_t done = 0;
+        while (done < length)
+        {
+            size_t piece = length - done < 16 ? length - done : 16;
+            got = 0;
+            if (mach_vm_read_overwrite( mach_task_self(), address + done, piece,
+                    (mach_vm_address_t)((char *)buffer + done), &got ) != KERN_SUCCESS || got != piece) break;
+            done += piece;
+        }
+        return done;
+    }
+    return (size_t)got;
+}
+
+static void tt_load_modules( void *owner )
+{
+    PEB peb;
+    PEB_LDR_DATA ldr;
+    LDR_DATA_TABLE_ENTRY entry;
+    uint64_t head, link;
+    unsigned guard = 0;
+
+    tt_nmods = 0;
+    if (!owner || tt_rd( (uint64_t)(uintptr_t)owner, &peb, sizeof(peb) ) != sizeof(peb) || !peb.LdrData ||
+        tt_rd( (uint64_t)(uintptr_t)peb.LdrData, &ldr, sizeof(ldr) ) != sizeof(ldr)) return;
+    head = (uint64_t)(uintptr_t)peb.LdrData + offsetof( PEB_LDR_DATA, InLoadOrderModuleList );
+    link = (uint64_t)(uintptr_t)ldr.InLoadOrderModuleList.Flink;
+    while (link && link != head && guard++ < 512 && tt_nmods < ARRAY_SIZE(tt_mods))
+    {
+        WCHAR wname[40];
+        size_t chars, k;
+        struct tt_mod *m;
+        if (tt_rd( link - offsetof( LDR_DATA_TABLE_ENTRY, InLoadOrderLinks ), &entry, sizeof(entry) ) != sizeof(entry))
+            break;
+        m = &tt_mods[tt_nmods++];
+        m->base = (uint64_t)(uintptr_t)entry.DllBase;
+        m->size = entry.SizeOfImage;
+        chars = entry.BaseDllName.Length / sizeof(WCHAR);
+        if (chars > ARRAY_SIZE(wname) - 1) chars = ARRAY_SIZE(wname) - 1;
+        chars = tt_rd( (uint64_t)(uintptr_t)entry.BaseDllName.Buffer, wname, chars * sizeof(WCHAR) ) / sizeof(WCHAR);
+        for (k = 0; k < chars && k < sizeof(m->name) - 1; k++)
+            m->name[k] = wname[k] < 0x80 ? (char)wname[k] : '?';
+        m->name[k] = 0;
+        chars = entry.FullDllName.Length / sizeof(WCHAR);
+        if (chars > ARRAY_SIZE(m->full) - 1) chars = ARRAY_SIZE(m->full) - 1;
+        chars = tt_rd( (uint64_t)(uintptr_t)entry.FullDllName.Buffer, m->full, chars * sizeof(WCHAR) ) / sizeof(WCHAR);
+        m->full[chars] = 0;
+        link = (uint64_t)(uintptr_t)entry.InLoadOrderLinks.Flink;
+    }
+}
+
+static const struct tt_mod *tt_mod_at( uint64_t address )
+{
+    unsigned i;
+    for (i = 0; i < tt_nmods; i++)
+        if (address >= tt_mods[i].base && address - tt_mods[i].base < tt_mods[i].size) return &tt_mods[i];
+    return NULL;
+}
+
+static const struct tt_mod *tt_mod_named( const char *name )
+{
+    unsigned i;
+    for (i = 0; i < tt_nmods; i++) if (!strcasecmp( tt_mods[i].name, name )) return &tt_mods[i];
+    return NULL;
+}
+
+/* "module+rva" or "anon" plus the region the address is in */
+static void tt_where( const char *tag, uint64_t address )
+{
+    const struct tt_mod *m = tt_mod_at( address );
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T len = 0;
+    memset( &mbi, 0, sizeof(mbi) );
+    if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)(uintptr_t)address, MemoryBasicInformation,
+                              &mbi, sizeof(mbi), &len ))
+        len = 0;
+    dprintf( 2, "[term-hooks] %s %#llx = %s%s+%#llx | region base=%p alloc=%p size=%#lx prot=%#x alloc_prot=%#x state=%#x type=%#x%s\n",
+             tag, (unsigned long long)address, m ? "" : "(no module)", m ? m->name : "",
+             (unsigned long long)(m ? address - m->base : 0), mbi.BaseAddress, mbi.AllocationBase,
+             (unsigned long)mbi.RegionSize, (unsigned)mbi.Protect, (unsigned)mbi.AllocationProtect,
+             (unsigned)mbi.State, (unsigned)mbi.Type, len ? "" : " (query failed)" );
+}
+
+static void tt_hex( const char *tag, uint64_t address, size_t length, int ascii )
+{
+    unsigned char bytes[64];
+    size_t done = 0;
+    if (length > 2048) length = 2048;
+    while (done < length)
+    {
+        size_t chunk = length - done < 32 ? length - done : 32, got, k, o = 0;
+        char line[32 * 3 + 40];
+        got = tt_rd( address + done, bytes, chunk );
+        for (k = 0; k < chunk; k++)
+            o += snprintf( line + o, sizeof(line) - o, k < got ? "%02x " : "?? ", bytes[k] );
+        if (ascii)
+        {
+            o += snprintf( line + o, sizeof(line) - o, "| " );
+            for (k = 0; k < got && o < sizeof(line) - 1; k++)
+                line[o++] = bytes[k] >= 0x20 && bytes[k] < 0x7f ? bytes[k] : '.';
+            line[o] = 0;
+        }
+        dprintf( 2, "[term-hooks] %s %#llx: %s\n", tag, (unsigned long long)(address + done), line );
+        done += chunk;
+    }
+}
+
+/* Same bytes in the JIT pool copy FEX may execute, when there is one */
+static void tt_copy_compare( const char *tag, uint64_t address, size_t length, void *owner )
+{
+    extern void *ios_jit_translate_addr_for_owner( void *, void * );
+    unsigned char a[48], b[48];
+    uint64_t copy = (uint64_t)(uintptr_t)ios_jit_translate_addr_for_owner( (void *)(uintptr_t)address, owner );
+    size_t ga, gb;
+    if (length > sizeof(a)) length = sizeof(a);
+    if (!copy || copy == address) return;
+    ga = tt_rd( address, a, length );
+    gb = tt_rd( copy, b, length );
+    dprintf( 2, "[term-hooks] %s copy=%#llx PE/COPY=%s\n", tag, (unsigned long long)copy,
+             ga != length || gb != length ? "INCOMPLETE" : memcmp( a, b, length ) ? "DIFFER" : "MATCH" );
+    if (ga == length && gb == length && memcmp( a, b, length )) tt_hex( "  copy-bytes", copy, length, 0 );
+}
+
+/* Decode the first instruction as a hook/jump shape. Returns the jump target or 0. */
+static uint64_t tt_classify( uint64_t address, const unsigned char *c, size_t n, char *what, size_t wl )
+{
+    uint64_t slot = 0, target = 0;
+    int32_t rel;
+    if (n >= 8 && c[0] == 0x4c && c[1] == 0x8b && c[2] == 0xd1 && c[3] == 0xb8)
+    {
+        snprintf( what, wl, "syscall-stub nr=%#x (unhooked shape)", c[4] | c[5] << 8 | c[6] << 16 | c[7] << 24 );
+        return 0;
+    }
+    if (n >= 10 && c[0] == 0x48 && c[1] == 0x8b && c[2] == 0xc4 && c[3] == 0x48 && c[4] == 0x89 &&
+        c[5] == 0x58 && c[6] == 0x20 && c[7] == 0x55 && c[8] == 0x5d && c[9] == 0xe9 && n >= 14)
+    {
+        memcpy( &rel, c + 10, 4 );
+        snprintf( what, wl, "fast-forward-sequence (EC entry, unhooked shape)" );
+        return address + 14 + (int64_t)rel;
+    }
+    if (n >= 16 && c[0] == 0x48 && c[1] == 0x8d && c[2] == 0xa4 && c[3] == 0x24 && !c[4] && !c[5] && !c[6] && !c[7] &&
+        c[8] == 0xff && c[9] == 0x25)
+    {
+        memcpy( &rel, c + 10, 4 );
+        slot = address + 8 + 6 + (int64_t)rel;
+        if (tt_rd( slot, &target, 8 ) != 8) target = 0;
+        snprintf( what, wl, "hotpatch-prologue + jmp [%#llx] (Madeira hotpatch-thunks shape)", (unsigned long long)slot );
+        return target;
+    }
+    if (n >= 6 && c[0] == 0xff && c[1] == 0x25)
+    {
+        memcpy( &rel, c + 2, 4 );
+        slot = address + 6 + (int64_t)rel;
+        if (tt_rd( slot, &target, 8 ) != 8) target = 0;
+        snprintf( what, wl, "jmp [%#llx]%s", (unsigned long long)slot, rel == 0 ? " (absolute, HOOK shape)" : "" );
+        return target;
+    }
+    if (n >= 5 && c[0] == 0xe9)
+    {
+        memcpy( &rel, c + 1, 4 );
+        snprintf( what, wl, "jmp rel32 (HOOK shape)" );
+        return address + 5 + (int64_t)rel;
+    }
+    if (n >= 2 && c[0] == 0xeb)
+    {
+        snprintf( what, wl, "jmp rel8 (HOOK shape)" );
+        return address + 2 + (int8_t)c[1];
+    }
+    if (n >= 12 && c[0] == 0x48 && c[1] == 0xb8 && c[10] == 0xff && c[11] == 0xe0)
+    {
+        memcpy( &target, c + 2, 8 );
+        snprintf( what, wl, "movabs rax + jmp rax (HOOK shape)" );
+        return target;
+    }
+    if (n >= 13 && c[0] == 0x49 && c[1] == 0xbb && c[10] == 0x41 && c[11] == 0xff && c[12] == 0xe3)
+    {
+        memcpy( &target, c + 2, 8 );
+        snprintf( what, wl, "movabs r11 + jmp r11 (HOOK shape)" );
+        return target;
+    }
+    if (n >= 6 && c[0] == 0x68 && c[5] == 0xc3)
+    {
+        uint32_t lo;
+        memcpy( &lo, c + 1, 4 );
+        snprintf( what, wl, "push imm32 + ret (HOOK shape)" );
+        return lo;
+    }
+    if (n >= 1 && c[0] == 0xcc) { snprintf( what, wl, "int3 (breakpoint at entry)" ); return 0; }
+    if (n >= 1 && c[0] == 0xc3) { snprintf( what, wl, "ret at entry (stubbed out)" ); return 0; }
+    snprintf( what, wl, "other (not a recognised jump)" );
+    return 0;
+}
+
+static void tt_follow( const char *tag, uint64_t address, void *owner )
+{
+    unsigned hop;
+    for (hop = 0; hop < 4 && address; hop++)
+    {
+        unsigned char c[32];
+        char what[128], label[64];
+        size_t got = tt_rd( address, c, sizeof(c) );
+        uint64_t next;
+        snprintf( label, sizeof(label), "%s hop%u", tag, hop );
+        tt_where( label, address );
+        if (!got) { dprintf( 2, "[term-hooks] %s unreadable\n", label ); return; }
+        next = tt_classify( address, c, got, what, sizeof(what) );
+        dprintf( 2, "[term-hooks] %s shape: %s%s%#llx\n", label, what, next ? " -> " : "", (unsigned long long)next );
+        tt_hex( label, address, 32, 0 );
+        tt_copy_compare( label, address, 32, owner );
+        if (!next || next == address) return;
+        /* A fast-forward sequence leads into native ARM64EC code: its bytes are not x64,
+         * so show where it lands and stop instead of decoding ARM64 as x64. */
+        if (strstr( what, "fast-forward-sequence" ))
+        {
+            snprintf( label, sizeof(label), "%s native", tag );
+            tt_where( label, next );
+            tt_hex( label, next, 32, 0 );
+            return;
+        }
+        address = next;
+    }
+}
+
+static int tt_rd_cstr( uint64_t address, char *out, size_t size )
+{
+    size_t got = tt_rd( address, out, size - 1 ), k;
+    out[got] = 0;
+    for (k = 0; k < got; k++) if (!out[k]) return 1;
+    return got > 0;
+}
+
+/* Export by name (binary search on the sorted name table) from the in-memory headers */
+static uint64_t tt_export( const struct tt_mod *m, const char *name, char *forward, size_t fl )
+{
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    IMAGE_EXPORT_DIRECTORY ex;
+    IMAGE_DATA_DIRECTORY dir;
+    uint32_t lo = 0, hi;
+    if (forward) forward[0] = 0;
+    if (!m || tt_rd( m->base, &dos, sizeof(dos) ) != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        tt_rd( m->base + dos.e_lfanew, &nt, sizeof(nt) ) != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || tt_rd( m->base + dir.VirtualAddress, &ex, sizeof(ex) ) != sizeof(ex)) return 0;
+    hi = ex.NumberOfNames;
+    while (lo < hi)
+    {
+        uint32_t mid = (lo + hi) / 2, name_rva = 0, func_rva = 0;
+        uint16_t ordinal = 0;
+        char buf[96];
+        int cmp;
+        if (tt_rd( m->base + ex.AddressOfNames + 4 * (uint64_t)mid, &name_rva, 4 ) != 4 ||
+            !tt_rd_cstr( m->base + name_rva, buf, sizeof(buf) )) return 0;
+        cmp = strcmp( name, buf );
+        if (!cmp)
+        {
+            if (tt_rd( m->base + ex.AddressOfNameOrdinals + 2 * (uint64_t)mid, &ordinal, 2 ) != 2 ||
+                tt_rd( m->base + ex.AddressOfFunctions + 4 * (uint64_t)ordinal, &func_rva, 4 ) != 4) return 0;
+            if (forward && func_rva >= dir.VirtualAddress && func_rva < dir.VirtualAddress + dir.Size)
+                tt_rd_cstr( m->base + func_rva, forward, fl );
+            return m->base + func_rva;
+        }
+        if (cmp < 0) hi = mid; else lo = mid + 1;
+    }
+    return 0;
+}
+
+/* The IAT slot module m uses for dll!name, and what it holds now */
+static void tt_iat( const struct tt_mod *m, const char *dll, const char *name, void *owner )
+{
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    IMAGE_DATA_DIRECTORY dir;
+    IMAGE_IMPORT_DESCRIPTOR desc;
+    unsigned d;
+    if (!m || tt_rd( m->base, &dos, sizeof(dos) ) != sizeof(dos) ||
+        tt_rd( m->base + dos.e_lfanew, &nt, sizeof(nt) ) != sizeof(nt)) return;
+    dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (d = 0; dir.VirtualAddress && d < 64; d++)
+    {
+        char dname[64];
+        uint64_t names, slots, k;
+        if (tt_rd( m->base + dir.VirtualAddress + d * sizeof(desc), &desc, sizeof(desc) ) != sizeof(desc) ||
+            !desc.Name) return;
+        if (!tt_rd_cstr( m->base + desc.Name, dname, sizeof(dname) ) || strcasecmp( dname, dll )) continue;
+        names = m->base + (desc.OriginalFirstThunk ? desc.OriginalFirstThunk : desc.FirstThunk);
+        slots = m->base + desc.FirstThunk;
+        for (k = 0; k < 4096; k++)
+        {
+            uint64_t thunk = 0, value = 0;
+            char iname[96];
+            if (tt_rd( names + 8 * k, &thunk, 8 ) != 8 || !thunk) break;
+            if (thunk >> 63 || !tt_rd_cstr( m->base + (uint32_t)thunk + 2, iname, sizeof(iname) ) ||
+                strcmp( iname, name )) continue;
+            tt_rd( slots + 8 * k, &value, 8 );
+            dprintf( 2, "[term-hooks] iat %s -> %s!%s slot=%#llx value=%#llx\n", m->name, dll, name,
+                     (unsigned long long)(slots + 8 * k), (unsigned long long)value );
+            {
+                char label[96];
+                snprintf( label, sizeof(label), "iat %s:%s", m->name, name );
+                tt_where( label, value );
+            }
+            return;
+        }
+    }
+    dprintf( 2, "[term-hooks] iat %s -> %s!%s not found\n", m->name, dll, name );
+}
+
+
+/* madeira [term-diff] (part of [term-hooks]): BO3's quitting thread reads blackops3.exe
+ * from disk (106 MB) and computes for ~10 s before its quit routine runs. Compare, in
+ * the same run: (a) the main image in memory against the file on disk, with every
+ * DIR64 relocation slot accounted for (file value + load delta), so any byte our
+ * loader, hotpatching or emulation left different shows up with its RVA/section;
+ * (b) the program's own file buffer (a large private region holding the same PE
+ * headers) against the disk, which would show a short or wrong read. Read-only: the
+ * file is opened for reading, memory is read with Mach reads. */
+static int tt_u32_cmp( const void *a, const void *b )
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int tt_open_file( const WCHAR *dos, int *needs_close, HANDLE *handle )
+{
+    static const WCHAR prefix[] = {'\\','?','?','\\',0};
+    WCHAR path[320];
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES attr;
+    IO_STATUS_BLOCK io;
+    size_t k = 0, j;
+    int fd = -1;
+    for (j = 0; prefix[j]; j++) path[k++] = prefix[j];
+    for (j = 0; dos[j] && k < ARRAY_SIZE(path) - 1; j++) path[k++] = dos[j];
+    path[k] = 0;
+    us.Buffer = path;
+    us.Length = (USHORT)(k * sizeof(WCHAR));
+    us.MaximumLength = us.Length + sizeof(WCHAR);
+    InitializeObjectAttributes( &attr, &us, OBJ_CASE_INSENSITIVE, 0, NULL );
+    *handle = 0;
+    if (NtOpenFile( handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE )) return -1;
+    if (server_get_unix_fd( *handle, FILE_READ_DATA, &fd, needs_close, NULL, NULL ))
+    {
+        NtClose( *handle );
+        *handle = 0;
+        return -1;
+    }
+    return fd;
+}
+
+static size_t tt_pread( int fd, void *buffer, size_t length, uint64_t offset )
+{
+    size_t done = 0;
+    while (done < length)
+    {
+        ssize_t r = pread( fd, (char *)buffer + done, length - done, (off_t)(offset + done) );
+        if (r <= 0) break;
+        done += (size_t)r;
+    }
+    return done;
+}
+
+struct tt_range { uint32_t rva, len; };
+
+static void tt_report_ranges( const char *tag, const struct tt_range *r, unsigned n, int fd,
+                              uint64_t base, const IMAGE_SECTION_HEADER *sec, unsigned nsec )
+{
+    unsigned i, s;
+    for (i = 0; i < n; i++)
+    {
+        unsigned char f[32] = {0}, m[32] = {0};
+        uint32_t len = r[i].len < 32 ? r[i].len : 32, off = 0;
+        const char *sname = "?";
+        char hf[32 * 3 + 1], hm[32 * 3 + 1];
+        size_t gf, gm, b;
+        for (s = 0; s < nsec; s++)
+            if (r[i].rva >= sec[s].VirtualAddress && r[i].rva - sec[s].VirtualAddress < sec[s].SizeOfRawData)
+            {
+                static char nm[9];
+                memcpy( nm, sec[s].Name, 8 ); nm[8] = 0; sname = nm;
+                off = sec[s].PointerToRawData + (r[i].rva - sec[s].VirtualAddress);
+                break;
+            }
+        gf = s < nsec ? tt_pread( fd, f, len, off ) : 0;
+        gm = tt_rd( base + r[i].rva, m, len );
+        for (b = 0; b < len; b++)
+        {
+            snprintf( hf + 3 * b, 4, b < gf ? "%02x " : "?? ", f[b] );
+            snprintf( hm + 3 * b, 4, b < gm ? "%02x " : "?? ", m[b] );
+        }
+        dprintf( 2, "[term-diff] %s #%u rva=%#x len=%u section=%s\n", tag, i, r[i].rva, r[i].len, sname );
+        dprintf( 2, "[term-diff]   file: %s\n", hf );
+        dprintf( 2, "[term-diff]   mem : %s\n", hm );
+    }
+}
+
+static void tt_image_diff( const struct tt_mod *m )
+{
+    enum { CHUNK = 1u << 20, MAX_RANGES = 96 };
+    unsigned char hdr[4096], *fb = NULL, *mb = NULL;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)hdr;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *sec;
+    IMAGE_DATA_DIRECTORY rel, iat;
+    uint32_t *relocs = NULL;
+    size_t nrel = 0, caprel = 0;
+    struct tt_range ranges[MAX_RANGES];
+    unsigned nranges = 0, nsec, s;
+    uint64_t delta, file_size = 0;
+    int fd, needs_close = 0;
+    HANDLE handle = 0;
+    struct stat st;
+
+    {
+        const char *td = getenv( "MADEIRA_TERM_DIFF" );   /* off: env.MADEIRA_TERM_DIFF = 0 */
+        if (td && td[0] == '0') return;
+    }
+    if (!m || !m->full[0]) { dprintf( 2, "[term-diff] no main module path\n" ); return; }
+    fd = tt_open_file( m->full, &needs_close, &handle );
+    if (fd < 0) { dprintf( 2, "[term-diff] %s: cannot open the file on disk\n", m->name ); return; }
+    if (!fstat( fd, &st )) file_size = (uint64_t)st.st_size;
+    if (tt_pread( fd, hdr, sizeof(hdr), 0 ) != sizeof(hdr) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew < 0 || (size_t)dos->e_lfanew > sizeof(hdr) - sizeof(IMAGE_NT_HEADERS64) ||
+        (nt = (IMAGE_NT_HEADERS64 *)(hdr + dos->e_lfanew))->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        dprintf( 2, "[term-diff] %s: file headers unreadable\n", m->name );
+        goto done;
+    }
+    if (24 + (size_t)nt->FileHeader.SizeOfOptionalHeader > sizeof(hdr) - (size_t)dos->e_lfanew ||
+        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+    {
+        dprintf( 2, "[term-diff] %s: optional header out of range\n", m->name );
+        goto done;
+    }
+    sec = (IMAGE_SECTION_HEADER *)((char *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+    nsec = nt->FileHeader.NumberOfSections;
+    if ((char *)(sec + nsec) > (char *)hdr + sizeof(hdr)) nsec = (unsigned)(((char *)hdr + sizeof(hdr) - (char *)sec) / sizeof(*sec));
+    delta = m->base - nt->OptionalHeader.ImageBase;
+    rel = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    iat = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+    dprintf( 2, "[term-diff] %s file size=%llu image base file=%#llx memory=%#llx delta=%#llx sections=%u "
+             "reloc dir=%#x+%#x iat dir=%#x+%#x checksum=%#x timestamp=%#x\n", m->name,
+             (unsigned long long)file_size, (unsigned long long)nt->OptionalHeader.ImageBase,
+             (unsigned long long)m->base, (unsigned long long)delta, nsec, rel.VirtualAddress, rel.Size,
+             iat.VirtualAddress, iat.Size, (unsigned)nt->OptionalHeader.CheckSum,
+             (unsigned)nt->FileHeader.TimeDateStamp );
+
+    /* relocation slots (DIR64 only), from the file, sorted */
+    for (s = 0; s < nsec && rel.Size; s++)
+    {
+        uint32_t va = sec[s].VirtualAddress, raw = sec[s].SizeOfRawData;
+        unsigned char *rb;
+        uint32_t pos = 0, in_sec;
+        if (rel.VirtualAddress < va || rel.VirtualAddress - va >= raw) continue;
+        in_sec = rel.VirtualAddress - va;
+        if (rel.Size > raw - in_sec || rel.Size > (64u << 20) || !(rb = malloc( rel.Size ))) break;
+        if (tt_pread( fd, rb, rel.Size, (uint64_t)sec[s].PointerToRawData + in_sec ) == rel.Size)
+        {
+            while (pos + 8 <= rel.Size)
+            {
+                uint32_t page, bsize, e;
+                memcpy( &page, rb + pos, 4 ); memcpy( &bsize, rb + pos + 4, 4 );
+                if (bsize < 8 || bsize > rel.Size - pos) break;
+                for (e = 8; e + 2 <= bsize; e += 2)
+                {
+                    uint16_t v;
+                    memcpy( &v, rb + pos + e, 2 );
+                    if ((v >> 12) != IMAGE_REL_BASED_DIR64) continue;
+                    if (nrel == caprel)
+                    {
+                        size_t nc = caprel ? caprel * 2 : 65536;
+                        uint32_t *nr = realloc( relocs, nc * sizeof(*nr) );
+                        if (!nr) break;
+                        relocs = nr; caprel = nc;
+                    }
+                    relocs[nrel++] = page + (v & 0xfff);
+                }
+                pos += bsize;
+            }
+        }
+        free( rb );
+        break;
+    }
+    if (nrel) qsort( relocs, nrel, sizeof(*relocs), tt_u32_cmp );
+    dprintf( 2, "[term-diff] %s: %zu DIR64 relocation slots\n", m->name, nrel );
+
+    fb = malloc( CHUNK );
+    mb = malloc( CHUNK );
+    if (!fb || !mb) goto done;
+    for (s = 0; s < nsec; s++)
+    {
+        uint32_t va = sec[s].VirtualAddress, raw = sec[s].SizeOfRawData, vsize = sec[s].Misc.VirtualSize;
+        uint32_t len = raw < vsize || !vsize ? raw : vsize, done_b = 0;
+        uint64_t same = 0, relocated = 0, other = 0, unreadable = 0, in_iat = 0;
+        unsigned first_range = nranges;
+        char nm[9];
+        memcpy( nm, sec[s].Name, 8 ); nm[8] = 0;
+        while (done_b < len)
+        {
+            uint32_t n = len - done_b < CHUNK ? len - done_b : CHUNK, i;
+            uint64_t other_before = other;
+            size_t gf = tt_pread( fd, fb, n, (uint64_t)sec[s].PointerToRawData + done_b );
+            size_t gm = tt_rd( m->base + va + done_b, mb, n );
+            if (gf < n) n = (uint32_t)gf;
+            for (i = 0; i < n; i++)
+            {
+                uint32_t rva = va + done_b + i;
+                size_t lo, hi;
+                if (i >= gm) { unreadable += n - i; break; }
+                if (fb[i] == mb[i]) { same++; continue; }
+                /* inside a DIR64 slot whose value is file + delta? */
+                lo = 0; hi = nrel;
+                while (lo < hi) { size_t mid = (lo + hi) / 2; if (relocs[mid] <= rva) lo = mid + 1; else hi = mid; }
+                if (lo && rva - relocs[lo - 1] < 8)
+                {
+                    uint32_t slot = relocs[lo - 1], so = slot - (va + done_b);
+                    uint64_t fv = 0, mv = 0;
+                    if (slot >= va + done_b && so + 8 <= n && so + 8 <= gm)
+                    {
+                        memcpy( &fv, fb + so, 8 ); memcpy( &mv, mb + so, 8 );
+                        if (fv + delta == mv) { relocated++; continue; }
+                    }
+                    else
+                    {
+                        /* slot straddles a chunk edge: read both values directly */
+                        unsigned char f8[8];
+                        if (tt_pread( fd, f8, 8, (uint64_t)sec[s].PointerToRawData + (slot - va) ) == 8 &&
+                            tt_rd( m->base + slot, &mv, 8 ) == 8)
+                        {
+                            memcpy( &fv, f8, 8 );
+                            if (fv + delta == mv) { relocated++; continue; }
+                        }
+                    }
+                }
+                if (iat.Size && rva - iat.VirtualAddress < iat.Size) { in_iat++; continue; }
+                other++;
+                /* writable sections change at run time: count them, list only code/read-only ranges */
+                if (sec[s].Characteristics & IMAGE_SCN_MEM_WRITE) continue;
+                if (nranges > first_range && ranges[nranges - 1].rva + ranges[nranges - 1].len + 16 >= rva)
+                    ranges[nranges - 1].len = rva - ranges[nranges - 1].rva + 1;
+                else if (nranges < MAX_RANGES && nranges - first_range < 16)
+                {
+                    ranges[nranges].rva = rva;
+                    ranges[nranges].len = 1;
+                    nranges++;
+                }
+            }
+            if (other != other_before)
+                dprintf( 2, "[term-diff] %s %s 1MB chunk rva %#x: %llu different bytes\n", m->name, nm,
+                         va + done_b, (unsigned long long)(other - other_before) );
+            if (!n) break;   /* a short file read ends the section */
+            done_b += n;
+        }
+        dprintf( 2, "[term-diff] %s section %-8s rva=%#x raw=%#x chars=%#x: same=%llu reloc-explained=%llu "
+                 "iat=%llu DIFFERENT=%llu unreadable=%llu ranges(listed)=%u%s\n", m->name, nm, va, len,
+                 (unsigned)sec[s].Characteristics, (unsigned long long)same, (unsigned long long)relocated,
+                 (unsigned long long)in_iat, (unsigned long long)other, (unsigned long long)unreadable, nranges - first_range,
+                 (sec[s].Characteristics & IMAGE_SCN_MEM_WRITE) ? " (writable: ranges not listed)" : "" );
+    }
+    tt_report_ranges( "image", ranges, nranges, fd, m->base, sec, nsec );
+
+    /* (b) the program's own copy of the file: a large private region starting with these headers */
+    {
+        uint64_t addr = 0x10000;
+        unsigned regions = 0, found = 0;
+        while (addr < UINT64_C(0x800000000000) && regions++ < 200000)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            SIZE_T got = 0;
+            static const uint32_t starts[] = { 0, 0x10, 0x20, 0x40 };
+            unsigned k;
+            if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)(uintptr_t)addr, MemoryBasicInformation,
+                                      &mbi, sizeof(mbi), &got ) || !mbi.RegionSize) break;
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && mbi.RegionSize >= (16u << 20) &&
+                mbi.RegionSize >= file_size / 2 && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            {
+                for (k = 0; k < ARRAY_SIZE(starts); k++)
+                {
+                    uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + starts[k];
+                    unsigned char probe[512];
+                    uint64_t cmp = 0, diff = 0, avail;
+                    unsigned nr = 0;
+                    struct tt_range br[16];
+                    unsigned bi;
+                    if (tt_rd( b, probe, sizeof(probe) ) != sizeof(probe) || memcmp( probe, hdr, sizeof(probe) )) continue;
+                    avail = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize - b;
+                    found++;
+                    while (cmp < file_size && cmp < avail)
+                    {
+                        size_t n = file_size - cmp < CHUNK ? file_size - cmp : CHUNK, gf, gm, i;
+                        if (n > avail - cmp) n = avail - cmp;
+                        gf = tt_pread( fd, fb, n, cmp );
+                        gm = tt_rd( b + cmp, mb, n );
+                        if (gm < n || gf < n) { n = gf < gm ? gf : gm; if (!n) break; }
+                        for (i = 0; i < n; i++)
+                            if (fb[i] != mb[i])
+                            {
+                                diff++;
+                                if (nr && br[nr - 1].rva + br[nr - 1].len + 16 >= cmp + i)
+                                    br[nr - 1].len = (uint32_t)(cmp + i - br[nr - 1].rva + 1);
+                                else if (nr < 16) { br[nr].rva = (uint32_t)(cmp + i); br[nr].len = 1; nr++; }
+                            }
+                        cmp += n;
+                    }
+                    dprintf( 2, "[term-diff] file buffer at %#llx (region %p+%#lx): compared %llu of %llu bytes, "
+                             "DIFFERENT=%llu\n", (unsigned long long)b, mbi.BaseAddress, (unsigned long)mbi.RegionSize,
+                             (unsigned long long)cmp, (unsigned long long)file_size, (unsigned long long)diff );
+                    for (bi = 0; bi < nr; bi++)
+                        dprintf( 2, "[term-diff]   buffer diff #%u file offset %#x len %u\n", bi, br[bi].rva, br[bi].len );
+                    break;
+                }
+            }
+            addr = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        }
+        if (!found) dprintf( 2, "[term-diff] no live copy of the file found in memory (freed or not a whole-file buffer)\n" );
+    }
+done:
+    free( fb );
+    free( mb );
+    free( relocs );
+    if (needs_close) close( fd );
+    if (handle) NtClose( handle );
+}
+
+static void ios_term_hooks_dump( const void *frame, uint64_t rip, const uint64_t *gregs, void *owner )
+{
+    static const char *const ntdll_names[] = {
+        "NtProtectVirtualMemory", "NtAllocateVirtualMemory", "NtAllocateVirtualMemoryEx", "NtFreeVirtualMemory",
+        "NtQueryVirtualMemory", "NtReadVirtualMemory", "NtWriteVirtualMemory", "NtFlushInstructionCache",
+        "NtTerminateProcess", "NtTerminateThread", "NtQueryInformationProcess", "NtSetInformationProcess",
+        "NtQueryInformationThread", "NtSetInformationThread", "NtGetContextThread", "NtSetContextThread",
+        "NtQuerySystemInformation", "NtClose", "NtCreateFile", "NtOpenFile", "NtReadFile",
+        "NtQueryAttributesFile", "NtMapViewOfSection", "NtCreateSection", "NtOpenProcess", "NtContinue",
+        "NtRaiseException", "KiUserExceptionDispatcher", "LdrLoadDll", "LdrGetProcedureAddress",
+        "RtlAddVectoredExceptionHandler", "DbgBreakPoint", "DbgUiRemoteBreakin", "NtYieldExecution" };
+    static const char *const base_names[] = {
+        "VirtualProtect", "VirtualProtectEx", "VirtualQuery", "VirtualQueryEx", "VirtualAlloc", "VirtualFree",
+        "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "GetThreadContext", "OutputDebugStringA",
+        "ExitProcess", "TerminateProcess", "GetProcAddress", "LoadLibraryExW", "FlushInstructionCache" };
+    static const char *const iat_names[] = {
+        "NtProtectVirtualMemory", "NtQueryVirtualMemory", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
+        "NtTerminateProcess", "NtQueryInformationProcess" };
+    static const char *const base_mods[] = { "kernelbase.dll", "kernel32.dll" };
+    extern unsigned ios_fex_branch_history_offset( void );
+    extern void ios_protect_ring_dump( uint32_t current_tid );
+    struct { uint64_t magic, serial; struct { uint64_t source, target, block, hint; } edges[8]; } history;
+    const char *off = getenv( "MADEIRA_TERM_HOOKS" );
+    const struct tt_mod *ntdll;
+    unsigned i, j, count;
+    char forward[96], label[96];
+    uint64_t rsp = gregs[4], stub = 0;
+
+    if (off && off[0] == '0') return;
+    tt_load_modules( owner );
+    dprintf( 2, "[term-hooks] begin rev=term-hooks modules=%u rip=%#llx rsp=%#llx rbp=%#llx "
+             "(read-only snapshot at the self-terminate)\n", tt_nmods, (unsigned long long)rip,
+             (unsigned long long)rsp, (unsigned long long)gregs[5] );
+    for (i = 0; i < tt_nmods; i++)
+        dprintf( 2, "[term-hooks] module %s base=%#llx size=%#llx\n", tt_mods[i].name,
+                 (unsigned long long)tt_mods[i].base, (unsigned long long)tt_mods[i].size );
+
+    /* 1. entry points: hooked or not, and where they lead */
+    ntdll = tt_mod_named( "ntdll.dll" );
+    for (i = 0; i < ARRAY_SIZE(ntdll_names); i++)
+    {
+        uint64_t a = tt_export( ntdll, ntdll_names[i], forward, sizeof(forward) );
+        snprintf( label, sizeof(label), "ntdll!%s", ntdll_names[i] );
+        if (!a) { dprintf( 2, "[term-hooks] %s not exported/unreadable\n", label ); continue; }
+        if (forward[0]) { dprintf( 2, "[term-hooks] %s forwarder -> %s\n", label, forward ); continue; }
+        tt_follow( label, a, owner );
+    }
+    for (j = 0; j < ARRAY_SIZE(base_mods); j++)
+    {
+        const struct tt_mod *m = tt_mod_named( base_mods[j] );
+        for (i = 0; i < ARRAY_SIZE(base_names); i++)
+        {
+            uint64_t a = tt_export( m, base_names[i], forward, sizeof(forward) );
+            snprintf( label, sizeof(label), "%s!%s", base_mods[j], base_names[i] );
+            if (!a) { dprintf( 2, "[term-hooks] %s not exported/unreadable\n", label ); continue; }
+            if (forward[0]) { dprintf( 2, "[term-hooks] %s forwarder -> %s\n", label, forward ); continue; }
+            tt_follow( label, a, owner );
+        }
+        /* 2. how kernelbase/kernel32 reach ntdll */
+        for (i = 0; i < ARRAY_SIZE(iat_names); i++) tt_iat( m, "ntdll.dll", iat_names[i], owner );
+    }
+
+    /* 3. what reached the unix protect code */
+    ios_protect_ring_dump( (uint32_t)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
+
+    /* 4. bytes and regions around every recorded branch */
+    if (frame && (j = ios_fex_branch_history_offset()) &&
+        tt_rd( (uint64_t)(uintptr_t)frame + j, &history, sizeof(history) ) == sizeof(history) &&
+        history.magic == UINT64_C(0x314744454742444d))
+    {
+        count = history.serial < 8 ? (unsigned)history.serial : 8;
+        for (i = 0; i < count; i++)
+        {
+            unsigned slot = (unsigned)((history.serial - 1 - i) & 7);
+            uint64_t s = history.edges[slot].source, t = history.edges[slot].target;
+            snprintf( label, sizeof(label), "edge#%u source", i );
+            tt_where( label, s );
+            tt_hex( label, s >= 32 ? s - 32 : s, 80, 0 );
+            snprintf( label, sizeof(label), "edge#%u target", i );
+            tt_where( label, t );
+            tt_hex( label, t, 64, 0 );
+            tt_copy_compare( label, t, 48, owner );
+            if (i == 1) stub = s;
+        }
+    }
+    else dprintf( 2, "[term-hooks] branch history unavailable\n" );
+
+    /* 5. the stub page the quit came from */
+    if (stub)
+    {
+        uint64_t from = (stub & ~UINT64_C(0xff)) - 0x100;
+        tt_where( "stub-page", stub );
+        tt_hex( "stub-page", from, 0x300, 0 );
+    }
+
+    /* 6. registers, guest stack and RBP memory */
+    dprintf( 2, "[term-hooks] regs rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsp=%#llx rbp=%#llx rsi=%#llx rdi=%#llx\n",
+             (unsigned long long)gregs[0], (unsigned long long)gregs[1], (unsigned long long)gregs[2],
+             (unsigned long long)gregs[3], (unsigned long long)gregs[4], (unsigned long long)gregs[5],
+             (unsigned long long)gregs[6], (unsigned long long)gregs[7] );
+    dprintf( 2, "[term-hooks] regs r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
+             (unsigned long long)gregs[8], (unsigned long long)gregs[9], (unsigned long long)gregs[10],
+             (unsigned long long)gregs[11], (unsigned long long)gregs[12], (unsigned long long)gregs[13],
+             (unsigned long long)gregs[14], (unsigned long long)gregs[15] );
+    for (i = 0; i < 16; i++)
+    {
+        snprintf( label, sizeof(label), "reg%u-points-to", i );
+        if (gregs[i] >= 0x10000 && gregs[i] < UINT64_C(0x800000000000)) tt_where( label, gregs[i] );
+    }
+    tt_where( "stack", rsp );
+    for (i = 0; i < 64; i++)
+    {
+        uint64_t q = 0;
+        const struct tt_mod *m;
+        if (tt_rd( rsp + 8 * i, &q, 8 ) != 8) { dprintf( 2, "[term-hooks] stack +%#x unreadable\n", 8 * i ); break; }
+        m = tt_mod_at( q );
+        dprintf( 2, "[term-hooks] stack +%03x: %016llx %s%s%s%llx\n", 8 * i, (unsigned long long)q,
+                 m ? m->name : "", m ? "+" : "", m ? "0x" : "", (unsigned long long)(m ? q - m->base : 0) );
+    }
+    if (gregs[5] >= 0x10000 && gregs[5] < UINT64_C(0x800000000000))
+    {
+        tt_where( "rbp", gregs[5] );
+        /* [term-ring]: the whole checker frame, 1 KB below and above RBP */
+        tt_hex( "rbp-mem", gregs[5] >= 0x400 ? gregs[5] - 0x400 : gregs[5], 0x800, 1 );
+    }
+    /* 7. [term-diff]: the main image vs its file, and the program's own copy of the file */
+    {
+        PEB peb;
+        const struct tt_mod *main_mod = NULL;
+        if (owner && tt_rd( (uint64_t)(uintptr_t)owner, &peb, sizeof(peb) ) == sizeof(peb))
+            main_mod = tt_mod_at( (uint64_t)(uintptr_t)peb.ImageBaseAddress );
+        tt_image_diff( main_mod );
+    }
+    dprintf( 2, "[term-hooks] end rev=term-hooks\n" );
+}
+
 static int ios_dump_guest_instruction( HANDLE handle, LONG exit_code, uint64_t rip, void *owner )
 {
     extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
@@ -4108,7 +4965,11 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
          * captured — the first-3 slots are consumed by early exit-0 procs
          * (cmd/start.exe) before steam.exe ever runs. The dump below (guest RIP +
          * emulator-stack code-address scan) names which steam.exe code path bails. */
-        if (term_log_count < 3 || (exit_code != 0 && term_log_count < 24)) {
+        /* madeira [term-trace]: env.MADEIRA_TERM_TRACE = 1 lifts the exit-0 cap to 24, so
+         * early helper exits cannot use up the slots before the game's own exit. */
+        const char *tt_cap = getenv( "MADEIRA_TERM_TRACE" );
+        const int tt_on = tt_cap && tt_cap[0] == '1';
+        if (term_log_count < 3 || ((exit_code != 0 || tt_on) && term_log_count < 24)) {
             term_log_count++;
             extern volatile uint64_t g_wine_dispatcher_count;
             extern volatile uint64_t g_wine_unix_call_count;
@@ -4155,6 +5016,32 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                             ios_guest_code_pair( "before-rip", rip - 32, cur_teb->Peb );
                         ios_guest_block_dump( fx[0], rip, cur_teb->Peb, 0 );
                         ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
+                    }
+                    else if (handle == NtCurrentProcess() || !handle)
+                    {
+                        /* madeira [term-trace] (env.MADEIRA_TERM_TRACE = 1, per game; off by default):
+                         * a program that ends ITSELF with no exception (BO3 0.2.88: a thread calls
+                         * NtTerminateProcess(self, 0) from a stub on a stack it built, after ~70k log
+                         * lines of syscall-free guest code). Show the last 8 executed branches (FEX
+                         * exits) and the block that ran, so the deciding code is named. Diagnostic
+                         * only: nothing is changed. */
+                        if (tt_on)
+                        {
+                            dprintf( 2, "[term-trace] self-terminate exit_code=0x%x rip=%#llx: last branches follow\n",
+                                     (unsigned int)exit_code, (unsigned long long)rip );
+                            ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
+                            ios_guest_block_dump( fx[0], rip, cur_teb->Peb, 0 );
+                            ios_term_hooks_dump( fex_state, rip, gregs, cur_teb->Peb );
+                            /* madeira [term-ring]: the last 4096 guest blocks this thread entered
+                             * (needs env.MADEIRA_BLOCK_RING = 1), so the check that chose the quit
+                             * path is in the log. Read-only; off with env.MADEIRA_TERM_HOOKS = 0. */
+                            {
+                                extern void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why );
+                                const char *th = getenv( "MADEIRA_TERM_HOOKS" );
+                                if (!(th && th[0] == '0'))
+                                    ios_block_ring_dump( (uintptr_t)cur_teb, 4096, "self-terminate" );
+                            }
+                        }
                     }
                     dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
                             gregs[0], gregs[1], gregs[2], gregs[3],
@@ -4312,17 +5199,20 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         req->exit_code = exit_code;
         ret = wine_server_call( req );
         self = reply->self;
+        exit_code = reply->exit_code;
     }
     SERVER_END_REQ;
     if (self)
     {
 #ifdef WINE_IOS
-        if (!handle) *exiting_flag = TRUE;
-        else if (*exiting_flag) exit_process( exit_code );
+        /* Wine 11.22 order: a process already marked exiting exits with the code the
+         * server recorded, whatever handle this call used. */
+        if (*exiting_flag) exit_process( exit_code );
+        else if (!handle) *exiting_flag = TRUE;
         else abort_process( exit_code );
 #else
-        if (!handle) process_exiting = TRUE;
-        else if (process_exiting) exit_process( exit_code );
+        if (process_exiting) exit_process( exit_code );
+        else if (!handle) process_exiting = TRUE;
         else abort_process( exit_code );
 #endif
     }
@@ -5287,6 +6177,16 @@ NTSTATUS WINAPI NtOpenProcess( HANDLE *handle, ACCESS_MASK access,
     unsigned int status;
 
     *handle = 0;
+
+    /* madeira [proc-list-system]: pid 4 is the System process the process list now shows; Windows
+     * refuses an ordinary caller anything beyond limited query on it. Without this the id would
+     * not exist (STATUS_INVALID_CID) although the list names it. MADEIRA_PROC_LIST_SYSTEM=0 turns
+     * both off. */
+    if (HandleToULong( id->UniqueProcess ) == 4)
+    {
+        const char *e = getenv( "MADEIRA_PROC_LIST_SYSTEM" );
+        if (!(e && e[0] == '0' && !e[1])) return STATUS_ACCESS_DENIED;
+    }
 
     SERVER_START_REQ( open_process )
     {

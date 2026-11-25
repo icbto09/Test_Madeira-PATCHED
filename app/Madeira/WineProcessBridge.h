@@ -52,6 +52,9 @@ void wine_exit_status_reset(void);
 // and fills *appid when one was asked since the last reset.
 void wine_steam_run_requested(unsigned int appid);
 int wine_steam_run_request(uint32_t *appid);
+// A game asked Windows to open a web page (winebrowser.exe <address>); ntdll calls
+// wine_open_link_requested() with the http(s) address and the app opens it in Safari.
+void wine_open_link_requested(const char *url);
 // The session's own program ended while a steam.exe it started still ran (a Steam
 // game started without Madeira Dock); 1 since the last reset.
 int wine_handed_to_steam(void);

@@ -265,3 +265,43 @@ enum ModInstaller {
         try? FileManager.default.removeItem(at: store.appendingPathComponent(prepared.id, isDirectory: true))
     }
 }
+
+// MARK: BepInEx, one tap
+
+extension ModInstaller {
+    /// The pinned BepInEx release into a temporary file (the caller removes it). Any failure to
+    /// fetch it is the same plain error; a wrong file is caught by `BepInExLoader.verify`.
+    static func downloadBepInEx() async throws -> URL {
+        var request = URLRequest(url: BepInExLoader.url)
+        request.timeoutInterval = 60
+        do {
+            let (temporary, response) = try await URLSession.shared.download(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                try? FileManager.default.removeItem(at: temporary)
+                throw ModError.bepinexDownload
+            }
+            let kept = FileManager.default.temporaryDirectory.appendingPathComponent("BepInEx-\(UUID().uuidString).zip")
+            try FileManager.default.moveItem(at: temporary, to: kept)
+            return kept
+        } catch let error as ModError {
+            throw error
+        } catch {
+            throw ModError.bepinexDownload
+        }
+    }
+
+    /// Checks the zip against the pin, unpacks it and installs it like any mod, named "BepInEx"
+    /// (the layout finder takes a folder with BepInEx in it as a BepInEx mod, into the game's folder).
+    static func installBepInEx(zip: URL, game: ModGame, store: URL, progress: @escaping (Phase) -> Void) throws {
+        // One BepInEx per game: a second tap, or a return to the page mid-install, adds nothing.
+        if BepInExLoader.loader(in: ModStore(folder: store, game: game).mods) != nil { return }
+        try BepInExLoader.verify(zip)
+        var prepared = try prepare(zip, store: store, progress: progress)
+        guard prepared.kind == .bepinex else {
+            discard(prepared, store: store)
+            throw ModError.bepinexHash
+        }
+        prepared.name = BepInExLoader.name
+        _ = try install(prepared, choices: nil, game: game, store: store, progress: progress)
+    }
+}

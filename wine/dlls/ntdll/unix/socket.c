@@ -25,11 +25,14 @@
 #include "config.h"
 #include <assert.h>
 #include <errno.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>   /* ml591: CLOCK_MONOTONIC for the per-socket TLS timeline */
+#include <stdio.h>  /* madeira [bsd-sockets]: fprintf for the once-per-process log line */
+#include <stdlib.h> /* madeira [bsd-sockets]: getenv */
 #ifdef HAVE_IFADDRS_H
 # include <ifaddrs.h>
 #endif
@@ -171,6 +174,7 @@ union unix_sockaddr
 struct async_recv_ioctl
 {
     struct async_fileio io;
+    HANDLE handle;
     void *control;
     struct WS_sockaddr *addr;
     int *addr_len;
@@ -184,6 +188,7 @@ struct async_recv_ioctl
 struct async_send_ioctl
 {
     struct async_fileio io;
+    HANDLE handle;
     const struct WS_sockaddr *addr;
     int addr_len;
     int unix_flags;
@@ -197,7 +202,8 @@ struct async_send_ioctl
 struct async_transmit_ioctl
 {
     struct async_fileio io;
-    HANDLE file;
+    HANDLE handle;              /* socket handle */
+    HANDLE file;                /* file to transmit */
     char *buffer;
     unsigned int buffer_size;   /* allocated size of buffer */
     unsigned int read_len;      /* amount of valid data currently in the buffer */
@@ -1319,7 +1325,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
-        ret = fixup_icmp_over_dgram( &hdr, &unix_addr, async->io.handle, ret, &status );
+        ret = fixup_icmp_over_dgram( &hdr, &unix_addr, async->handle, ret, &status );
 
     if (async->control)
     {
@@ -1382,7 +1388,7 @@ static BOOL async_recv_proc( void *user, ULONG_PTR *info, unsigned int *status )
 
     if (*status == STATUS_ALERTED)
     {
-        if ((*status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL )))
+        if ((*status = server_get_unix_fd( async->handle, 0, &fd, &needs_close, NULL, NULL )))
             return TRUE;
 
         *status = try_recv( fd, async, info );
@@ -1481,9 +1487,10 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
 
     async_size = offsetof( struct async_recv_ioctl, iov[count] );
 
-    if (!(async = (struct async_recv_ioctl *)alloc_fileio( async_size, async_recv_proc, handle )))
+    if (!(async = (struct async_recv_ioctl *)alloc_fileio( async_size, async_recv_proc )))
         return STATUS_NO_MEMORY;
 
+    async->handle = handle;
     async->count = count;
     if (afd_is_wow64_caller())
     {
@@ -1522,9 +1529,9 @@ NTSTATUS sock_read( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
     static const DWORD async_size = offsetof( struct async_recv_ioctl, iov[1] );
     struct async_recv_ioctl *async;
 
-    if (!(async = (struct async_recv_ioctl *)alloc_fileio( async_size, async_recv_proc, handle )))
+    if (!(async = (struct async_recv_ioctl *)alloc_fileio( async_size, async_recv_proc )))
         return STATUS_NO_MEMORY;
-
+    async->handle = handle;
     async->count = 1;
     async->iov[0].iov_base = buffer;
     async->iov[0].iov_len = length;
@@ -1644,7 +1651,7 @@ static BOOL async_send_proc( void *user, ULONG_PTR *info, unsigned int *status )
     if (*status == STATUS_ALERTED)
     {
         needs_close = FALSE;
-        if ((fd = async->fd) == -1 && (*status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL )))
+        if ((fd = async->fd) == -1 && (*status = server_get_unix_fd( async->handle, 0, &fd, &needs_close, NULL, NULL )))
             return TRUE;
 
         *status = try_send( fd, async );
@@ -1677,7 +1684,7 @@ static void sock_save_icmp_id( struct async_send_ioctl *async )
     seq = h->un.echo.sequence;
     SERVER_START_REQ( socket_send_icmp_id )
     {
-        req->handle = wine_server_obj_handle( async->io.handle );
+        req->handle = wine_server_obj_handle( async->handle );
         req->icmp_id = id;
         req->icmp_seq = seq;
         if (wine_server_call( req ))
@@ -1740,13 +1747,14 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
             addr_size = max( 0, async->addr_len );
             async_size = offsetof( struct async_send_ioctl, iov[1] ) + data_size + addr_size
                          + sizeof(IO_STATUS_BLOCK) + sizeof(IO_STATUS_BLOCK32);
-            if (!(rem_async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc, handle )))
+            if (!(rem_async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc )))
             {
                 status = STATUS_NO_MEMORY;
             }
             else
             {
                 /* Use a local copy of socket fd so the async send works after socket handle is closed. */
+                rem_async->handle = handle;
                 rem_async->fd = dup( fd );
                 rem_async->count = 1;
                 p = (char *)rem_async + offsetof( struct async_send_ioctl, iov[1] );
@@ -1803,9 +1811,10 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
 
     async_size = offsetof( struct async_send_ioctl, iov[count] );
 
-    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc, handle )))
+    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc )))
         return STATUS_NO_MEMORY;
 
+    async->handle = handle;
     async->count = count;
     if (afd_is_wow64_caller())
     {
@@ -1844,9 +1853,10 @@ NTSTATUS sock_write( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
     static const DWORD async_size = offsetof( struct async_send_ioctl, iov[1] );
     struct async_send_ioctl *async;
 
-    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc, handle )))
+    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc )))
         return STATUS_NO_MEMORY;
 
+    async->handle = handle;
     async->fd = -1;
     async->count = 1;
     async->iov[0].iov_base = (void *)buffer;
@@ -1961,7 +1971,7 @@ static BOOL async_transmit_proc( void *user, ULONG_PTR *info, unsigned int *stat
 
     if (*status == STATUS_ALERTED)
     {
-        if ((*status = server_get_unix_fd( async->io.handle, 0, &sock_fd, &sock_needs_close, NULL, NULL )))
+        if ((*status = server_get_unix_fd( async->handle, 0, &sock_fd, &sock_needs_close, NULL, NULL )))
             return TRUE;
 
         if (async->file && (*status = server_get_unix_fd( async->file, 0, &file_fd, &file_needs_close, NULL, NULL )))
@@ -2013,9 +2023,10 @@ static NTSTATUS sock_transmit( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
         }
     }
 
-    if (!(async = (struct async_transmit_ioctl *)alloc_fileio( sizeof(*async), async_transmit_proc, handle )))
+    if (!(async = (struct async_transmit_ioctl *)alloc_fileio( sizeof(*async), async_transmit_proc )))
         return STATUS_NO_MEMORY;
 
+    async->handle = handle;
     async->file = ULongToHandle( params->file );
     async->buffer_size = params->buffer_size ? params->buffer_size : 65536;
     if (!(async->buffer = malloc( async->buffer_size )))
@@ -2110,6 +2121,63 @@ static NTSTATUS do_getsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
 }
 
 
+/* madeira [bsd-sockets]: one switch for the BSD-socket fixes taken from MetalSharp-Wine
+ * patches 0149-0157 (ntdll, ws2_32 and wineserver each read it).
+ * env MADEIRA_BSD_SOCKETS=0 restores the previous behaviour; default on.
+ * On iOS this unix image lives as long as the app, across game sessions that each export their
+ * own env lines (see virtual_ios.c [x64-rwx-reread]), so the value is read again on every call
+ * and the log line is printed when it changes; callers test it after their cheap checks.
+ * Elsewhere it is read once per process. Never called from a signal handler.
+ * Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine (LGPL-2.1) */
+int madeira_bsd_sockets(void)
+{
+#ifdef WINE_IOS
+    static int logged = -1;
+    const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+    int m = !(e && e[0] == '0' && !e[1]);
+
+    if (__atomic_exchange_n( &logged, m, __ATOMIC_RELAXED ) != m)
+        fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (ntdll)\n", m ? "on" : "off" );
+    return m;
+#else
+    static int mode = -1;   /* -1 not read, 0 off, 1 on */
+    int m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
+
+    if (m < 0)
+    {
+        const char *e = getenv( "MADEIRA_BSD_SOCKETS" );
+        int expected = -1;
+
+        m = !(e && e[0] == '0' && !e[1]);
+        if (__atomic_compare_exchange_n( &mode, &expected, m, FALSE, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            fprintf( stderr, "[bsd-sockets] rev=bsd-sockets-1 %s (ntdll)\n", m ? "on" : "off" );
+        else m = expected;
+    }
+    return m;
+#endif
+}
+
+
+/* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+static socklen_t host_optlen( int level, int option, socklen_t optlen )
+{
+#ifdef __APPLE__
+    /* macOS takes an integer IPv6 option only in a buffer exactly the size of an int,
+     * where Windows and Linux read the int from the start of a longer one */
+    if (level == IPPROTO_IPV6 && optlen > sizeof(int)
+#ifdef IPV6_JOIN_GROUP
+        && option != IPV6_JOIN_GROUP
+#endif
+#ifdef IPV6_LEAVE_GROUP
+        && option != IPV6_LEAVE_GROUP
+#endif
+        && madeira_bsd_sockets())   /* off (MADEIRA_BSD_SOCKETS=0): optlen as given */
+        return sizeof(int);
+#endif
+    return optlen;
+}
+
+
 static NTSTATUS do_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
                                int option, const void *optval, socklen_t optlen )
 {
@@ -2120,11 +2188,94 @@ static NTSTATUS do_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
         return status;
 
-    ret = setsockopt( fd, level, option, optval, optlen );
+    /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+    ret = setsockopt( fd, level, option, optval, host_optlen( level, option, optlen ) );
     if (needs_close) close( fd );
     if (ret) return sock_errno_to_status( errno );
     if (io) io->Status = STATUS_SUCCESS;
     return STATUS_SUCCESS;
+}
+
+
+/* A boolean option reads as 1 when set. BSD kernels report the option's flag bit
+ * instead (8 for SO_KEEPALIVE, 4 for TCP_NODELAY).
+ * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+static NTSTATUS do_getsockopt_bool( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+                                    int option, void *out_buffer, ULONG out_size )
+{
+#ifdef __APPLE__
+    /* read the whole int: a shorter read keeps only the low bytes of the flag bit
+     * (SO_OOBINLINE is 0x100) */
+    IO_STATUS_BLOCK host_io;
+    NTSTATUS status;
+    int value = 0;
+
+    if (!out_size || !madeira_bsd_sockets())
+        return do_getsockopt( handle, io, level, option, out_buffer, out_size );
+    if ((status = do_getsockopt( handle, &host_io, level, option, &value, sizeof(value) )))
+        return status;
+    value = !!value;
+    io->Information = min( out_size, sizeof(value) );
+    memcpy( out_buffer, &value, io->Information );
+    io->Status = STATUS_SUCCESS;
+    return STATUS_SUCCESS;
+#else
+    return do_getsockopt( handle, io, level, option, out_buffer, out_size );
+#endif
+}
+
+
+/* IPv4 options holding a byte (IP_TOS, IP_TTL, IP_MULTICAST_TTL, IP_MULTICAST_LOOP).
+ * Windows, like Linux, reads a value shorter than an int as one unsigned byte and
+ * returns one byte when asked for less than an int. macOS wants an int, and keeps
+ * only the low byte of the int it is given for IP_MULTICAST_LOOP.
+ * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+static NTSTATUS do_setsockopt_ip_byte( HANDLE handle, IO_STATUS_BLOCK *io, int option,
+                                       const void *in_buffer, ULONG in_size )
+{
+#ifdef __APPLE__
+    int value;
+
+    if (!in_size || !madeira_bsd_sockets())
+        return do_setsockopt( handle, io, IPPROTO_IP, option, in_buffer, in_size );
+    if (in_size >= sizeof(value)) memcpy( &value, in_buffer, sizeof(value) );
+    else value = *(const unsigned char *)in_buffer;
+    if (option == IP_MULTICAST_LOOP) value = !!value;
+    return do_setsockopt( handle, io, IPPROTO_IP, option, &value, sizeof(value) );
+#else
+    return do_setsockopt( handle, io, IPPROTO_IP, option, in_buffer, in_size );
+#endif
+}
+
+
+static NTSTATUS do_getsockopt_ip_byte( HANDLE handle, IO_STATUS_BLOCK *io, int option,
+                                       void *out_buffer, ULONG out_size )
+{
+#ifdef __APPLE__
+    IO_STATUS_BLOCK host_io;
+    NTSTATUS status;
+    int value = 0;
+
+    if (!out_size || !madeira_bsd_sockets())
+        return do_getsockopt( handle, io, IPPROTO_IP, option, out_buffer, out_size );
+    /* a one-byte answer lands in the low byte of the zeroed int */
+    if ((status = do_getsockopt( handle, &host_io, IPPROTO_IP, option, &value, sizeof(value) )))
+        return status;
+    if (out_size < sizeof(value) && value >= 0 && value <= 255)
+    {
+        *(unsigned char *)out_buffer = value;
+        io->Information = 1;
+    }
+    else
+    {
+        io->Information = min( out_size, sizeof(value) );
+        memcpy( out_buffer, &value, io->Information );
+    }
+    io->Status = STATUS_SUCCESS;
+    return STATUS_SUCCESS;
+#else
+    return do_getsockopt( handle, io, IPPROTO_IP, option, out_buffer, out_size );
+#endif
 }
 
 
@@ -2605,13 +2756,15 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             break;
 
         case IOCTL_AFD_WINE_GET_SO_BROADCAST:
-            return do_getsockopt( handle, io, SOL_SOCKET, SO_BROADCAST, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_BROADCAST, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_SO_BROADCAST:
             return do_setsockopt( handle, io, SOL_SOCKET, SO_BROADCAST, in_buffer, in_size );
 
         case IOCTL_AFD_WINE_GET_SO_KEEPALIVE:
-            return do_getsockopt( handle, io, SOL_SOCKET, SO_KEEPALIVE, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_KEEPALIVE, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_SO_KEEPALIVE:
             return do_setsockopt( handle, io, SOL_SOCKET, SO_KEEPALIVE, in_buffer, in_size );
@@ -2651,7 +2804,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         }
 
         case IOCTL_AFD_WINE_GET_SO_OOBINLINE:
-            return do_getsockopt( handle, io, SOL_SOCKET, SO_OOBINLINE, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_OOBINLINE, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_SO_OOBINLINE:
             return do_setsockopt( handle, io, SOL_SOCKET, SO_OOBINLINE, in_buffer, in_size );
@@ -2770,28 +2924,32 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         {
             int sock_type = get_sock_type( handle );
             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
-            return do_getsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_LOOP, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_ip_byte( handle, io, IP_MULTICAST_LOOP, out_buffer, out_size );
         }
 
         case IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP:
         {
             int sock_type = get_sock_type( handle );
             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
-            return do_setsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_LOOP, in_buffer, in_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_setsockopt_ip_byte( handle, io, IP_MULTICAST_LOOP, in_buffer, in_size );
         }
 
         case IOCTL_AFD_WINE_GET_IP_MULTICAST_TTL:
         {
             int sock_type = get_sock_type( handle );
             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
-            return do_getsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_TTL, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_ip_byte( handle, io, IP_MULTICAST_TTL, out_buffer, out_size );
         }
 
         case IOCTL_AFD_WINE_SET_IP_MULTICAST_TTL:
         {
             int sock_type = get_sock_type( handle );
             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
-            return do_setsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_TTL, in_buffer, in_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_setsockopt_ip_byte( handle, io, IP_MULTICAST_TTL, in_buffer, in_size );
         }
 
         case IOCTL_AFD_WINE_GET_IP_OPTIONS:
@@ -2863,16 +3021,20 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 #endif
 
         case IOCTL_AFD_WINE_GET_IP_TOS:
-            return do_getsockopt( handle, io, IPPROTO_IP, IP_TOS, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_ip_byte( handle, io, IP_TOS, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_IP_TOS:
-            return do_setsockopt( handle, io, IPPROTO_IP, IP_TOS, in_buffer, in_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_setsockopt_ip_byte( handle, io, IP_TOS, in_buffer, in_size );
 
         case IOCTL_AFD_WINE_GET_IP_TTL:
-            return do_getsockopt( handle, io, IPPROTO_IP, IP_TTL, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_ip_byte( handle, io, IP_TTL, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_IP_TTL:
-            return do_setsockopt( handle, io, IPPROTO_IP, IP_TTL, in_buffer, in_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_setsockopt_ip_byte( handle, io, IP_TTL, in_buffer, in_size );
 
 #ifdef IP_UNBLOCK_SOURCE
         case IOCTL_AFD_WINE_SET_IP_UNBLOCK_SOURCE:
@@ -2885,6 +3047,39 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
         case IOCTL_AFD_WINE_SET_IP_UNICAST_IF:
             return do_setsockopt( handle, io, IPPROTO_IP, IP_UNICAST_IF, in_buffer, in_size );
+#elif defined(IP_BOUND_IF)
+        /* the same option on macOS, which takes the interface index in host byte order;
+         * Windows, like Linux, takes it in network byte order.
+         * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0157 (LGPL-2.1)
+         * Off: STATUS_BAD_DEVICE_TYPE, what the default case gave before. */
+        case IOCTL_AFD_WINE_GET_IP_UNICAST_IF:
+        {
+            IO_STATUS_BLOCK host_io;
+            NTSTATUS ret;
+            int index = 0;
+
+            if (!madeira_bsd_sockets()) return STATUS_BAD_DEVICE_TYPE;
+            if (!out_size) return do_getsockopt( handle, io, IPPROTO_IP, IP_BOUND_IF, out_buffer, out_size );
+            if ((ret = do_getsockopt( handle, &host_io, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index) )))
+                return ret;
+            index = htonl( index );
+            io->Information = min( out_size, sizeof(index) );
+            memcpy( out_buffer, &index, io->Information );
+            io->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_AFD_WINE_SET_IP_UNICAST_IF:
+        {
+            int index;
+
+            if (!madeira_bsd_sockets()) return STATUS_BAD_DEVICE_TYPE;
+            if (in_size < sizeof(index))
+                return do_setsockopt( handle, io, IPPROTO_IP, IP_BOUND_IF, in_buffer, in_size );
+            memcpy( &index, in_buffer, sizeof(index) );
+            index = ntohl( index );
+            return do_setsockopt( handle, io, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index) );
+        }
 #endif
 
 #ifdef IPV6_ADD_MEMBERSHIP
@@ -2944,7 +3139,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         {
             int value = *(DWORD *)in_buffer ? IPV6_PMTUDISC_DO : IPV6_PMTUDISC_DONT;
 
-            return do_setsockopt( handle, io, IPPROTO_IP, IPV6_MTU_DISCOVER, &value, sizeof(value) );
+            return do_setsockopt( handle, io, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &value, sizeof(value) );
         }
 #else
         {
@@ -3063,6 +3258,15 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
         case IOCTL_AFD_WINE_SET_IPV6_UNICAST_IF:
             return do_setsockopt( handle, io, IPPROTO_IPV6, IPV6_UNICAST_IF, in_buffer, in_size );
+#elif defined(IPV6_BOUND_IF)
+        /* the same option on macOS. madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0157 (LGPL-2.1) */
+        case IOCTL_AFD_WINE_GET_IPV6_UNICAST_IF:
+            if (!madeira_bsd_sockets()) return STATUS_BAD_DEVICE_TYPE;
+            return do_getsockopt( handle, io, IPPROTO_IPV6, IPV6_BOUND_IF, out_buffer, out_size );
+
+        case IOCTL_AFD_WINE_SET_IPV6_UNICAST_IF:
+            if (!madeira_bsd_sockets()) return STATUS_BAD_DEVICE_TYPE;
+            return do_setsockopt( handle, io, IPPROTO_IPV6, IPV6_BOUND_IF, in_buffer, in_size );
 #endif
 
         case IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
@@ -3085,7 +3289,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
                 break;
             }
 
-            ret = setsockopt( fd, IPPROTO_IPV6, IPV6_V6ONLY, in_buffer, in_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            ret = setsockopt( fd, IPPROTO_IPV6, IPV6_V6ONLY, in_buffer, host_optlen( IPPROTO_IPV6, IPV6_V6ONLY, in_size ) );
             status = ret ? sock_errno_to_status( errno ) : STATUS_SUCCESS;
             break;
         }
@@ -3175,7 +3380,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 #endif
 
         case IOCTL_AFD_WINE_GET_TCP_NODELAY:
-            return do_getsockopt( handle, io, IPPROTO_TCP, TCP_NODELAY, out_buffer, out_size );
+            /* madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            return do_getsockopt_bool( handle, io, IPPROTO_TCP, TCP_NODELAY, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_TCP_NODELAY:
             return do_setsockopt( handle, io, IPPROTO_TCP, TCP_NODELAY, in_buffer, in_size );
@@ -3196,17 +3402,32 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             return do_setsockopt( handle, io, IPPROTO_TCP, TCP_KEEPALIVE, in_buffer, in_size );
 #endif
 
+#if defined(TCP_KEEPINTVL)
         case IOCTL_AFD_WINE_GET_TCP_KEEPINTVL:
             return do_getsockopt( handle, io, IPPROTO_TCP, TCP_KEEPINTVL, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_TCP_KEEPINTVL:
             return do_setsockopt( handle, io, IPPROTO_TCP, TCP_KEEPINTVL, in_buffer, in_size );
+#endif
 
+#if defined(TCP_KEEPCNT)
         case IOCTL_AFD_WINE_GET_TCP_KEEPCNT:
             return do_getsockopt( handle, io, IPPROTO_TCP, TCP_KEEPCNT, out_buffer, out_size );
 
         case IOCTL_AFD_WINE_SET_TCP_KEEPCNT:
+#ifdef __APPLE__
+            /* Windows refuses a count above 255 (Linux one above 127); macOS takes any.
+             * madeira [bsd-sockets] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine patch 0152 (LGPL-2.1) */
+            if (in_size >= sizeof(int) && madeira_bsd_sockets())
+            {
+                unsigned int count;
+
+                memcpy( &count, in_buffer, sizeof(count) );
+                if (count > 255) return STATUS_INVALID_PARAMETER;
+            }
+#endif
             return do_setsockopt( handle, io, IPPROTO_TCP, TCP_KEEPCNT, in_buffer, in_size );
+#endif
 
         default:
         {

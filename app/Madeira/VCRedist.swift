@@ -441,8 +441,10 @@ struct VCRedistSettingsSection: View {
                     Label(redist.complete ? "Install again" : (redist.error == nil ? "Download and install" : "Try Again"),
                           systemImage: "arrow.down.circle")
                 }
+                .padRow("rt-vcredist-install") { redist.install() }
                 if !redist.installed.isEmpty {
                     Button("Remove the runtime", role: .destructive) { confirmRemove = true }
+                        .padRow("rt-vcredist-remove") { confirmRemove = true }
                 }
             }
         } header: {
@@ -699,7 +701,12 @@ struct XAudio2SettingsSection: View {
                     Label(model.complete ? "Install again" : (model.error == nil ? "Download and install" : "Try Again"),
                           systemImage: "arrow.down.circle")
                 }
-                if model.complete { Button("Remove XAudio2", role: .destructive) { confirmRemove = true } }
+                .padRow("rt-xaudio2-install") { model.install() }
+                if model.complete {
+                    Button("Remove XAudio2", role: .destructive) { confirmRemove = true }
+                        .padRow("rt-xaudio2-remove") { confirmRemove = true }
+                }
+
             }
         } header: {
             Text("DirectX audio (XAudio2)")
@@ -897,7 +904,11 @@ struct DotNet10SettingsSection: View {
                     Label(model.installed ? "Install again" : (model.error == nil ? "Download and install" : "Try Again"),
                           systemImage: "arrow.down.circle")
                 }
-                if model.installed { Button("Remove the runtime", role: .destructive) { confirmRemove = true } }
+                .padRow("rt-dotnet10-install") { model.install() }
+                if model.installed {
+                    Button("Remove the runtime", role: .destructive) { confirmRemove = true }
+                        .padRow("rt-dotnet10-remove") { confirmRemove = true }
+                }
             }
         } header: {
             Text(".NET 10")

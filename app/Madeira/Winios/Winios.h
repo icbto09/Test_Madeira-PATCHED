@@ -84,6 +84,8 @@ int winios_compositor_set_hidden(int hidden);
  * presents from (IOSDisplayShim) is never drawn as a GDI window; a Wine
  * session start clears the overlay. */
 void winios_note_game_metal_hwnd(void *hwnd);
+/* cover-window: the OpenGL presenter took the game layer (WiniosGL.m). */
+void winios_note_game_picture(void);
 void winios_session_reset(void);
 /* Ends a Dock session: explorer's desktop is asked to close (its own thread posts WM_CLOSE). */
 void winios_close_desktop(void);

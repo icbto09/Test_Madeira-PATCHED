@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import SwiftUI
 
@@ -21,6 +22,10 @@ struct MadeiraApp: App {
     @UIApplicationDelegateAdaptor(MadeiraAppDelegate.self) private var appDelegate
 
     init() {
+        // (kill-list) switches the team turned off for this build, from the signed kept file; before anything reads a switch.
+        KillList.apply()
+        // (stock-apple-stage3) Its log line, and a new install's Library defaults (never over a set value).
+        StockApple.stage3Start()
         // [main-stack-move] crash guard (JITAllocator.c): still alive a few seconds after opening, so the
         // next start may move the stack again. Logs what the move did when it was asked for.
         let msmNote = String(cString: madeira_stack_move_note())
@@ -57,6 +62,7 @@ struct MadeiraApp: App {
             ContentView()
                 .background(InteractionFrameRateInstaller())   // touch frame-rate request (New library grid)
                 .modifier(ClaimGamepadEvents())
+                .modifier(FoldableFillsWindow())   // iPhone Duo: no dead column beside the library
                 .onAppear {
                     ExternalDrives.shared.mountAll()
                     GamepadInput.shared.start()
@@ -69,6 +75,8 @@ struct MadeiraApp: App {
                     CrashReports.start()                          // crashes, freezes and own errors go to the team (CrashReports.swift)
                     GetHelpUpload.resendLate()                    // (late-zip) Get Help zips Madeira closed before sending (GetHelpView.swift)
                     SharedConfigs.refresh()                       // (shared-configs) approved settings from other players (SharedConfigs.swift)
+                    RemoteRecs.refresh()                          // (remote-recs) newest game lists from the Get Help server (RemoteRecs.swift)
+                    KillList.refresh()                            // (kill-list) newest signed list of switches to keep off (KillList.swift)
                 }
                 // madeira://jit-network/... (the Madeira JIT shortcut returning, JITNetwork.swift),
                 // else a shared game setup (a .madeirasetup file or madeira://setup?d=..., GameSetupShare.swift),
@@ -78,6 +86,26 @@ struct MadeiraApp: App {
                     ShortcutRouter.shared.handle(url)
                 }
         }
+    }
+}
+
+/// iPhone Duo (iPhone19,4), unfolded: iOS reports an 84 pt safe-area column on the
+/// right of the window. ContentView stopped at it, so the column lay outside the
+/// view that claims game-controller events (ClaimGamepadEvents) and taps and the
+/// pad did nothing in the library there. The whole window is given to the app on
+/// that model, as upstream Madeira does (willfaust/Madeira pull request 624 by
+/// Lee Simpson; this is that modifier). Every other model is left exactly as it
+/// was. env.MADEIRA_DUO_FILL_WINDOW=0 in madeira.cfg turns it off.
+struct FoldableFillsWindow: ViewModifier {
+    static let models: Set<String> = ["iPhone19,4"]
+    static let active: Bool = {
+        guard MadeiraConfig.flag("MADEIRA_DUO_FILL_WINDOW") else { return false }
+        let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"]
+        return models.contains(simulated ?? DeviceDiagnostics.machine())
+    }()
+
+    func body(content: Content) -> some View {
+        if Self.active { content.ignoresSafeArea() } else { content }
     }
 }
 
@@ -161,6 +189,38 @@ enum ExternalDisplay {
         window = w
         active = true
         LogStore.shared.log("[display] external screen connected \(Int(scene.screen.bounds.width))x\(Int(scene.screen.bounds.height)): game view moved there")
+        logLatencyFacts(scene, why: "connected")
+        // Again once the game view has been laid out there and sound has settled on its output.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak scene] in
+            MainActor.assumeIsolated {
+                guard active, let scene else { return }
+                logLatencyFacts(scene, why: "5 s later")
+            }
+        }
+    }
+
+    /// Log only (tv-lag): what iOS says about the second screen and where sound
+    /// goes, so a report of slow controls on a TV shows whether the picture
+    /// travels by cable or by AirPlay, the TV's own delay as iOS knows it, and
+    /// the refresh rate the game view is drawn at. Changes nothing.
+    /// env.MADEIRA_TV_LAG_LOG=0 in madeira.cfg turns the lines off.
+    @MainActor static func logLatencyFacts(_ scene: UIWindowScene, why: String) {
+        guard MadeiraConfig.flag("MADEIRA_TV_LAG_LOG") else { return }
+        let screen = scene.screen
+        let mode = screen.currentMode?.size ?? .zero
+        let best = screen.preferredMode?.size ?? .zero
+        let session = AVAudioSession.sharedInstance()
+        let ports: String = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let host = MetalHostView.shared
+        let drawable: CGSize = host.metalLayer.drawableSize
+        let onSecond: String = host.window?.windowScene === scene ? "yes" : "not yet"
+        let scale: Double = Double(screen.scale)
+        let fps: Int = screen.maximumFramesPerSecond
+        let screenMs: Double = screen.calibratedLatency * 1000
+        let soundMs: Double = session.outputLatency * 1000
+        let format = "[tv-lag] %@: screen mode %dx%d (best %dx%d) scale %.1f, up to %d fps, screen delay iOS reports %.0f ms (0 = unknown or none), sound out [%@] delay %.0f ms, game layer %dx%d on the second screen %@"
+        LogStore.shared.log(String(format: format, why, Int(mode.width), Int(mode.height), Int(best.width), Int(best.height),
+                                   scale, fps, screenMs, ports, soundMs, Int(drawable.width), Int(drawable.height), onSecond))
     }
 
     @MainActor static func disconnect() {
