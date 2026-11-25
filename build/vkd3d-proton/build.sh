@@ -99,6 +99,13 @@ find "$SRC" -name "*.orig" -delete
 
 # 3. ARM64EC cross build. -static links the C++ runtime (dxil-spirv) in, as DXMT does.
 CROSS="$VKD3D_WORK/arm64ec-cross.txt"
+# An older VKD3D_REF (v2.14) ships Vulkan headers from before KosmicKrisp had a driver ID,
+# which the kosmickrisp patches compare against: give it the registry value (28).
+c_args="[]"
+if ! grep -qs VK_DRIVER_ID_MESA_KOSMICKRISP "$SRC/khronos/Vulkan-Headers/include/vulkan/vulkan_core.h"; then
+    c_args="['-DVK_DRIVER_ID_MESA_KOSMICKRISP=((VkDriverId)28)']"
+    echo "Vulkan headers without VK_DRIVER_ID_MESA_KOSMICKRISP: defined as 28"
+fi
 cat > "$CROSS.new" <<CROSSFILE
 [binaries]
 c = '$M-clang'
@@ -109,6 +116,7 @@ widl = '$M-widl'
 windres = '$M-windres'
 
 [built-in options]
+c_args = $c_args
 c_link_args = ['-static']
 cpp_link_args = ['-static', '-static-libstdc++']
 
