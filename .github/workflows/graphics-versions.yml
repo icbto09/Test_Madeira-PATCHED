@@ -19,11 +19,11 @@ on:
         options: [both, dxvk, vkd3d-proton]
         default: both
       dxvk_ref:
-        description: "DXVK tag, branch or commit (empty: Madeira's pin, build/dxvk/build.sh)"
+        description: "DXVK tag (v2.7.1, v3.1.1), branch or commit; empty: Madeira's pin (v3.1.1)"
         type: string
         default: ""
       vkd3d_ref:
-        description: "vkd3d-proton tag, branch or commit (empty: Madeira's pin, build/vkd3d-proton/build.sh)"
+        description: "vkd3d-proton tag (v2.14.1, v3.1), branch or commit; empty: Madeira's pin (v3.1)"
         type: string
         default: ""
       patches:
@@ -77,7 +77,7 @@ jobs:
           name="dxvk-$safe-$tag"
           dest="$OUT/$name"
           mkdir -p "$dest/licenses"
-          DEST="$dest" LIC_DEST="$dest/licenses" build/dxvk/build.sh
+          DEST="$dest" LIC_DEST="$dest/licenses" bash build/dxvk/build.sh
           # Madeira's bundle names them dxvk-<dll>; an imported version holds plain names.
           for f in "$dest"/dxvk-*.dll; do mv "$f" "$dest/${f##*/dxvk-}"; done
           {
@@ -117,7 +117,7 @@ jobs:
           name="vkd3d-proton-$safe-$tag"
           dest="$OUT/$name"
           mkdir -p "$dest/licenses"
-          DEST="$dest" LIC_DEST="$dest/licenses" build/vkd3d-proton/build.sh
+          DEST="$dest" LIC_DEST="$dest/licenses" bash build/vkd3d-proton/build.sh
           {
             echo "vkd3d-proton $ref ($(git -C toolchains/vkd3d-proton rev-parse HEAD)), ARM64EC, built by $GITHUB_REPOSITORY run $GITHUB_RUN_ID"
             echo "Patches ($VKD3D_PATCHES):"
