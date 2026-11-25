@@ -115,6 +115,14 @@ for m in "$@"; do
     # The file is the module's MODULE line: windows.gaming.input is a .dll, winecoreaudio.drv is not.
     f="$(sed -n 's/^MODULE[[:space:]]*=[[:space:]]*//p' "$R/wine/dlls/$m/Makefile.in")"
     [ -n "$f" ] || { echo "$m: no MODULE line in wine/dlls/$m/Makefile.in" >&2; exit 1; }
+    # Wine 11 (0.2.100) builds some old modules for i386 only (ENABLE_ARCHS = i386: crtdll,
+    # msvcr70/71, msvcrt20/40, d3d8, dplay, ...), so this ARM64EC tree has no rule for them;
+    # the 32-bit farm still ships them. A make variable (dmsynth's $(CXX_PE_ARCHS)) is kept.
+    archs="$(sed -n 's/^ENABLE_ARCHS[[:space:]]*=[[:space:]]*//p' "$R/wine/dlls/$m/Makefile.in")"
+    if [ -n "$archs" ] && [[ "$archs" != *'$('* ]] && [[ " $archs " != *" arm64ec "* ]]; then
+        echo "$m: not built for ARM64EC (ENABLE_ARCHS = $archs), skipped"
+        continue
+    fi
     targets+=("dlls/$m/arm64ec-windows/$f")
     names+=("$f")
 done
