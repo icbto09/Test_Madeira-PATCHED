@@ -14254,16 +14254,17 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     }
 #ifdef WINE_IOS
     /* MADEIRA_SB_NULL_UB_SKIP=1: the PE side (signal_arm64ec.c, ios_sb_null_ub_skip) resumes
-     * Stellar Blade's null uniform-buffer read at 0x18 instead of crashing, so it can recur
-     * every frame. Keep the first 8 of these lines and the region scan, then stay quiet for
-     * reads at 0x18; the PE side logs each new shader and a count every 1000 skips. */
+     * Stellar Blade's null uniform-buffer reads (site A at 0x18, site B at slot*8, both below
+     * 0x80) instead of crashing, so they can recur every frame. Keep the first 8 of these lines
+     * and the region scan, then stay quiet for 8-byte-aligned reads below 0x80; the PE side logs
+     * each new shader and a count every 1000 skips. */
     static int sb_skip_env = -1, sb_quiet_n;
     if (sb_skip_env < 0)
     {
         const char *e = getenv( "MADEIRA_SB_NULL_UB_SKIP" );
         sb_skip_env = e && !strcmp( e, "1" );
     }
-    if (!(sb_skip_env && (uintptr_t)siginfo->si_addr == 0x18 &&
+    if (!(sb_skip_env && (uintptr_t)siginfo->si_addr < 0x80 && !((uintptr_t)siginfo->si_addr & 7) &&
           __atomic_add_fetch( &sb_quiet_n, 1, __ATOMIC_RELAXED ) > 8))
     {
     ERR("setup_exception for SEGV at pc=%p addr=%p (virtual_handle_fault failed)\n",

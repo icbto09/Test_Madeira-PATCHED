@@ -7130,34 +7130,75 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
 }
 
 
-/* Stellar Blade: skip a null pixel-stage uniform buffer (MADEIRA_SB_NULL_UB_SKIP=1, off by default).
+/* Stellar Blade: skip a null uniform buffer (MADEIRA_SB_NULL_UB_SKIP=1, off by default).
  *
- * The crash (SB-Win64-Shipping.exe+0x2e3ec81, AV read of 0x18) is in Unreal's D3D11 RHI,
- * SetResourcesFromTables for the pixel stage. It walks the set bits of
- *   Shader->ShaderResourceTable.ResourceTableBits ([rbp+0x30]) & DirtyUniformBuffers ([rbx+0x43ce])
- * and dereferences BoundUniformBuffers[stage][index] ([rbx+0x4278+index*8]) with the check
- * compiled out of the shipping build:
+ * Unreal's D3D11 RHI (SetResourcesFromTables) walks the set bits of
+ *   Shader->ShaderResourceTable.ResourceTableBits & DirtyUniformBuffers ([owner+0x43ce])
+ * and uses BoundUniformBuffers[stage][index] ([owner+0x4278+index*8]). On this device the game
+ * has bound fewer or other slots than the shader asks for (Nov 24: wanted 0,2,3 with 0,1,2
+ * bound; then wanted 0,4,5 with 0-4 bound), so a slot is null. Two places fault on it:
+ *
+ * Site A, SB-Win64-Shipping.exe+0x2e3ec81 (AV reading 0x18): no null check.
  *   +0x2e3ec79  mov r8,[rbx+rax*8+0x4278]
- *   +0x2e3ec81  mov rcx,[r8+0x18]      <- r8 == 0
- *   ...
- *   +0x2e3ecdb  test edi,edi / jnz loop  (edi already has this index cleared)
- * In the captured log the game bound slots 0,1,2 just before the draw while the shader's mask
- * was 0x0d (slots 0,2,3): slot 3 was never written. This does not find out why; it moves the
- * faulting thread to the loop's next-index test, as if the bit were clear, so the draw goes on
- * without that buffer's textures and samplers (wrong-looking output for those draws at worst).
- * The x86 bytes on both sides are checked so another build of the game is left alone.
- * Each distinct shader seen here is logged once ([sb-ub-skip] new shader). */
+ *   +0x2e3ec81  mov rcx,[r8+0x18]          <- r8 == 0
+ *   +0x2e3ecdb  test edi,edi / jnz loop     (edi already has this index cleared)
+ * Site B, +0x2e6396f (AV reading index*8): it checks for null, but its error path looks up the
+ * buffer's name in an array the shipping build left empty.
+ *   +0x2e63957  mov rbp,[r13+r14*8+0x4278] / test rbp,rbp / jnz have_buffer
+ *   +0x2e63968  mov rbx,[r15+0x88]          (names array, data pointer null)
+ *   +0x2e6396f  mov ebx,[rbx+r14*8]        <- rbx == 0
+ *   +0x2e63a87  mov r15,[rsp+0x88] / test esi,esi / jnz loop  (esi already has this index cleared)
+ *
+ * This does not find out why the slot is empty. At either site it moves the faulting thread
+ * to the loop's next-index test, as if that bit were clear, so the draw goes on without that
+ * buffer's textures and samplers (wrong-looking output for those draws at worst). The x86 bytes
+ * around the fault and at the resume point are checked first, so another build of the game is
+ * left alone. Each distinct shader seen here is logged once ([sb-ub-skip] new shader). */
+struct ios_sb_site
+{
+    const char *name;
+    const BYTE *before; SIZE_T before_len;   /* bytes ending at the faulting instruction */
+    const BYTE *at;     SIZE_T at_len;       /* the faulting instruction */
+    ULONG64     resume_off;                  /* from the faulting instruction */
+    const BYTE *resume; SIZE_T resume_len;
+};
+
+static const BYTE ios_sb_a_before[8] = { 0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00 };   /* mov r8,[rbx+rax*8+0x4278] */
+static const BYTE ios_sb_a_at[8]     = { 0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 };   /* mov rcx,[r8+0x18]; add rcx,0x78 */
+static const BYTE ios_sb_a_resume[4] = { 0x85,0xff,0x75,0x81 };                       /* test edi,edi; jnz -0x7f */
+static const BYTE ios_sb_b_before[24] = { 0x4b,0x8b,0xac,0xf5,0x78,0x42,0x00,0x00,    /* mov rbp,[r13+r14*8+0x4278] */
+                                          0x48,0x85,0xed,                              /* test rbp,rbp */
+                                          0x0f,0x85,0x89,0x00,0x00,0x00,               /* jnz +0x89 */
+                                          0x49,0x8b,0x9f,0x88,0x00,0x00,0x00 };        /* mov rbx,[r15+0x88] */
+static const BYTE ios_sb_b_at[4]      = { 0x42,0x8b,0x1c,0xf3 };                       /* mov ebx,[rbx+r14*8] */
+static const BYTE ios_sb_b_resume[16] = { 0x4c,0x8b,0xbc,0x24,0x88,0x00,0x00,0x00,    /* mov r15,[rsp+0x88] */
+                                          0x85,0xf6,0x0f,0x85,0xa9,0xfe,0xff,0xff };   /* test esi,esi; jnz -0x157 */
+
+static const struct ios_sb_site ios_sb_sites[] =
+{
+    { "A", ios_sb_a_before, sizeof(ios_sb_a_before), ios_sb_a_at, sizeof(ios_sb_a_at),
+      0x5a,  ios_sb_a_resume, sizeof(ios_sb_a_resume) },    /* 0x2e3ecdb - 0x2e3ec81 */
+    { "B", ios_sb_b_before, sizeof(ios_sb_b_before), ios_sb_b_at, sizeof(ios_sb_b_at),
+      0x118, ios_sb_b_resume, sizeof(ios_sb_b_resume) },    /* 0x2e63a87 - 0x2e6396f */
+};
+
+static BOOL ios_sb_bytes_match( ULONG64 addr, const BYTE *want, SIZE_T len )
+{
+    BYTE buf[32];
+    SIZE_T got;
+
+    if (len > sizeof(buf)) return FALSE;
+    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)addr, buf, len, &got ) || got != len) return FALSE;
+    return !memcmp( buf, want, len );
+}
+
 static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
 {
-    static const BYTE before[16] = { 0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00,   /* mov r8,[rbx+rax*8+0x4278] */
-                                     0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 }; /* mov rcx,[r8+0x18]; add rcx,0x78 */
-    static const BYTE resume[4] = { 0x85,0xff,0x75,0x81 };                     /* test edi,edi; jnz -0x7f */
-    static const ULONG64 resume_off = 0x5a;  /* 0x2e3ecdb - 0x2e3ec81 */
     static LONG mode;  /* 0 not read yet, 1 off, 2 on */
     static LONG skips, nshaders;
     static ULONG64 shaders[64];  /* log-only; a racing duplicate just logs a shader twice */
-    BYTE code[16], tail[4];
-    ULONG64 slots[16], shader = ctx->Rbp, owner = ctx->Rbx;
+    const struct ios_sb_site *site = NULL;
+    ULONG64 slots[16], shader = 0, owner = 0, fault = rec->ExceptionInformation[1];
     DWORD res_bits = 0;
     WORD dirty = 0;
     SIZE_T got;
@@ -7165,8 +7206,21 @@ static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
     BOOL known = FALSE;
 
     if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters < 2) return FALSE;
-    if (rec->ExceptionInformation[0] != 0 || rec->ExceptionInformation[1] != 0x18) return FALSE;
-    if (ctx->R8 != 0 || ctx->Rip < 8) return FALSE;
+    if (rec->ExceptionInformation[0] != 0 || fault >= 0x80) return FALSE;
+    /* Register state each site leaves at its fault, before any memory is read. */
+    if (fault == 0x18 && ctx->R8 == 0)
+    {
+        site = &ios_sb_sites[0];
+        shader = ctx->Rbp;
+        owner = ctx->Rbx;
+    }
+    else if (ctx->R14 < 16 && fault == ctx->R14 * 8 && ctx->Rbx == 0 && ctx->Rbp == 0)
+    {
+        site = &ios_sb_sites[1];
+        shader = ctx->R15;
+        owner = ctx->R13;
+    }
+    if (!site || ctx->Rip < site->before_len) return FALSE;
     if (!mode)
     {
         UNICODE_STRING name, value;
@@ -7181,10 +7235,10 @@ static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
         if (mode == 2) ERR( "[sb-ub-skip] on (MADEIRA_SB_NULL_UB_SKIP=1)\n" );
     }
     if (mode != 2) return FALSE;
-    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip - 8), code, sizeof(code), &got ) ||
-        got != sizeof(code) || memcmp( code, before, sizeof(code) )) return FALSE;
-    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip + resume_off), tail, sizeof(tail), &got ) ||
-        got != sizeof(tail) || memcmp( tail, resume, sizeof(tail) )) return FALSE;
+    if (!ios_sb_bytes_match( ctx->Rip - site->before_len, site->before, site->before_len ) ||
+        !ios_sb_bytes_match( ctx->Rip, site->at, site->at_len ) ||
+        !ios_sb_bytes_match( ctx->Rip + site->resume_off, site->resume, site->resume_len ))
+        return FALSE;
 
     n = InterlockedIncrement( &skips );
     for (i = 0; i < min( nshaders, (LONG)ARRAY_SIZE(shaders) ); i++)
@@ -7203,17 +7257,18 @@ static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
             for (slot_mask = 0, i = 0; i < 16; i++) if (slots[i]) slot_mask |= 1 << i;
         idx = InterlockedIncrement( &nshaders ) - 1;
         if (idx < (LONG)ARRAY_SIZE(shaders)) shaders[idx] = shader;
-        ERR( "[sb-ub-skip] new shader #%ld %p: wants slots %04lx, bound non-null %04lx%s, dirty %04x, "
+        ERR( "[sb-ub-skip] new shader #%ld %p at site %s: wants slots %04lx, bound non-null %04lx%s, dirty %04x, "
              "missing %04lx (skip #%ld, rip=%p, tid=%04lx)\n",
-             idx + 1, (void *)shader, (unsigned long)(res_bits & 0xffff), (unsigned long)(slot_mask & 0xffff),
-             slot_mask < 0 ? " (unreadable)" : "", dirty,
+             idx + 1, (void *)shader, site->name, (unsigned long)(res_bits & 0xffff),
+             (unsigned long)(slot_mask & 0xffff), slot_mask < 0 ? " (unreadable)" : "", dirty,
              slot_mask < 0 ? 0ul : (unsigned long)(res_bits & 0xffff & ~slot_mask), n,
              (void *)ctx->Rip, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     else if (n <= 8 || !(n % 1000))
-        ERR( "[sb-ub-skip] skip #%ld shader %p (%ld distinct so far)\n", n, (void *)shader, nshaders );
+        ERR( "[sb-ub-skip] skip #%ld shader %p at site %s (%ld distinct so far)\n",
+             n, (void *)shader, site->name, nshaders );
 
-    ctx->Rip += resume_off;
+    ctx->Rip += site->resume_off;
     return TRUE;
 }
 

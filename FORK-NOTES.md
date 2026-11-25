@@ -107,12 +107,15 @@ FEX patches.
   instruction table filled on PRAGMATA) (`build/ntdll-unix/signal_arm64_ios.c`, `FEX/Source/Windows/ARM64EC/`,
   `FEX/FEXCore/Source/Interface/Core/`). Log prefix `[kuser-remap]`.
 - `env.MADEIRA_SB_NULL_UB_SKIP` (`wine/dlls/ntdll/signal_arm64ec.c`, `ios_sb_null_ub_skip`):
-  Stellar Blade's crash at `SB-Win64-Shipping.exe+0x2e3ec81` (access violation reading 0x18) is
-  Unreal's D3D11 renderer reading an empty pixel-stage uniform-buffer slot (in the Nov 24 log the
-  shader wanted slots 0, 2, 3 and the game had bound 0, 1, 2). With `= 1` the fault is resumed at
-  the loop's next-slot test before the game's handlers see it, so that draw goes on without the
-  missing buffer's textures (visual glitches are possible). The x86 bytes on both sides of the
-  fault are checked first. Each new shader is logged once (`[sb-ub-skip] new shader`), then a
-  count every 1000 skips; the Unix SEGV handler stops repeating its per-fault lines for reads
-  at 0x18 after 8 (`build/ntdll-unix/signal_arm64_ios.c`). A workaround, not the cause: why the
-  slot is empty is still open.
+  Stellar Blade's crashes in Unreal's D3D11 renderer when a shader's uniform-buffer slot is
+  empty. In the Nov 24 logs the shader wanted slots 0, 2, 3 with 0, 1, 2 bound, then 0, 4, 5 with
+  0-4 bound (every slot after 0 one higher than the game bound). Two sites fault on it: A at
+  `SB-Win64-Shipping.exe+0x2e3ec81` (reads 0x18, no null check) and B at `+0x2e6396f` (its
+  null check's error path reads an empty names array at slot*8). With `= 1` either fault is
+  resumed at its loop's next-slot test before the game's handlers see it, so that draw goes on
+  without the missing buffer's textures (visual glitches are possible). The x86 bytes around
+  the fault and at the resume point are checked first. Each new shader is logged once
+  (`[sb-ub-skip] new shader ... at site A|B`), then a count every 1000 skips; the Unix SEGV
+  handler stops repeating its per-fault lines for 8-byte-aligned reads below 0x80 after 8
+  (`build/ntdll-unix/signal_arm64_ios.c`). A workaround, not the cause: why the slot is empty
+  is still open. The game is launched with `-d3d11` here; its PC requirements list DirectX 12.
