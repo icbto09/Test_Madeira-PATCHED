@@ -81,9 +81,9 @@ def check_binary(path, data):
         expected = {0xa641, 0x8664} if path.startswith('arm64ec-windows/') else {0xaa64}
         if path.startswith(('x86_64-opengl/', 'compat/love/')):
             expected = {0x8664}
-        elif path.startswith('vulkan/'):
+        elif path.startswith(('vulkan/', 'openal/arm64ec-windows/')):
             expected = {0xa641, 0x8664}
-        elif path.startswith('i386-windows/'):
+        elif path.startswith(('i386-windows/', 'openal/i386-windows/')):
             expected = {0x14c}
         if path.endswith('/dockhost.exe'):
             expected = {0x8664}

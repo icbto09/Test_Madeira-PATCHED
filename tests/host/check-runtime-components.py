@@ -54,6 +54,8 @@ def fixture(path):
         return macho()
     if path.endswith(('.dll', '.exe', '.drv')):
         machine = 0xaa64 if path.startswith('aarch64-windows/') else 0x8664
+        if path.startswith('openal/i386-windows/'):
+            machine = 0x14c
         return pe(machine)
     return b'notice or version\n'
 

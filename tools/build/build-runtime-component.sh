@@ -10,7 +10,7 @@ case "${1:-}" in
   zink) deps=(bison flex pkg-config) ;;
   kosmickrisp) deps=(cmake ninja pkg-config llvm@21 spirv-tools) ;;
   mesa-d3d12) deps=(ninja bison) ;;
-  vulkan-pe) deps=(meson ninja glslang) ;;
+  vulkan-pe) deps=(meson ninja glslang cmake) ;;   # cmake: build/openal-soft
   *) echo "Unknown runtime component: ${1:-}" >&2; exit 2 ;;
 esac
 if [ ${#deps[@]} -ne 0 ]; then
@@ -45,6 +45,9 @@ case "${1:-}" in
   vulkan-pe)
     bash "$ROOT/build/dxvk/build.sh"
     bash "$ROOT/build/vkd3d-proton/build.sh"
+    # Fork build: 0.2.100 bundles OpenAL Soft (app/Madeira/openal, a folder resource of the
+    # app target) but its CI did not build it; same llvm-mingw as DXVK and vkd3d-proton.
+    bash "$ROOT/build/openal-soft/build.sh"
     ;;
   *) echo "Unknown runtime component: ${1:-}" >&2; exit 2 ;;
 esac
