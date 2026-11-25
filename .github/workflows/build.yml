@@ -325,6 +325,8 @@ jobs:
       MADEIRA_PLANNED_IPA: ${{ needs.plan.outputs.ipaenv }}
       MADEIRA_RUNTIME_SDK: ${{ needs.plan.outputs.sdk }}
       MADEIRA_RUNTIME_REUSE: '1'
+      # Fork: a runner image with another Rust than the plan's still builds (ci-input-key.sh).
+      MADEIRA_ALLOW_IPA_DRIFT: '1'
     timeout-minutes: 360
     steps:
       # Fork test build: GitHub's own Macs instead of the Madeira team's xcode-27 machine.
@@ -467,6 +469,7 @@ jobs:
       - name: Build IPA
         run: tools/build-ipa.sh
       - uses: actions/cache/save@v4
+        if: steps.sdk.outputs.drift != '1'
         with:
           key: ${{ needs.plan.outputs.ipa }}
           path: dist/Madeira.ipa

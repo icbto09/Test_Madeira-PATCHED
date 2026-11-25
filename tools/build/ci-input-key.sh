@@ -19,8 +19,19 @@ if [[ -n "${MADEIRA_PLANNED_SDK:-}" && "$key" != "$MADEIRA_PLANNED_SDK" ]]; then
   echo "ERROR: this runner's build inputs differ from the planned IPA key" >&2
   exit 1
 fi
+drift=0
 if [[ -n "${MADEIRA_PLANNED_IPA:-}" && "$ipa" != "$MADEIRA_PLANNED_IPA" ]]; then
-  echo "ERROR: this runner's app build inputs differ from the planned IPA key" >&2
-  exit 1
+  # Fork test build: GitHub rolls new runner images out gradually, so the plan job and the
+  # app job can get images with the same Xcode but a different Rust (rustc -vV is in the IPA
+  # key). With MADEIRA_ALLOW_IPA_DRIFT=1 the app is still built, from this runner's tools,
+  # but drift=1 keeps it out of the cache under the planned key.
+  printf 'rustc on this runner:\n%s\n' "$rustc" >&2
+  if [[ "${MADEIRA_ALLOW_IPA_DRIFT:-}" == 1 ]]; then
+    echo "WARNING: this runner's app build inputs differ from the planned IPA key (Rust or app flags; Xcode and SDKs match); building without caching the IPA" >&2
+    drift=1
+  else
+    echo "ERROR: this runner's app build inputs differ from the planned IPA key" >&2
+    exit 1
+  fi
 fi
-printf 'key=%s\nrust=%s\ngraphics=%s\nipa=%s\n' "$key" "$rust" "$graphics" "$ipa" >> "$GITHUB_OUTPUT"
+printf 'key=%s\nrust=%s\ngraphics=%s\nipa=%s\ndrift=%s\n' "$key" "$rust" "$graphics" "$ipa" "$drift" >> "$GITHUB_OUTPUT"
