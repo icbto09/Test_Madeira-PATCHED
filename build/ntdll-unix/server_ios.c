@@ -977,6 +977,14 @@ static uint64_t ios_ts_teb(pthread_t pt)
     ios_ts_read((uint64_t)(uintptr_t)pt + ios_ts_tsd_off + (uint64_t)ios_teb_tls_key * 8, &v, 8);
     return (v & 0xfff) ? 0 : v;
 }
+/* madeira hang-ring: the TEB of any thread of this task, for the [thread-stacks]
+ * block-ring dump (signal_arm64_ios.c). A thread parked in a server call has x18 = 0
+ * in its Mach state and its pthread is NOT its TEB, so the TSD slot is the only way. */
+uint64_t ios_ts_teb_export( void *pt )
+{
+    if (ios_ts_tsd_off < 0) ios_ts_calibrate();
+    return ios_ts_teb( (pthread_t)pt );
+}
 
 static struct ios_ts_map *ios_ts_map_for_teb(uint64_t teb)
 {

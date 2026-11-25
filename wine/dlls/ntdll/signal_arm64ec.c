@@ -7130,6 +7130,93 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
 }
 
 
+/* Stellar Blade: skip a null pixel-stage uniform buffer (MADEIRA_SB_NULL_UB_SKIP=1, off by default).
+ *
+ * The crash (SB-Win64-Shipping.exe+0x2e3ec81, AV read of 0x18) is in Unreal's D3D11 RHI,
+ * SetResourcesFromTables for the pixel stage. It walks the set bits of
+ *   Shader->ShaderResourceTable.ResourceTableBits ([rbp+0x30]) & DirtyUniformBuffers ([rbx+0x43ce])
+ * and dereferences BoundUniformBuffers[stage][index] ([rbx+0x4278+index*8]) with the check
+ * compiled out of the shipping build:
+ *   +0x2e3ec79  mov r8,[rbx+rax*8+0x4278]
+ *   +0x2e3ec81  mov rcx,[r8+0x18]      <- r8 == 0
+ *   ...
+ *   +0x2e3ecdb  test edi,edi / jnz loop  (edi already has this index cleared)
+ * In the captured log the game bound slots 0,1,2 just before the draw while the shader's mask
+ * was 0x0d (slots 0,2,3): slot 3 was never written. This does not find out why; it moves the
+ * faulting thread to the loop's next-index test, as if the bit were clear, so the draw goes on
+ * without that buffer's textures and samplers (wrong-looking output for those draws at worst).
+ * The x86 bytes on both sides are checked so another build of the game is left alone.
+ * Each distinct shader seen here is logged once ([sb-ub-skip] new shader). */
+static BOOL ios_sb_null_ub_skip( EXCEPTION_RECORD *rec, CONTEXT *ctx )
+{
+    static const BYTE before[16] = { 0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00,   /* mov r8,[rbx+rax*8+0x4278] */
+                                     0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 }; /* mov rcx,[r8+0x18]; add rcx,0x78 */
+    static const BYTE resume[4] = { 0x85,0xff,0x75,0x81 };                     /* test edi,edi; jnz -0x7f */
+    static const ULONG64 resume_off = 0x5a;  /* 0x2e3ecdb - 0x2e3ec81 */
+    static LONG mode;  /* 0 not read yet, 1 off, 2 on */
+    static LONG skips, nshaders;
+    static ULONG64 shaders[64];  /* log-only; a racing duplicate just logs a shader twice */
+    BYTE code[16], tail[4];
+    ULONG64 slots[16], shader = ctx->Rbp, owner = ctx->Rbx;
+    DWORD res_bits = 0;
+    WORD dirty = 0;
+    SIZE_T got;
+    LONG n, i, slot_mask = -1;
+    BOOL known = FALSE;
+
+    if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters < 2) return FALSE;
+    if (rec->ExceptionInformation[0] != 0 || rec->ExceptionInformation[1] != 0x18) return FALSE;
+    if (ctx->R8 != 0 || ctx->Rip < 8) return FALSE;
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_SB_NULL_UB_SKIP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '1') ? 2 : 1;
+        if (mode == 2) ERR( "[sb-ub-skip] on (MADEIRA_SB_NULL_UB_SKIP=1)\n" );
+    }
+    if (mode != 2) return FALSE;
+    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip - 8), code, sizeof(code), &got ) ||
+        got != sizeof(code) || memcmp( code, before, sizeof(code) )) return FALSE;
+    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(ctx->Rip + resume_off), tail, sizeof(tail), &got ) ||
+        got != sizeof(tail) || memcmp( tail, resume, sizeof(tail) )) return FALSE;
+
+    n = InterlockedIncrement( &skips );
+    for (i = 0; i < min( nshaders, (LONG)ARRAY_SIZE(shaders) ); i++)
+        if (shaders[i] == shader) { known = TRUE; break; }
+    if (!known)
+    {
+        LONG idx;
+
+        /* Diagnostic reads only; a failed read leaves that field shown as unknown (ffff / -1). */
+        if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(shader + 0x30), &res_bits, sizeof(res_bits), &got ) ||
+            got != sizeof(res_bits)) res_bits = ~0u;
+        if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(owner + 0x43ce), &dirty, sizeof(dirty), &got ) ||
+            got != sizeof(dirty)) dirty = 0xffff;
+        if (!NtReadVirtualMemory( NtCurrentProcess(), (void *)(owner + 0x4278), slots, sizeof(slots), &got ) &&
+            got == sizeof(slots))
+            for (slot_mask = 0, i = 0; i < 16; i++) if (slots[i]) slot_mask |= 1 << i;
+        idx = InterlockedIncrement( &nshaders ) - 1;
+        if (idx < (LONG)ARRAY_SIZE(shaders)) shaders[idx] = shader;
+        ERR( "[sb-ub-skip] new shader #%ld %p: wants slots %04lx, bound non-null %04lx%s, dirty %04x, "
+             "missing %04lx (skip #%ld, rip=%p, tid=%04lx)\n",
+             idx + 1, (void *)shader, (unsigned long)(res_bits & 0xffff), (unsigned long)(slot_mask & 0xffff),
+             slot_mask < 0 ? " (unreadable)" : "", dirty,
+             slot_mask < 0 ? 0ul : (unsigned long)(res_bits & 0xffff & ~slot_mask), n,
+             (void *)ctx->Rip, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
+    }
+    else if (n <= 8 || !(n % 1000))
+        ERR( "[sb-ub-skip] skip #%ld shader %p (%ld distinct so far)\n", n, (void *)shader, nshaders );
+
+    ctx->Rip += resume_off;
+    return TRUE;
+}
+
 /* madeira-bcd [ccall-peek] (env MADEIRA_CCALL_PEEK_FIXUP = 0 turns it off).
  *
  * arm64x_check_call reads the first bytes of an x64 call target to spot the
@@ -7591,6 +7678,11 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
     }
     if (rec->ExceptionCode != STATUS_EMULATION_SYSCALL)   /* madeira [crashmailer-dump]: the context handlers get */
         ios_cmd_exc_ctx( xr_index, rec, &context->c.AMD64_Context );
+    /* After ResetToConsistentState, so Rip is the exact faulting x86 instruction (the
+     * [rtcs] post line for the Stellar Blade crash shows ecRip=...142E3EC81). Before any
+     * guest VEH/SEH runs, so the game's crash reporter never sees a skipped fault. */
+    if (ios_sb_null_ub_skip( rec, &context->c.AMD64_Context ))
+        NtContinue( &context->c.AMD64_Context, FALSE );
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     /* iOS-Madeira ml409 (#66): the fatal [bogus-ctx] walks a context whose Rsp
      * high dword became exactly 1 and whose Rip/Rbp/R12 turned into FEX-band

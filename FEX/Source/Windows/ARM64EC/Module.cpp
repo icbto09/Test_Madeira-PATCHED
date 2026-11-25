@@ -86,6 +86,9 @@ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
 extern "C" void IosJitAliasStats(int* Count, int* Live, uint64_t* Refused, uint64_t* LastRefusedJit, uint64_t* Low, uint64_t* High); // fo4-alias-miss-probe
 extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
 extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
+extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real);   // madeira kuser-remap
+extern "C" int IosKuserNote(uint64_t Rip, uint64_t Tick, uint32_t* Strikes);
+extern "C" void IosKuserCounts(uint32_t* Rips, uint32_t* Pages);
 /* Defined in FEXCore Dispatcher.cpp; read when the dispatcher is emitted. */
 extern "C" uint32_t IosEcCodeBitMapCached;
 /* PEB->EcCodeBitMap as read in ProcessInit; ThreadInit stores it in every thread's frame. */
@@ -2093,6 +2096,58 @@ public:
 };
 
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+#ifdef FEX_IOS_HOST
+/* madeira kuser-remap (see IosJitAlias.cpp): a JIT load from the KUSER_SHARED_DATA window that
+ * ntdll handed over (env.MADEIRA_KUSER_REMAP = 1). Learn the guest instruction's 4 KB page and drop its
+ * compiled code, then resume the SAME host PC with the context untouched: the load faults
+ * again and ntdll emulates it (it hands each host PC over once), and the next time the guest
+ * reaches the instruction it runs the recompiled code with the address translated inline.
+ * The guest state is never rebuilt here: a first version resumed at the reconstructed RIP,
+ * which can name an earlier instruction mid-block, re-ran it and corrupted PRAGMATA's hash of
+ * this page (crash on a wild pointer, log 2026-11-22 12:09).
+ * Returns true when the fault is consumed (always, once it is a KUSER load from JIT code). */
+static bool IosKuserRemapFault(const ThreadCPUArea CPUArea, FEXCore::Core::InternalThreadState* Thread, uint64_t FaultAddress,
+                               ARM64_NT_CONTEXT* NativeContext) {
+  if (FaultAddress < 0x7ffe0000ull || FaultAddress >= 0x7fff0000ull) {
+    return false;
+  }
+  uint64_t Low = 0, Size = 0, Real = 0;
+  if (!IosKuserWindow(&Low, &Size, &Real) || FaultAddress < Low || FaultAddress - Low >= Size) {
+    return false;
+  }
+  if (!CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc)) {
+    return false;
+  }
+  const uint64_t Rip = CTX->RestoreRIPFromHostPC(Thread, NativeContext->Pc);
+  if (!Rip) {
+    return false;
+  }
+  uint64_t Tick;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(Tick));
+  uint32_t Strikes = 0;
+  int Action;
+  {
+    std::scoped_lock Lock(ThreadCreationMutex);
+    Action = IosKuserNote(Rip, Tick, &Strikes);
+    if (Action && InvalidationTracker) {
+      InvalidationTracker->InvalidateAlignedInterval(Rip, 1, false);
+    }
+  }
+  static std::atomic<uint32_t> Said {0};
+  const uint32_t N = Said.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (N <= 24 || (N & (N - 1)) == 0) {
+    uint32_t Rips = 0, Pages = 0;
+    IosKuserCounts(&Rips, &Pages);
+    static const char* const What[4] = {"gave up (left to ntdll)", "learned the instruction", "learned its 4 KB page",
+                                        "page already learned: dropped its code again"};
+    LogMan::Msg::EFmt("[kuser-remap] #{} guest rip {:#x} read {:#x} (host pc {:#x}): {} (strike {}); {} pages learned, {} re-faulting rips",
+                      N, Rip, FaultAddress, NativeContext->Pc, What[Action & 3], Strikes, Pages, Rips);
+  }
+  (void)CPUArea;
+  return true;   // NtContinueNative re-runs the faulting load in the old code; ntdll emulates it
+}
+#endif
+
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   auto Thread = CPUArea.ThreadState();
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
@@ -2141,6 +2196,12 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
       if (IosDeferAvLog) IosLogAv();
       return true;
     }
+
+#ifdef FEX_IOS_HOST
+    if (!IosDeferAvLog && IosKuserRemapFault(CPUArea, Thread, FaultAddress, NativeContext)) {   // madeira kuser-remap: reads only
+      return true;
+    }
+#endif
 
     std::scoped_lock Lock(ThreadCreationMutex);
     static std::atomic<uint64_t> IosSmcHandled {0};

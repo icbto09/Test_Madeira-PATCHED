@@ -8457,6 +8457,7 @@ struct file_view
 #define VPROT_GUARD      0x10
 #define VPROT_COMMITTED  0x20
 #define VPROT_WRITEWATCH 0x40
+#define VPROT_SMC_TRAP   0x80   /* sub-page SMC mtrack trap (4 KB RX inside 16 KB host page) */
 /* per-mapping protection flags */
 #define VPROT_ARM64EC          0x0100  /* view may contain ARM64EC code */
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
@@ -14462,6 +14463,17 @@ static const char *get_prot_str( BYTE prot )
  *
  * Convert page protections to protection for mmap/mprotect.
  */
+static int ios_smc_subpage_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SMC_SUBPAGE" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
 static int get_unix_prot( BYTE vprot )
 {
     int prot = 0;
@@ -14471,7 +14483,7 @@ static int get_unix_prot( BYTE vprot )
         if (vprot & VPROT_WRITE) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
-        if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+        if (vprot & (VPROT_WRITEWATCH | VPROT_SMC_TRAP)) prot &= ~PROT_WRITE;
     }
     if (!prot) prot = PROT_NONE;
     return prot;
@@ -22700,6 +22712,41 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
      * back into anonymous memory; a GUARD request still does. */
     if ((vprot & VPROT_GUARD) || ((vprot & (VPROT_EXEC | VPROT_WRITECOPY)) && !(view->protect & VPROT_X64DATA)))
         ios_swap_release_range( base, size, 1 );
+    /* Sub-page SMC mtrack trap: on 16 KB iOS host pages, FEX arms mtrack on
+     * individual 4 KB guest pages via NtProtectVirtualMemory(..., PAGE_EXECUTE_READ).
+     * Because get_host_page_vprot() ORs all four 4 KB sub-pages together, any
+     * writable 4 KB sibling keeps the 16 KB host page PROT_READ|PROT_WRITE and
+     * FEX never sees the SMC write fault. Tagging a 4 KB page that transitions
+     * from EXEC+WRITE/WRITECOPY (or already tagged) to EXEC-without-WRITE with
+     * VPROT_SMC_TRAP strips host PROT_WRITE on the 16 KB page while keeping each
+     * sibling's logical vprot intact (signal_arm64_ios.c emulates stores to
+     * writable siblings and lets stores to trapped sub-pages fault to FEX).
+     * MADEIRA_SMC_SUBPAGE=0 disables. */
+    if (ios_smc_subpage_enabled() &&
+        (vprot & VPROT_EXEC) && !(vprot & (VPROT_WRITE | VPROT_WRITECOPY | VPROT_GUARD)))
+    {
+        char *p;
+        int arm_smc = 0;
+        for (p = (char *)base; p < (char *)base + size; p += page_size)
+        {
+            BYTE old_vp = get_page_vprot( p );
+            if ((old_vp & VPROT_SMC_TRAP) ||
+                ((old_vp & VPROT_COMMITTED) && (old_vp & VPROT_EXEC) &&
+                 (old_vp & (VPROT_WRITE | VPROT_WRITECOPY))))
+            {
+                arm_smc = 1;
+                break;
+            }
+        }
+        if (arm_smc)
+        {
+            static unsigned int smc_arm_n;
+            vprot |= VPROT_SMC_TRAP;
+            if (++smc_arm_n <= 16)
+                dprintf( 2, "[smc-subpage] #%u armed %p+0x%lx (prot=0x%x)\n",
+                         smc_arm_n, base, (unsigned long)size, (unsigned)protect );
+        }
+    }
     if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
     {
         /* madeira [ro-view-cow] Credit: BOR1NG (Avery Felts, https://github.com/aaf2tbz), MetalSharp-Wine
@@ -31825,8 +31872,16 @@ void virtual_init_user_shared_data(void)
             xs->Features[XSTATE_AVX].Offset = 0x200 + 0x40;            /* XSAVE_FORMAT + XSAVE_AREA_HEADER */
             xs->Features[XSTATE_AVX].Size = 16 * 16;                   /* upper halves of YMM0-15 */
             for (i = 0; i <= XSTATE_AVX; i++) xs->AllFeatures[i] = xs->Features[i].Size;
+            /* kusd-pf-avx: Wine's ARM64 init_shared_data_cpuinfo only adds the i386 x86 flags
+             * (SSE..SSE4.2), so the page said XState = x87+SSE+AVX and FEX's CPUID said
+             * AVX/AVX2 while PF_XSAVE_ENABLED / PF_AVX / PF_AVX2 read 0, which no x64 PC
+             * shows (IsProcessorFeaturePresent, and code that reads the page directly).
+             * Same switch as the XState block. */
+            data->ProcessorFeatures[PF_XSAVE_ENABLED] = TRUE;
+            data->ProcessorFeatures[PF_AVX_INSTRUCTIONS_AVAILABLE] = TRUE;
+            data->ProcessorFeatures[PF_AVX2_INSTRUCTIONS_AVAILABLE] = TRUE;
             dprintf( 2, "[kusd-avx] ml1310 MADEIRA_FEX_AVX=1: KUSER_SHARED_DATA XState says x87+SSE+AVX "
-                        "(features %#llx, size %#x; MADEIRA_KUSD_AVX=0 leaves it empty)\n",
+                        "(features %#llx, size %#x; PF_XSAVE/AVX/AVX2 set; MADEIRA_KUSD_AVX=0 leaves it empty)\n",
                      (unsigned long long)xs->EnabledFeatures, (unsigned)xs->Size );
         }
     }
@@ -32046,6 +32101,11 @@ int ios_page_expected_prot( const void *addr )
     return get_unix_prot( vprot );
 }
 
+int ios_page_has_smc_sibling( const void *addr )
+{
+    return (get_host_page_vprot( addr ) & VPROT_SMC_TRAP) != 0;
+}
+
 /***********************************************************************
  *           ios_page_vprot_explain                               (ml998)
  *
@@ -32078,7 +32138,7 @@ void ios_page_vprot_explain( const void *addr, const char *why )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     view = find_view( (void *)addr, 0 );
-    dprintf( 2, "ml998: [%s] %p vprot=%#02x { %s%s%s%s%s%s%s } unix_prot=%d\n",
+    dprintf( 2, "ml998: [%s] %p vprot=%#02x { %s%s%s%s%s%s%s%s } unix_prot=%d\n",
              why, addr, vp,
              (vp & VPROT_COMMITTED) ? "COMMITTED " : "",
              (vp & VPROT_READ)      ? "READ "      : "",
@@ -32087,6 +32147,7 @@ void ios_page_vprot_explain( const void *addr, const char *why )
              (vp & VPROT_WRITECOPY) ? "WRITECOPY " : "",
              (vp & VPROT_GUARD)     ? "GUARD "     : "",
              (vp & VPROT_WRITEWATCH)? "WRITEWATCH ": "",
+             (vp & VPROT_SMC_TRAP)  ? "SMC_TRAP "  : "",
              get_unix_prot( vp ) );
     if (view)
         dprintf( 2, "ml998: [%s]   view %p+%#lx protect=%#x { %s%s%s%s } page_off=%#lx\n",
@@ -32455,17 +32516,33 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
 {
     size_t i;
     char *addr = ROUND_ADDR( base, host_page_mask );
+    char *req_lo = ROUND_ADDR( base, page_mask );
+    char *req_hi = req_lo + ROUND_SIZE( base, size, page_mask );
+    size_t h_size = ROUND_SIZE( base, size, host_page_mask );
 
-    size = ROUND_SIZE( base, size, host_page_mask );
-    for (i = 0; i < size; i += host_page_size)
+    for (i = 0; i < h_size; i += host_page_size)
     {
         BYTE vprot = get_host_page_vprot( addr + i );
         if (vprot & VPROT_WRITEWATCH) *has_write_watch = TRUE;
+        if (vprot & VPROT_SMC_TRAP)
+        {
+            char *lo = (addr + i > req_lo) ? (addr + i) : req_lo;
+            char *hi = (addr + i + host_page_size < req_hi) ? (addr + i + host_page_size) : req_hi;
+            char *p;
+            for (p = lo; p < hi; p += page_size)
+            {
+                BYTE sub = get_page_vprot( p );
+                if (!(get_unix_prot( sub & ~VPROT_WRITEWATCH ) & PROT_WRITE))
+                    return STATUS_INVALID_USER_BUFFER;
+            }
+            *has_write_watch = TRUE;
+            continue;
+        }
         if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
             return STATUS_INVALID_USER_BUFFER;
     }
     if (*has_write_watch)
-        mprotect_range( addr, size, 0, VPROT_WRITEWATCH );  /* temporarily enable write access */
+        mprotect_range( addr, h_size, 0, VPROT_WRITEWATCH | VPROT_SMC_TRAP );  /* temporarily enable write access */
     return STATUS_SUCCESS;
 }
 
@@ -40018,7 +40095,7 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
         BYTE vprot;
 
         info->AllocationBase = alloc_base;
-        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
+        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~(VPROT_WRITEWATCH | VPROT_SMC_TRAP) );
         info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
         info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
         info->AllocationProtect = get_win32_prot( view->protect, view->protect );
@@ -40379,7 +40456,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
         while (start != (char *)view->base + view->size && r != ref + count
                && r->addr < (char *)view->base + view->size)
         {
-            start += get_committed_size( view, start, end - start, &vprot, ~VPROT_WRITEWATCH );
+            start += get_committed_size( view, start, end - start, &vprot, ~(VPROT_WRITEWATCH | VPROT_SMC_TRAP) );
             i = 0;
             while (r + i != ref + count && r[i].addr < start) ++i;
             if (vprot & VPROT_COMMITTED) fill_working_set_info( &data, view, vprot, r, i, info );

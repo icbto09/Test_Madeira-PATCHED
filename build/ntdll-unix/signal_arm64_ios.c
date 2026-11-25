@@ -2295,6 +2295,43 @@ static uintptr_t ios_write_alias( uintptr_t addr )
     return ios_jit_anon_alias_lookup( addr );
 }
 
+/* Active temporarily-unprotected host page window for writable 4 KB siblings
+ * sharing a 16 KB host page with a VPROT_SMC_TRAP 4 KB sub-page.
+ * Touched ONLY on the single Mach exception-server thread. */
+static uintptr_t ios_smc_sib_active_lo, ios_smc_sib_active_hi;
+
+static uintptr_t ios_mach_write_alias( uintptr_t addr )
+{
+    uintptr_t rw = ios_write_alias( addr );
+    if (rw) return rw;
+    if (ios_smc_sib_active_lo && addr >= ios_smc_sib_active_lo && addr < ios_smc_sib_active_hi)
+        return addr;
+    return 0;
+}
+
+/* Exact byte width of single-register ARM64 stores so a store near the end of
+ * a writable 4 KB sub-page only escalates to the next 4 KB sub-page when its
+ * bytes actually cross the 4 KB boundary (never false-positives on STRB at +0xfff).
+ * Pairs (STP/CASP) validate every spanned 4 KB sub-page themselves via ios_alias_write. */
+static unsigned ios_smc_single_store_width( uint32_t insn )
+{
+    if ((insn & 0x3f200000u) == 0x38000000u ||     /* STR/STUR/STR(imm/reg) GPR */
+        (insn & 0x3ffffc00u) == 0x089ffc00u ||     /* STLR{B,H,W,X} */
+        (insn & 0x3fe00c00u) == 0x19000000u ||     /* STLUR{B,H,W,X} */
+        (insn & 0x3fe07c00u) == 0x08007c00u ||     /* STXR/STLXR */
+        (insn & 0x3f20fc00u) == 0x38208000u ||     /* SWP */
+        (insn & 0x3f20cc00u) == 0x38200000u ||     /* LD<OP> */
+        (insn & 0x3fa07c00u) == 0x08a07c00u)       /* CAS */
+        return 1u << ((insn >> 30) & 3u);
+    if ((insn & 0x3b000000u) == 0x3c000000u)       /* SIMD/FP STR/STUR */
+    {
+        unsigned sz = (insn >> 30) & 3u;
+        if (sz == 0 && (insn & 0x00800000u)) return 16u; /* Q-reg */
+        return 1u << sz;
+    }
+    return 0;
+}
+
 /* The writable alias is a host implementation detail, not permission to
  * bypass a guest protection fault. FEX removes logical write permission
  * while a guest page has cached translations. Let its normal exception
@@ -2341,7 +2378,7 @@ static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uin
     if (!size || size > MAX_STORE || addr > UINTPTR_MAX - (size - 1)) return 0;
     while (done < size)
     {
-        uintptr_t at = addr + done, rw = ios_write_alias( at );
+        uintptr_t at = addr + done, rw = ios_mach_write_alias( at );
         size_t length = PAGE - (at & (PAGE - 1));
         if (length > size - done) length = size - done;
         /* A store can cross a 4KB Wine protection boundary within one
@@ -2358,7 +2395,7 @@ static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uin
             return 0;
         }
         if (!rw || rw > UINTPTR_MAX - (length - 1) ||
-            ios_write_alias( at + length - 1 ) != rw + length - 1) return 0;
+            ios_mach_write_alias( at + length - 1 ) != rw + length - 1) return 0;
         destinations[count] = rw;
         lengths[count++] = length;
         done += length;
@@ -3284,8 +3321,8 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
         a = ea + done;
         if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
         part_rw[parts] = (rx && rw && len <= sz && a >= rx && a - rx <= sz - len)
-                         ? rw + (a - rx) : ios_write_alias( (uintptr_t)a );
-        if (part_rw[parts] && ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1)
+                         ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
+        if (part_rw[parts] && ios_mach_write_alias( a + len - 1 ) != part_rw[parts] + len - 1)
             return -1;
         if (part_rw[parts] && honor_guest_prot)
         {
@@ -3941,6 +3978,99 @@ static void *ios_mach_exception_thread( void *arg )
              * legitimately own it. An address outside every registered window
              * falls through untouched, so non-sub-floor faults keep their exact
              * current ordering. */
+            /* madeira kuser-remap: env.MADEIRA_KUSER_REMAP = 1 hands a KUSER_SHARED_DATA read
+             * made by FEX-compiled code (pool PC) to FEX instead of emulating it here: FEX
+             * learns the guest instruction, recompiles it with the address translated inline,
+             * and drops its compiled code (FEX ResetToConsistentState, IosKuserRemapFault), then
+             * resumes the SAME host PC unchanged; that retry faults here again and is emulated
+             * as before, so the guest state is never rebuilt mid-block. The next time the guest
+             * reaches the instruction it runs the recompiled code. The delivery is the ordinary
+             * guest-exception path below (dispatch_guest_fault). Each host PC is handed over
+             * ONCE; every later fault at it is emulated here, so the worst case is the old
+             * behaviour plus one round trip per site. */
+            if (!handled && req->exception == EXC_BAD_ACCESS && thread_teb &&
+                fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u)
+            {
+                static int kr_on = -1;
+                /* "FEX is loaded" = its export was found and recorded. Only the pointer is
+                 * read, never called (ml614: EC exports aren't callable from here), and
+                 * NOT ios_fex_rip_resolved, which ml614 deliberately never sets. */
+                extern unsigned long long (*ios_fex_rip_from_hostpc_cb)( unsigned long long, unsigned long long );
+                if (kr_on < 0)
+                {
+                    const char *e = getenv( "MADEIRA_KUSER_REMAP" );
+                    kr_on = (e && e[0] == '1') ? 1 : 0;
+                    if (kr_on)
+                        dprintf( 2, "[kuser-remap] MADEIRA_KUSER_REMAP=1: KUSER_SHARED_DATA reads from JIT code go to FEX "
+                                    "(learn + recompile), once per site, then emulated here\n" );
+                }
+                if (kr_on && ios_fex_rip_from_hostpc_cb)
+                {
+                    extern void *ios_jit_rx_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uintptr_t kr_rx = (uintptr_t)ios_jit_rx_base_global;
+                    size_t kr_sz = ios_jit_pool_size_global;
+                    uint64_t kr_pc = (uint64_t)__darwin_arm_thread_state64_get_pc( state );
+                    if ((kr_rx && kr_pc >= kr_rx && kr_pc < kr_rx + kr_sz) || ios_jit_low_contains( (uintptr_t)kr_pc ))
+                    {
+                        /* Only this (single) Mach exception thread touches the table.
+                         * 65536 slots: the first 8192-slot version filled in 15 s on PRAGMATA
+                         * (6,144 sites) and then emulated everything. When it fills now it is
+                         * cleared and starts over: a stale host PC (the code buffer reuses them)
+                         * is at worst handed over once more, and FEX shrugs that off. */
+                        enum { KR_SLOTS = 65536 };
+                        static uint64_t kr_pcs[KR_SLOTS];
+                        static unsigned char kr_cnt[KR_SLOTS];
+                        static unsigned kr_used, kr_deferred, kr_capped, kr_clears;
+                        unsigned kr_i, kr_n;
+                        int kr_defer = 0;
+
+                        if (kr_used >= KR_SLOTS * 3 / 4)
+                        {
+                            memset( kr_pcs, 0, sizeof(kr_pcs) );
+                            memset( kr_cnt, 0, sizeof(kr_cnt) );
+                            kr_used = 0;
+                            kr_clears++;
+                            dprintf( 2, "[kuser-remap] site table full: cleared (%u time(s)), %u handed over so far\n",
+                                     kr_clears, kr_deferred );
+                        }
+                        kr_i = (unsigned)((kr_pc >> 2) * 0x9E3779B1u) & (KR_SLOTS - 1);
+                        for (kr_n = 0; kr_n < KR_SLOTS; kr_n++, kr_i = (kr_i + 1) & (KR_SLOTS - 1))
+                        {
+                            if (kr_pcs[kr_i] == kr_pc) break;
+                            if (!kr_pcs[kr_i])
+                            {
+                                kr_pcs[kr_i] = kr_pc;
+                                kr_used++;
+                                break;
+                            }
+                        }
+                        if (kr_n < KR_SLOTS)
+                        {
+                            if (!kr_cnt[kr_i]) { kr_cnt[kr_i] = 1; kr_defer = 1; }
+                            else if (kr_cnt[kr_i] == 1)
+                            {
+                                /* the retry FEX asked for, or old code still running: emulate */
+                                kr_cnt[kr_i] = 2;
+                                kr_capped++;
+                                if (kr_capped <= 16 || !(kr_capped & (kr_capped - 1)))
+                                    dprintf( 2, "[kuser-remap] pc=%#llx addr=%#llx handed to FEX once, emulated here from now on "
+                                                "(%u sites so far)\n", (unsigned long long)kr_pc,
+                                             (unsigned long long)fault_addr, kr_capped );
+                            }
+                        }
+                        if (kr_defer)
+                        {
+                            kr_deferred++;
+                            if (kr_deferred <= 16 || !(kr_deferred & (kr_deferred - 1)))
+                                dprintf( 2, "[kuser-remap] #%u pc=%#llx addr=%#llx -> FEX (%u sites seen)\n", kr_deferred,
+                                         (unsigned long long)kr_pc, (unsigned long long)fault_addr, kr_used );
+                            goto dispatch_guest_fault;
+                        }
+                    }
+                }
+            }
+
             if (!handled && req->exception == EXC_BAD_ACCESS)
             {
                 /* ml1205: the faulting thread's own process decides the window */
@@ -5375,6 +5505,88 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p (wine prot %d) for the store at pc=%p errno=%d\n",
                                  (void *)ios_watch_page, watch_prot, (void *)(uintptr_t)fault_pc, errno );
                 }
+                /* Sub-page SMC sibling write: the 16 KB host page is PROT_READ
+                 * because another 4 KB sub-page has VPROT_SMC_TRAP, while this
+                 * 4 KB sub-page is logically writable. Temporarily unprotect the
+                 * host page (never PROT_EXEC), emulate the store, and re-arm. */
+                int smc_sib_hit = 0, was_smc_sib = 0;
+                uintptr_t smc_sib_hpage = 0, smc_sib_hpage2 = 0;
+                if (!rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                {
+                    extern int ios_page_has_smc_sibling( const void *addr );
+                    extern int ios_page_expected_prot( const void *addr );
+                    if (ios_page_has_smc_sibling( (const void *)fault_addr ))
+                    {
+                        int want = ios_page_expected_prot( (const void *)fault_addr );
+                        if (want > 0 && (want & PROT_WRITE))
+                        {
+                            uint32_t probe_insn = 0;
+                            unsigned sw;
+                            ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &probe_insn );
+                            sw = ios_smc_single_store_width( probe_insn );
+                            if (sw > 1 && (fault_addr & 0xfff) + sw > 0x1000)
+                            {
+                                uintptr_t next_4k = ((uintptr_t)fault_addr & ~(uintptr_t)0xfff) + 0x1000;
+                                if (ios_alias_write_is_trapped( next_4k ))
+                                {
+                                    fault_addr = next_4k;
+                                    goto dispatch_guest_fault;
+                                }
+                            }
+                            uintptr_t hp = (uintptr_t)fault_addr & ~(uintptr_t)0x3fff;
+                            if (mprotect( (void *)hp, 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                            {
+                                uintptr_t act_lo = hp, act_hi = hp + 0x4000;
+                                if ((fault_addr & 0x3fff) >= 0x3fe0)
+                                {
+                                    int nwant = ios_page_expected_prot( (const void *)(hp + 0x4000) );
+                                    if (nwant > 0 && (nwant & PROT_WRITE))
+                                    {
+                                        if (!ios_page_has_smc_sibling( (const void *)(hp + 0x4000) ))
+                                            act_hi = hp + 0x8000;
+                                        else if (mprotect( (void *)(hp + 0x4000), 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                                        {
+                                            smc_sib_hpage2 = hp + 0x4000;
+                                            act_hi = hp + 0x8000;
+                                        }
+                                    }
+                                }
+                                else if ((fault_addr & 0x3fff) < 0x20 && hp >= 0x4000)
+                                {
+                                    int pwant = ios_page_expected_prot( (const void *)(hp - 0x1000) );
+                                    if (pwant > 0 && (pwant & PROT_WRITE))
+                                    {
+                                        if (!ios_page_has_smc_sibling( (const void *)(hp - 0x4000) ))
+                                            act_lo = hp - 0x4000;
+                                        else if (mprotect( (void *)(hp - 0x4000), 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                                        {
+                                            smc_sib_hpage2 = hp - 0x4000;
+                                            act_lo = hp - 0x4000;
+                                        }
+                                    }
+                                }
+                                rw_addr = fault_addr;
+                                smc_sib_hit = 1;
+                                was_smc_sib = 1;
+                                smc_sib_hpage = hp;
+                                ios_smc_sib_active_lo = act_lo;
+                                ios_smc_sib_active_hi = act_hi;
+                            }
+                        }
+                    }
+                }
+#define IOS_SMC_SIB_CLEANUP() do { \
+    if (smc_sib_hit) { \
+        extern int ios_page_has_smc_sibling( const void *addr ); \
+        ios_smc_sib_active_lo = 0; \
+        ios_smc_sib_active_hi = 0; \
+        if (ios_page_has_smc_sibling( (const void *)smc_sib_hpage )) \
+            mprotect( (void *)smc_sib_hpage, 0x4000, PROT_READ ); \
+        if (smc_sib_hpage2 && ios_page_has_smc_sibling( (const void *)smc_sib_hpage2 )) \
+            mprotect( (void *)smc_sib_hpage2, 0x4000, PROT_READ ); \
+        smc_sib_hit = 0; \
+    } \
+} while (0)
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
                  * decode, and the two need opposite fixes. Without this the
@@ -5439,6 +5651,7 @@ static void *ios_mach_exception_thread( void *arg )
                     if (trapped_alias_logs++ < 16)
                         dprintf( 2, "[alias-protection] dispatching guest write fault pc=%llx addr=%llx\n",
                                  (unsigned long long)fault_pc, (unsigned long long)fault_addr );
+                    IOS_SMC_SIB_CLEANUP();
                     goto dispatch_guest_fault;
                 }
                 if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
@@ -5908,7 +6121,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
                                 part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
-                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                                 ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
                                 done += len;
@@ -5996,7 +6209,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
                                 part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
-                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                                 ? rw + (a - rx) : ios_mach_write_alias( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
                                 done += len;
@@ -6352,9 +6565,9 @@ static void *ios_mach_exception_thread( void *arg )
                         unsigned casp_width = (insn & 0x40000000u) ? 16 : 8;
                         uint64_t base = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
                                         rn == 29 ? state.__fp : state.__x[rn];
-                        uintptr_t casp_rw = ios_write_alias( (uintptr_t)base );
+                        uintptr_t casp_rw = ios_mach_write_alias( (uintptr_t)base );
                         if (fault_addr >= base && fault_addr - base < casp_width &&
-                            casp_rw && ios_write_alias( (uintptr_t)base + casp_width - 1 ) ==
+                            casp_rw && ios_mach_write_alias( (uintptr_t)base + casp_width - 1 ) ==
                                        casp_rw + casp_width - 1 &&
                             !(honor_guest_prot && ios_alias_write_is_trapped( (uintptr_t)base )) &&
                             ios_mach_emulate_casp( insn, casp_rw, state.__x ))
@@ -6367,6 +6580,7 @@ static void *ios_mach_exception_thread( void *arg )
                                          (unsigned long long)base, (unsigned long long)casp_rw );
                         }
                     }
+                    IOS_SMC_SIB_CLEANUP();
                     if (!emulated && alias_fault && honor_guest_prot)
                     {
                         fault_addr = alias_fault;
@@ -6403,6 +6617,16 @@ static void *ios_mach_exception_thread( void *arg )
                          * translation is NOT invalidated here (the ARM64EC path would call
                          * HandleRWXAccessViolation); this counter is what proves whether a
                          * page was filled AFTER its translation was compiled. */
+                        if (was_smc_sib)
+                        {
+                            static unsigned int smc_sib_emul_n;
+                            if (++smc_sib_emul_n <= 16)
+                                dprintf( STDERR_FILENO,
+                                         "[smc-subpage] emulated sibling write #%u pc=0x%llx insn=0x%08x addr=0x%llx\n",
+                                         smc_sib_emul_n, (unsigned long long)fault_pc, insn,
+                                         (unsigned long long)fault_addr );
+                        }
+                        if (!was_smc_sib)
                         {
                             extern void ios_jit_anon_alias_note_write( unsigned long long );
                             ios_jit_anon_alias_note_write( (unsigned long long)fault_addr );
@@ -6763,7 +6987,7 @@ wx_done: ;
                                 __sync_lock_release(&fc_lock);
                             }
                         }
-                        if (madeira_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
+                        if (!was_smc_sib && madeira_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
                         {   /* ml649: the readback below touches both aliases */
                             /* Verify dual-map sharing: read back via the RX
                              * (original) address and compare to what we wrote
@@ -6782,6 +7006,8 @@ wx_done: ;
                         }
                     }
                 }
+                IOS_SMC_SIB_CLEANUP();
+#undef IOS_SMC_SIB_CLEANUP
             }
 
             /* iOS-Madeira RECLAIM RECOVERY (FEX-2607 Thumper): a page that Wine/FEX
@@ -10418,10 +10644,15 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * MADEIRA_MACH_ALIGN_FAULT=0 restores the old classification (every
          * data abort here is c0000005) for a same-build A/B; it is read once
          * when the exception server starts, never from this thread. */
+        /* madeira kuser-remap: a misaligned read of the KUSER_SHARED_DATA window gets
+         * here only when the Mach handler handed it to FEX on purpose; it must arrive
+         * as c0000005 (FEX's IosKuserRemapFault learns from access violations), not
+         * as a misaligned access FEX would "fix" by patching the load. */
         const int force_av = ios_force_write_av;
         ios_force_write_av = 0;
         is_align = !force_av && ios_mach_align_fault_enabled &&
-                   (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21;
+                   (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21 &&
+                   !(fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u);
         if (force_av) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;   /* [lse-fex] */
         if (is_align)
         {
@@ -10645,8 +10876,12 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * invalidation are fixed by re-execution and were free retries under
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
-     * Single server thread services all messages: no atomics needed. */
-    if (!is_align)
+     * Single server thread services all messages: no atomics needed.
+     * madeira kuser-remap: a KUSER_SHARED_DATA read only gets here when the Mach
+     * handler handed it to FEX on purpose, once per site; it is not a race, and the
+     * retry is emulated by the Mach handler, so it must be dispatched the FIRST time
+     * (with the debounce, FEX never saw one: log 2026-11-22 14:04). */
+    if (!is_align && !(fault_addr >= 0x7ffe0000u && fault_addr < 0x7fff0000u))
     {
         static struct { uint64_t key; uint32_t n; } rep[16];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
@@ -12524,6 +12759,75 @@ static void ios_tls_probe_dump( uint64_t teb )
     if (len) ERR("  [tls-probe]   expansion%s\n", line);
 }
 
+/* Stellar Blade null-table snapshot v1. Opt-in, diagnostic reads only.
+ * Offsets and signature come from the captured executable, not symbols.
+ * This is a post-fault snapshot, not an atomic snapshot or a writer trace. */
+static void ios_sb_fault_state( ucontext_t *context, uint64_t rip, const void *fault_addr )
+{
+    static unsigned count;
+    static const unsigned char signature[16] = {
+        0x4c,0x8b,0x84,0xc3,0x78,0x42,0x00,0x00,
+        0x49,0x8b,0x48,0x18,0x48,0x83,0xc1,0x78 };
+    unsigned char code[16];
+    uint64_t owner, index, image, entry, value, slots[16], object;
+    uint32_t image_size = 0, mask27c8 = 0, mask27cc = 0, mask27d0 = 0, object30 = 0;
+    uint16_t mask43ce = 0, objectbc = 0;
+    int ok27c8, ok27cc, ok27d0, ok43ce, ok30 = 0, okbc = 0, i;
+    const char *enabled = getenv( "MADEIRA_SB_FAULT_STATE" );
+
+    if (!enabled || strcmp( enabled, "1" )) return;
+    if ((uintptr_t)fault_addr != 0x18 || REGn_sig(2, context) != 0 || rip < 8) return;
+    if (!ios_guest_ctx_read( rip - 8, code, sizeof(code) ) ||
+        memcmp( code, signature, sizeof(code) )) return;
+    image = ios_guest_ctx_image( rip, &image_size );
+    if (!image || rip - image != 0x2e3ec81 || image_size < 0x2e3ec89) return;
+    if (__atomic_fetch_add( &count, 1, __ATOMIC_RELAXED ) >= 4) return;
+
+    owner = REGn_sig(27, context); /* live RBX, not saved frame state */
+    index = REGn_sig(8, context);  /* live RAX after MOVSXD */
+    object = FP_sig(context);     /* live RBP */
+    ERR("  [sb-state] v1 rip=%p image=%p owner=%p index=%llu r8=%p rdx=%p rdi=%p rbp=%p r14=%p (post-fault snapshot)\n",
+        (void *)rip, (void *)image, (void *)owner, (unsigned long long)index,
+        (void *)(uintptr_t)REGn_sig(2, context), (void *)(uintptr_t)REGn_sig(1, context),
+        (void *)(uintptr_t)REGn_sig(26, context), (void *)object,
+        (void *)(uintptr_t)REGn_sig(21, context));
+    if (owner < 0x10000 || owner > ~0ull - 0x4400)
+    {
+        ERR("  [sb-state] v1 owner outside safe diagnostic range; reads skipped\n");
+        return;
+    }
+    ok27c8 = ios_guest_ctx_read( owner + 0x27c8, &mask27c8, sizeof(mask27c8) );
+    ok27cc = ios_guest_ctx_read( owner + 0x27cc, &mask27cc, sizeof(mask27cc) );
+    ok27d0 = ios_guest_ctx_read( owner + 0x27d0, &mask27d0, sizeof(mask27d0) );
+    ok43ce = ios_guest_ctx_read( owner + 0x43ce, &mask43ce, sizeof(mask43ce) );
+    if (object >= 0x10000 && object <= ~0ull - 0xc0)
+    {
+        ok30 = ios_guest_ctx_read( object + 0x30, &object30, sizeof(object30) );
+        okbc = ios_guest_ctx_read( object + 0xbc, &objectbc, sizeof(objectbc) );
+    }
+    ERR("  [sb-state] v1 owner+27c8=%08x(read=%d) +27cc=%08x(read=%d) +27d0=%08x(read=%d) +43ce=%04x(read=%d) rbp+30=%08x(read=%d) +bc=%04x(read=%d)\n",
+        mask27c8, ok27c8, mask27cc, ok27cc, mask27d0, ok27d0, (unsigned)mask43ce, ok43ce,
+        object30, ok30, (unsigned)objectbc, okbc);
+    if (ok43ce && ok30)
+        ERR("  [sb-state] v1 current-memory candidate mask=%04x; may differ from mask used before fault\n",
+            (unsigned)(mask43ce & object30));
+    if (index < 16)
+    {
+        entry = owner + 0x4278 + index * 8;
+        if (ios_guest_ctx_read( entry, &value, sizeof(value) ))
+            ERR("  [sb-state] v1 selected[%llu] addr=%p now=%p live_r8=%p\n",
+                (unsigned long long)index, (void *)entry, (void *)value,
+                (void *)(uintptr_t)REGn_sig(2, context));
+        else ERR("  [sb-state] v1 selected entry unreadable\n");
+    }
+    else ERR("  [sb-state] v1 index outside captured 16-bit-mask domain; selected read skipped\n");
+    if (ios_guest_ctx_read( owner + 0x4278, slots, sizeof(slots) ))
+        for (i = 0; i < 16; i++)
+            ERR("  [sb-state] v1 slot[%02d]=%p%s\n", i, (void *)slots[i],
+                (uint64_t)i == index ? " SELECTED" : "");
+    else ERR("  [sb-state] v1 table snapshot unreadable\n");
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -13116,6 +13420,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             else
                                 ERR("  [guest-exact] ml885 block=%p rip=%p (bytes unreadable)\n", (void*)bb, (void*)xrip);
                             ios_guest_fault_context( xrip, REGn_sig(23, context), cs[5] );   /* ml1291 */
+                            ios_sb_fault_state( context, xrip, siginfo->si_addr );
                             ios_tls_probe_dump( REGn_sig(18, context) );   /* ml-tls-probe */
                         }
                         else ERR("  [guest-exact] ml885 block=%p unresolved: %s\n", (void*)bb, why);
@@ -13856,6 +14161,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 #ifdef WINE_IOS
+    /* MADEIRA_SB_NULL_UB_SKIP=1: the PE side (signal_arm64ec.c, ios_sb_null_ub_skip) resumes
+     * Stellar Blade's null uniform-buffer read at 0x18 instead of crashing, so it can recur
+     * every frame. Keep the first 8 of these lines and the region scan, then stay quiet for
+     * reads at 0x18; the PE side logs each new shader and a count every 1000 skips. */
+    static int sb_skip_env = -1, sb_quiet_n;
+    if (sb_skip_env < 0)
+    {
+        const char *e = getenv( "MADEIRA_SB_NULL_UB_SKIP" );
+        sb_skip_env = e && !strcmp( e, "1" );
+    }
+    if (!(sb_skip_env && (uintptr_t)siginfo->si_addr == 0x18 &&
+          __atomic_add_fetch( &sb_quiet_n, 1, __ATOMIC_RELAXED ) > 8))
+    {
     ERR("setup_exception for SEGV at pc=%p addr=%p (virtual_handle_fault failed)\n",
         (void*)PC_sig(context), siginfo->si_addr);
     /* Steam S3 (task #29): name the native faulting code + the target
@@ -13872,6 +14190,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      di.dli_fbase );
         ios_dump_fault_region( siginfo->si_addr );
     }
+    }   /* sb_quiet */
     /* A 32-bit program's call or jump to an address below 64 KB. FEX refuses to
      * compile such a block (CompileBlock: REFUSING low/invalid RIP) and returns 0,
      * and its dispatcher branches there, so the fault arrives here with pc = 0 and
@@ -16241,8 +16560,10 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      * writes so it invalidates translated code before patching
                      * the RW alias. Healing here skips that invalidation and
                      * leaves CoreCLR repeatedly executing its old prestub. */
+                    extern int ios_page_has_smc_sibling( const void *addr );
                     int aliased = ios_write_alias( (uintptr_t)siginfo->si_addr ) != 0;
-                    int stripped = (is_write && (want & PROT_WRITE) && !aliased &&
+                    int smc_sib = ios_page_has_smc_sibling( siginfo->si_addr );
+                    int stripped = (is_write && (want & PROT_WRITE) && !aliased && !smc_sib &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                     ++wr_seen;
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
@@ -16251,6 +16572,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             wr_seen, siginfo->si_addr, pc, (unsigned long long)esr,
                             is_write, want, host_prot,
                             aliased ? "(intentional alias protection)" :
+                            smc_sib ? "(intentional SMC sub-page protection)" :
                             stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
                             wr_seen, wr_healed);
 
@@ -18612,6 +18934,472 @@ void ios_wait_chain_snapshot( const char *why )
     }
 }
 
+/* madeira xref-scan: find the code that touches a guest variable or calls a function.
+ * env.MADEIRA_XREF_SCAN = <hex addr>[:<hex len>][,...] (up to 16 ranges) scans the main image
+ * (env.MADEIRA_XREF_IMAGE, default 0x140000000) once, at the first [thread-stacks] dump where
+ * it is mapped: executable sections for rip-relative operands, call/jmp/jcc rel32 and
+ * call/jmp [rip] into a range, every section for 8-byte pointers into a range (vtables).
+ * Each hit: `[xref] <where> -> <target> <kind> (insn ~<addr>) func <start>-<end>: [<from>] bytes`,
+ * the function bounds from the image's .pdata (unwind chains followed).
+ * env.MADEIRA_XREF_CHAIN = N then walks N levels up: the functions holding the hits become
+ * the next targets (their start addresses), so one run gives the call chain above a
+ * variable or function, each caller's code as `[xref-code]` (the whole function when it is at
+ * most 4 KB, else 384 bytes before the call and 64 after).
+ * env.MADEIRA_DUMP_GUEST = <hex addr>:<hex len>[,...] hex-dumps guest memory (`[dump]`, <= 64 KB).
+ * PRAGMATA (2026-11-23): its black screen is a loading screen whose stop routine
+ * 0x140c640b0 is never called; this finds the loader above it. Reads only, through
+ * mach_vm_read_overwrite, so an unmapped page can't fault the dumper. */
+enum { XREF_MAXR = 16, XREF_MAXH = 512, XREF_CHUNK = 4u << 20, XREF_OVER = 64 };
+struct xref_hit { uint64_t at, target, insn; const char *kind; };
+
+static int xref_read( uint64_t a, void *dst, uint64_t n )
+{
+    mach_vm_size_t g = 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a, n, (mach_vm_address_t)dst, &g )
+           == KERN_SUCCESS && g == n;
+}
+
+/* function bounds of addr from .pdata; 0 if none */
+static int xref_func_of( uint64_t img, uint32_t pd_rva, uint32_t pd_size, uint64_t addr,
+                         uint64_t *fs, uint64_t *fe )
+{
+    uint32_t n = pd_size / 12, lo = 0, hi, rva, ent[3];
+    int depth;
+    if (!pd_rva || !n || addr < img || addr - img > 0xffffffffull) return 0;
+    rva = (uint32_t)(addr - img);
+    hi = n;
+    while (lo < hi)
+    {
+        uint32_t mid = (lo + hi) / 2;
+        if (!xref_read( img + pd_rva + (uint64_t)mid * 12, ent, 12 )) return 0;
+        if (rva < ent[0]) hi = mid;
+        else if (rva >= ent[1]) lo = mid + 1;
+        else { lo = mid; break; }
+    }
+    if (lo >= n || !xref_read( img + pd_rva + (uint64_t)lo * 12, ent, 12 ) || rva < ent[0] || rva >= ent[1])
+        return 0;
+    for (depth = 0; depth < 8; depth++)   /* follow UNW_FLAG_CHAININFO to the primary entry */
+    {
+        unsigned char ui[4];
+        uint32_t parent[3], cnt;
+        if (ent[2] & 1) break;   /* unwind data is itself a RUNTIME_FUNCTION index (rare) */
+        if (!xref_read( img + ent[2], ui, 4 ) || !((ui[0] >> 3) & 4)) break;
+        cnt = (ui[2] + 1u) & ~1u;
+        if (!xref_read( img + ent[2] + 4 + cnt * 2, parent, 12 )) break;
+        ent[0] = parent[0]; ent[1] = parent[1]; ent[2] = parent[2];
+    }
+    *fs = img + ent[0];
+    *fe = img + ent[1];
+    return 1;
+}
+
+static int xref_scan( uint64_t img, const unsigned char *hdr, uint32_t pe, unsigned optsz, int nsec,
+                      const uint64_t *rlo, const uint64_t *rhi, int nr, unsigned char *buf,
+                      struct xref_hit *out )
+{
+    int sec, hits = 0;
+    for (sec = 0; sec < nsec; sec++)
+    {
+        const unsigned char *sh = hdr + pe + 24 + optsz + sec * 40;
+        uint32_t vsz, va, ch;
+        uint64_t off;
+        if ((size_t)(sh + 40 - hdr) > 4096) break;
+        vsz = *(const uint32_t *)(sh + 8); va = *(const uint32_t *)(sh + 12); ch = *(const uint32_t *)(sh + 36);
+        if (!vsz) continue;
+        for (off = 0; off < vsz; off += XREF_CHUNK)
+        {
+            uint64_t base = img + va + off, n = vsz - off, i;
+            if (n > XREF_CHUNK + XREF_OVER) n = XREF_CHUNK + XREF_OVER;
+            if (!xref_read( base, buf, n )) continue;
+            if (ch & 0x20000000u)
+                for (i = 2; i + 5 <= n && i < XREF_CHUNK + 2; i++)
+                {
+                    int32_t d = (int32_t)(buf[i] | buf[i+1] << 8 | buf[i+2] << 16 | (uint32_t)buf[i+3] << 24);
+                    unsigned char op = buf[i-2], rm = buf[i-1];
+                    const char *kind = NULL;
+                    uint64_t t, insn = base + i - 2;
+                    int k, r;
+                    if (rm == 0xE8 || rm == 0xE9) { k = 0; kind = rm == 0xE8 ? "call" : "jmp"; insn = base + i - 1; }
+                    else if (op == 0x0F && (rm & 0xF0) == 0x80) { k = 0; kind = "jcc"; }
+                    else if ((rm & 0xC7) != 0x05) continue;     /* modrm: [rip+disp32] */
+                    else if (op == 0xFF && ((rm & 0x38) == 0x10 || (rm & 0x38) == 0x20)) { k = 0; kind = "call/jmp [rip]"; }
+                    else if (op == 0xC6) { k = 1; kind = "mov byte imm"; }
+                    else if (op == 0xC7) { k = 4; kind = "mov dword imm"; }
+                    else if (op == 0x88 || op == 0x89) { k = 0; kind = "store reg"; }
+                    else if (op == 0x8A || op == 0x8B) { k = 0; kind = "load"; }
+                    else if (op == 0x8D) { k = 0; kind = "lea"; }
+                    else if (op == 0x80 || op == 0x83) { k = 1; kind = (rm & 0x38) == 0x38 ? "cmp imm8" : "op imm8"; }
+                    else if (op == 0x81) { k = 4; kind = (rm & 0x38) == 0x38 ? "cmp imm32" : "op imm32"; }
+                    else if (op == 0x86 || op == 0x87) { k = 0; kind = "xchg"; }
+                    else if (op == 0xB0 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "cmpxchg"; insn = base + i - 3; }
+                    else if (op == 0xB6 && i >= 3 && buf[i-3] == 0x0F) { k = 0; kind = "movzx byte"; insn = base + i - 3; }
+                    else continue;
+                    t = base + i + 4 + k + (int64_t)d;
+                    for (r = 0; r < nr; r++)
+                        if (t >= rlo[r] && t < rhi[r]) break;
+                    if (r == nr) continue;
+                    if (hits < XREF_MAXH) { out[hits].at = base + i; out[hits].target = t; out[hits].insn = insn; out[hits].kind = kind; }
+                    hits++;
+                }
+            for (i = 0; i + 8 <= n && i < XREF_CHUNK; i += 8)   /* absolute pointers, any section */
+            {
+                uint64_t v;
+                int r;
+                memcpy( &v, buf + i, 8 );
+                if (v < img || v - img > 0x40000000ull) continue;
+                for (r = 0; r < nr; r++)
+                    if (v >= rlo[r] && v < rhi[r]) break;
+                if (r == nr) continue;
+                if (hits < XREF_MAXH) { out[hits].at = base + i; out[hits].target = v; out[hits].insn = base + i; out[hits].kind = "ptr64"; }
+                hits++;
+            }
+        }
+    }
+    return hits;
+}
+
+static void xref_print_bytes( const char *tag, uint64_t from, uint64_t len )
+{
+    unsigned char row[32];
+    uint64_t o;
+    for (o = 0; o < len; o += 32)
+    {
+        char hx[32 * 3 + 1];
+        int b;
+        if (!xref_read( from + o, row, 32 )) { fprintf( stderr, "%s %p: unreadable\n", tag, (void *)(from + o) ); continue; }
+        for (b = 0; b < 32; b++) snprintf( hx + b * 3, 4, "%02x ", row[b] );
+        fprintf( stderr, "%s %p: %s\n", tag, (void *)(from + o), hx );
+    }
+}
+
+/* madeira guest-unwind: a .pdata-checked call chain for a parked guest thread.
+ * The [guest-stack] scan lists every qword that looks like a return address, stale ones
+ * from earlier, deeper calls included (log 2026-11-23 13:38: PRAGMATA's thread 0178 had
+ * 128 of them). Here a candidate counts only if the chain above it is consistent with
+ * the x64 unwind data: the caller's return address must sit exactly at
+ * candidate_slot + 8 + (pushes + allocation of the function the candidate returns into).
+ * The lowest candidate that starts such a chain of >= 3 frames (or one that ends outside
+ * the image, i.e. at the thread start) is printed as `[guest-unwind]`, and the 96 bytes
+ * of code before each of its first 6 return addresses as `[guest-unwind-code]` (once
+ * per address per run). A function with a frame pointer (UWOP_SET_FPREG) ends the
+ * chain (its size isn't known without rbp); the chain is then shorter, not wrong. */
+static int gu_call_len( uint64_t ra )
+{
+    unsigned char c[8];
+    if (!xref_read( ra - 8, c, 8 )) return 0;
+    if (c[3] == 0xE8) return 5;
+    if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC7) == 0x05) return 6;
+    if (c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) return 2;
+    if (c[5] == 0x41 && c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) return 3;
+    if (c[5] == 0xFF && (c[6] & 0x38) == 0x10 && (c[6] & 0xC0) == 0x40) return 3;
+    if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC0) == 0x80) return 6;
+    if (c[6] == 0xFF && (c[7] & 0x38) == 0x10 && (c[7] & 0xC0) == 0x00) return 2;
+    return 0;
+}
+
+/* bytes the function holding ra has on the stack below its return address; 0 = unknown */
+static int gu_frame_size( uint64_t img, uint32_t pd_rva, uint32_t pd_size, uint64_t ra, uint64_t *total )
+{
+    uint32_t n = pd_size / 12, lo = 0, hi, rva, ent[3];
+    int depth;
+    uint64_t t = 0;
+    if (!pd_rva || !n || ra < img || ra - img > 0xffffffffull) return 0;
+    rva = (uint32_t)(ra - img) - 1;   /* ra may be the first byte after a function ending in a call */
+    hi = n;
+    while (lo < hi)
+    {
+        uint32_t mid = (lo + hi) / 2;
+        if (!xref_read( img + pd_rva + (uint64_t)mid * 12, ent, 12 )) return 0;
+        if (rva < ent[0]) hi = mid;
+        else if (rva >= ent[1]) lo = mid + 1;
+        else { lo = mid; break; }
+    }
+    if (lo >= n || !xref_read( img + pd_rva + (uint64_t)lo * 12, ent, 12 ) || rva < ent[0] || rva >= ent[1])
+        return 0;
+    for (depth = 0; depth < 8; depth++)
+    {
+        unsigned char ui[4];
+        uint16_t codes[256];
+        unsigned cnt, i;
+        if (ent[2] & 1) return 0;
+        if (!xref_read( img + ent[2], ui, 4 )) return 0;
+        cnt = ui[2];
+        if (cnt && !xref_read( img + ent[2] + 4, codes, cnt * 2 )) return 0;
+        for (i = 0; i < cnt; i++)
+        {
+            unsigned op = (codes[i] >> 8) & 0xF, info = codes[i] >> 12;
+            switch (op)
+            {
+            case 0: t += 8; break;                                       /* PUSH_NONVOL */
+            case 1:                                                      /* ALLOC_LARGE */
+                if (info == 0) { if (i + 1 >= cnt) return 0; t += (uint64_t)codes[i + 1] * 8; i += 1; }
+                else { if (i + 2 >= cnt) return 0; t += (uint64_t)codes[i + 1] | ((uint64_t)codes[i + 2] << 16); i += 2; }
+                break;
+            case 2: t += info * 8 + 8; break;                            /* ALLOC_SMALL */
+            case 3: return 0;                                            /* SET_FPREG: size needs rbp */
+            case 4: i += 1; break;                                       /* SAVE_NONVOL */
+            case 5: i += 2; break;                                       /* SAVE_NONVOL_FAR */
+            case 6: i += 1; break;                                       /* EPILOG (v2) */
+            case 8: i += 1; break;                                       /* SAVE_XMM128 */
+            case 9: i += 2; break;                                       /* SAVE_XMM128_FAR */
+            case 10: t += info ? 48 : 40; break;                         /* PUSH_MACHFRAME */
+            default: return 0;
+            }
+        }
+        if (!((ui[0] >> 3) & 4)) break;                                  /* no CHAININFO: done */
+        {
+            uint32_t parent[3];
+            if (!xref_read( img + ent[2] + 4 + ((cnt + 1u) & ~1u) * 2, parent, 12 )) return 0;
+            ent[0] = parent[0]; ent[1] = parent[1]; ent[2] = parent[2];
+        }
+    }
+    *total = t;
+    return 1;
+}
+
+static void gu_print( uint64_t gsp, uint64_t gtop, uint64_t img, uint64_t img_hi )
+{
+    static uint32_t pd_rva, pd_size;
+    static int pd_done;
+    static uint64_t printed[512];
+    static unsigned nprinted;
+    uint64_t loc;
+    int tries = 0;
+
+    if (!pd_done)
+    {
+        unsigned char h[0x200];
+        pd_done = 1;
+        if (xref_read( img, h, sizeof(h) ) && h[0] == 'M' && h[1] == 'Z')
+        {
+            uint32_t pe = *(uint32_t *)(h + 0x3c);
+            if (pe < sizeof(h) - 24 - 112 - 32 && !memcmp( h + pe, "PE\0\0", 4 ))
+            {
+                pd_rva = *(uint32_t *)(h + pe + 24 + 112 + 3 * 8);
+                pd_size = *(uint32_t *)(h + pe + 24 + 112 + 3 * 8 + 4);
+            }
+        }
+    }
+    if (!pd_rva) return;
+    for (loc = gsp; loc + 8 <= gtop && tries < 4096; loc += 8)
+    {
+        uint64_t ra, chain[48], cl = loc, sz;
+        int nch = 0, ended = 0, k;
+        if (!xref_read( loc, &ra, 8 ) || ra < img + 0x1000 || ra >= img_hi || !gu_call_len( ra )) continue;
+        tries++;
+        chain[nch++] = ra;
+        while (nch < 48)
+        {
+            uint64_t nra;
+            if (!gu_frame_size( img, pd_rva, pd_size, chain[nch - 1], &sz )) break;
+            cl = cl + 8 + sz;
+            if (cl + 8 > gtop || !xref_read( cl, &nra, 8 )) break;
+            if (nra < img || nra >= img_hi)                         /* returns out of the image: thread start / host */
+            {
+                ended = nra > 0x100000000ull && nch >= 2;
+                if (!ended) nch = -nch;
+                break;
+            }
+            if (!gu_call_len( nra )) { nch = -nch; break; }          /* inconsistent: not a real chain */
+            chain[nch++] = nra;
+        }
+        if (nch < 0) continue;
+        if (nch < 3 && !ended) continue;
+        {
+            char out[1600];
+            int len = snprintf( out, sizeof(out), "[guest-unwind] at %#llx:%s", (unsigned long long)loc,
+                                ended ? "" : " (cut)" );
+            for (k = 0; k < nch && len < (int)sizeof(out) - 24; k++)
+                len += snprintf( out + len, sizeof(out) - len, " +%#llx", (unsigned long long)(chain[k] - img) );
+            fprintf( stderr, "%s\n", out );
+            for (k = 0; k < nch && k < 6; k++)
+            {
+                unsigned j;
+                for (j = 0; j < nprinted; j++) if (printed[j] == chain[k]) break;
+                if (j < nprinted || nprinted >= 512) continue;
+                printed[nprinted++] = chain[k];
+                xref_print_bytes( "[guest-unwind-code]", chain[k] - 96, 128 );
+            }
+        }
+        return;
+    }
+    fprintf( stderr, "[guest-unwind] no consistent chain (%d candidates)\n", tries );
+}
+
+static void ios_xref_scan_once( void )
+{
+    static int done;
+    uint64_t rlo[XREF_MAXR], rhi[XREF_MAXR], img;
+    int nr = 0, nsec, level, chain = 0, printed = 0;
+    const char *e, *q;
+    unsigned char hdr[4096];
+    unsigned char *buf;
+    struct xref_hit *hit;
+    uint32_t pe, pd_rva = 0, pd_size = 0;
+    unsigned optsz;
+
+    if (done) return;
+    e = getenv( "MADEIRA_XREF_SCAN" );
+    q = getenv( "MADEIRA_DUMP_GUEST" );
+    if ((!e || !*e) && (!q || !*q)) { done = 1; return; }
+    img = 0x140000000ull;
+    { const char *im = getenv( "MADEIRA_XREF_IMAGE" ); if (im && *im) img = (uint64_t)strtoull( im, NULL, 16 ); }
+    { const char *c = getenv( "MADEIRA_XREF_CHAIN" ); if (c && *c) chain = atoi( c ); if (chain < 0) chain = 0; if (chain > 8) chain = 8; }
+    if (!xref_read( img, hdr, sizeof(hdr) ) || hdr[0] != 'M' || hdr[1] != 'Z')
+        return;   /* not mapped yet: try again at the next dump */
+    done = 1;
+
+    while (e && *e && nr < XREF_MAXR)
+    {
+        char *end;
+        uint64_t a = (uint64_t)strtoull( e, &end, 16 ), len = 1;
+        if (end == e) break;
+        if (*end == ':') len = (uint64_t)strtoull( end + 1, &end, 16 );
+        if (a && len) { rlo[nr] = a; rhi[nr] = a + len; nr++; }
+        while (*end && *end != ',') end++;
+        e = *end ? end + 1 : end;
+    }
+
+    pe = *(uint32_t *)(hdr + 0x3c);
+    if (nr && pe < sizeof(hdr) - 24 && !memcmp( hdr + pe, "PE\0\0", 4 )
+        && (buf = malloc( XREF_CHUNK + XREF_OVER )) && (hit = malloc( sizeof(*hit) * XREF_MAXH )))
+    {
+        optsz = *(uint16_t *)(hdr + pe + 20);
+        nsec = *(uint16_t *)(hdr + pe + 6);
+        if (optsz >= 112 + 4 * 8)   /* PE32+ data directory 3 = exception (.pdata) */
+        {
+            pd_rva = *(uint32_t *)(hdr + pe + 24 + 112 + 3 * 8);
+            pd_size = *(uint32_t *)(hdr + pe + 24 + 112 + 3 * 8 + 4);
+        }
+        fprintf( stderr, "[xref] image %p: %d section(s), .pdata rva %#x (%u functions); %d range(s), chain %d\n",
+                 (void *)img, nsec, pd_rva, pd_size / 12, nr, chain );
+        for (level = 0; level <= chain && nr; level++)
+        {
+            int nh = xref_scan( img, hdr, pe, optsz, nsec, rlo, rhi, nr, buf, hit ), h, nn = 0;
+            uint64_t nlo[XREF_MAXR];
+            fprintf( stderr, "[xref] level %d: %d reference(s) to %d range(s)%s\n", level, nh, nr,
+                     nh > XREF_MAXH ? " (first 512 kept)" : "" );
+            if (nh > XREF_MAXH) nh = XREF_MAXH;
+            for (h = 0; h < nh; h++)
+            {
+                uint64_t fs = 0, fe = 0;
+                int have = xref_func_of( img, pd_rva, pd_size, hit[h].insn, &fs, &fe ), j;
+                if (printed++ < 600)
+                {
+                    char hx[72 * 3 + 1];
+                    unsigned char ctx[72];
+                    int b;
+                    hx[0] = 0;
+                    if (xref_read( hit[h].at - 48, ctx, 72 ))
+                        for (b = 0; b < 72; b++) snprintf( hx + b * 3, 4, "%02x ", ctx[b] );
+                    fprintf( stderr, "[xref] L%d %p -> %p %s (insn ~%p) func %p-%p: [%p] %s\n", level,
+                             (void *)hit[h].at, (void *)hit[h].target, hit[h].kind, (void *)hit[h].insn,
+                             (void *)fs, (void *)fe, (void *)(hit[h].at - 48), hx );
+                    if (chain && strcmp( hit[h].kind, "ptr64" ))
+                    {
+                        if (have && fe > fs && fe - fs <= 4096)   /* the whole function */
+                            xref_print_bytes( "[xref-code]", fs & ~31ull, ((fe - (fs & ~31ull)) + 31) & ~31ull );
+                        else
+                            xref_print_bytes( "[xref-code]", (hit[h].insn - 384) & ~31ull, 384 + 64 + 32 );
+                    }
+                }
+                if (!have || level == chain) continue;
+                for (j = 0; j < nn; j++) if (nlo[j] == fs) break;
+                if (j == nn && nn < XREF_MAXR) nlo[nn++] = fs;
+            }
+            for (h = 0; h < nn; h++) { rlo[h] = nlo[h]; rhi[h] = nlo[h] + 1; }
+            nr = nn;
+            if (level < chain && nn)
+            {
+                fprintf( stderr, "[xref] next level targets:" );
+                for (h = 0; h < nn; h++) fprintf( stderr, " %p", (void *)nlo[h] );
+                fprintf( stderr, "\n" );
+            }
+        }
+        fprintf( stderr, "[xref] done\n" );
+        free( hit );
+        free( buf );
+    }
+    else if (nr)
+        fprintf( stderr, "[xref] no PE header at %p\n", (void *)img );
+
+    if (q && *q)
+    {
+        unsigned total = 0;
+        while (*q && total < 65536)
+        {
+            char *end;
+            uint64_t a = (uint64_t)strtoull( q, &end, 16 ), len = 0x100;
+            if (end == q) break;
+            if (*end == ':') len = (uint64_t)strtoull( end + 1, &end, 16 );
+            if (len > 65536 - total) len = 65536 - total;
+            xref_print_bytes( "[dump]", a, (len + 31) & ~31ull );
+            total += (unsigned)((len + 31) & ~31ull);
+            while (*end && *end != ',') end++;
+            q = *end ? end + 1 : end;
+        }
+    }
+}
+
+/* [kusd-clock] what the guest reads from KUSER_SHARED_DATA's clocks at each dump, next to
+ * the host clock. A loader or protection wait that compares two readings spins forever if
+ * the page stops moving while the renderer keeps drawing (ml731). Prints how far each field
+ * moved since the previous dump against the host's elapsed time, and the static fields
+ * once. Reads the real page (the same one FEX's inline window reads). */
+static void ios_kusd_clock_report(void)
+{
+    static unsigned long long prev_host_ms, prev_it, prev_st, prev_tc;
+    static int once;
+    struct timespec ts;
+    const unsigned char *u = (const unsigned char *)ios_exc_usd;
+    unsigned long long host_ms, it, st, tc;
+
+    if (!u) { fprintf(stderr, "[kusd-clock] no KUSER page recorded\n"); return; }
+    /* CLOCK_MONOTONIC (the mach_absolute_time conversion gave nonsense deltas on device) */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    host_ms = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+    /* KSYSTEM_TIME: LowPart, High1Time, High2Time */
+    it = ((unsigned long long)*(volatile unsigned int *)(u + 0x00c) << 32) | *(volatile unsigned int *)(u + 0x008);
+    st = ((unsigned long long)*(volatile unsigned int *)(u + 0x018) << 32) | *(volatile unsigned int *)(u + 0x014);
+    tc = ((unsigned long long)*(volatile unsigned int *)(u + 0x324) << 32) | *(volatile unsigned int *)(u + 0x320);
+    fprintf(stderr, "[kusd-clock] InterruptTime=%llu (100ns) SystemTime=%llu TickCount=%llu TickCountLow=%u\n",
+            it, st, tc, *(volatile unsigned int *)(u + 0x000));
+    if (prev_host_ms)
+    {
+        unsigned long long dh = host_ms - prev_host_ms;
+        long long dit = (long long)(it - prev_it) / 10000, dst = (long long)(st - prev_st) / 10000;
+        long long dtc = (long long)(tc - prev_tc);
+        const char *verdict = (!dit && !dst && !dtc) ? "*** FROZEN: no clock field moved ***" :
+                              (dh > 1000 && (dit < (long long)dh / 2 || dtc < (long long)dh / 2)) ? "*** LAGGING the host clock ***" :
+                              "moving with the host clock";
+        fprintf(stderr, "[kusd-clock] since last dump: host %llu ms, InterruptTime %lld ms, SystemTime %lld ms, "
+                "TickCount %lld ms -- %s\n", dh, dit, dst, dtc, verdict);
+    }
+    prev_host_ms = host_ms; prev_it = it; prev_st = st; prev_tc = tc;
+    if (!once)
+    {
+        once = 1;
+        fprintf(stderr, "[kusd-clock] static: NtBuild=%u NtMajor=%u NtMinor=%u ProductType=%u "
+                "KdDebuggerEnabled=%u SafeBoot=%u SharedDataFlags=%#x ActiveProcs=%u PhysPages=%u "
+                "QpcFrequency=%llu QpcBypass=%#x QpcBias=%llu TickCountMultiplier=%#x\n",
+                *(volatile unsigned int *)(u + 0x260), *(volatile unsigned int *)(u + 0x26c),
+                *(volatile unsigned int *)(u + 0x270), *(volatile unsigned int *)(u + 0x264),
+                *(volatile unsigned char *)(u + 0x2d4), *(volatile unsigned char *)(u + 0x2ec),
+                *(volatile unsigned int *)(u + 0x2f0), *(volatile unsigned int *)(u + 0x3c0),
+                *(volatile unsigned int *)(u + 0x2e8),
+                *(volatile unsigned long long *)(u + 0x300), *(volatile unsigned char *)(u + 0x3c6),
+                *(volatile unsigned long long *)(u + 0x3b8), *(volatile unsigned int *)(u + 0x004));
+        {   /* ProcessorFeatures[0..63] at 0x274 (PF_ index = position), XState.EnabledFeatures at 0x3d8 */
+            char pf[65];
+            int k;
+            for (k = 0; k < 64; k++) pf[k] = *(volatile unsigned char *)(u + 0x274 + k) ? '1' : '0';
+            pf[64] = 0;
+            fprintf(stderr, "[kusd-clock] ProcessorFeatures[0..63]=%s XState.EnabledFeatures=%#llx NativeArch=%u\n",
+                    pf, *(volatile unsigned long long *)(u + 0x3d8), *(volatile unsigned short *)(u + 0x26a));
+        }
+    }
+}
+
 void ios_dump_all_thread_stacks(void)
 {
     thread_act_array_t threads;
@@ -18620,6 +19408,8 @@ void ios_dump_all_thread_stacks(void)
 
     if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
     fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);
+    ios_kusd_clock_report();
+    ios_xref_scan_once();   /* madeira xref-scan / guest dump (env-driven, once) */
     for (i = 0; i < count; i++)
     {
         arm_thread_state64_t st;
@@ -18698,6 +19488,179 @@ void ios_dump_all_thread_stacks(void)
                     bi.run_state, bi.suspend_count, bi.cpu_usage,
                     (unsigned long long)st.__x[8], (unsigned long long)st.__x[18],
                     (unsigned long long)arm_thread_state64_get_sp(st), tebstate);
+
+            /* madeira hang-ring: env.MADEIRA_BLOCK_RING_STACKS = N (with MADEIRA_BLOCK_RING = 1)
+             * prints the last N guest code blocks of every guest thread under its stack line,
+             * x86 bytes included, so a game that sits on a black screen with every thread
+             * waiting shows WHAT each thread ran right before its wait (PRAGMATA, log
+             * 2026-11-22 19:13: empty scene after its initial settings, nothing in the log
+             * says what it waits for). A thread parked in a server call has x18 = 0; its
+             * TEB then comes from its pthread TSD slot (the thread sampler's calibration;
+             * the first version used the pthread itself and missed every such thread, log
+             * 2026-11-22 20:04), confirmed by TEB->Self (TEB+0x30) before the ring at
+             * TEB+0x1710 is read. Reads only. */
+            {
+                static int ring_n = -1, gs_n = -1;
+                if (ring_n < 0)
+                {
+                    const char *e = getenv( "MADEIRA_BLOCK_RING_STACKS" );
+                    ring_n = (e && *e) ? atoi( e ) : 0;
+                    if (ring_n < 0) ring_n = 0;
+                    if (ring_n > 1536) ring_n = 1536;
+                    /* madeira guest-stack: env.MADEIRA_GUEST_STACK = N prints up to N return
+                     * addresses found on each guest thread's stack (sp .. TEB StackBase) that
+                     * point into the main image (0x140000000, SizeOfImage from its header)
+                     * right after a call instruction: a heuristic call stack of where the
+                     * thread is blocked. PRAGMATA's main thread (log 2026-11-22 21:16) only
+                     * shows its window procedure in the ring, called again and again from a
+                     * native wait; this shows which game call is underneath. */
+                    e = getenv( "MADEIRA_GUEST_STACK" );
+                    gs_n = (e && *e) ? atoi( e ) : 0;
+                    if (gs_n < 0) gs_n = 0;
+                    if (gs_n > 128) gs_n = 128;
+                }
+                if (ring_n > 0 || gs_n > 0)
+                {
+                    uintptr_t rteb = 0;
+                    uint64_t rself = 0, rring = 0;
+                    mach_vm_size_t rg = 0, rg2 = 0;
+
+                    uintptr_t cand[3] = { 0, 0, 0 };
+                    int ci, ok = 0, tebok = 0;
+                    static int rmiss;
+
+                    if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff)) cand[0] = (uintptr_t)st.__x[18];
+                    if (pt)
+                    {
+                        extern uint64_t ios_ts_teb_export( void *pt );
+                        cand[1] = (uintptr_t)ios_ts_teb_export( (void *)pt );
+                        cand[2] = (uintptr_t)pt;
+                    }
+                    for (ci = 0; ci < 3 && !ok; ci++)
+                    {
+                        uintptr_t c = cand[ci];
+                        uint64_t sf = 0, rr = 0;
+                        if (!c || (c & 0xfff)) continue;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(c + 0x30), 8,
+                                                    (mach_vm_address_t)&sf, &rg ) != KERN_SUCCESS || rg != 8
+                            || sf != c)
+                            continue;
+                        if (!tebok) { tebok = 1; rteb = c; rself = sf; }
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(c + 0x1710), 8,
+                                                    (mach_vm_address_t)&rr, &rg2 ) == KERN_SUCCESS && rg2 == 8 && rr)
+                        { ok = 1; rteb = c; rring = rr; }
+                    }
+                    if (tebok)
+                    {
+                        uint64_t tid = 0;
+                        mach_vm_size_t tg = 0;
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 0x48), 8,
+                                                (mach_vm_address_t)&tid, &tg );
+                        fprintf( stderr, "[thread-stacks]   guest tid=%04llx teb=%#llx\n",
+                                 (unsigned long long)tid, (unsigned long long)rteb );
+                    }
+                    if (ring_n > 0 && ok)
+                        ios_block_ring_dump( rteb, (unsigned)ring_n, "thread-stacks" );
+                    else if (ring_n > 0 && rmiss++ < 300)   /* why a thread got no ring: which TEB guesses there were */
+                        fprintf( stderr, "[block-ring] no ring: x18=%#llx tsd-teb=%#llx pthread=%#llx self=%#llx ring=%#llx\n",
+                                 (unsigned long long)cand[0], (unsigned long long)cand[1], (unsigned long long)cand[2],
+                                 (unsigned long long)rself, (unsigned long long)rring );
+                    if (gs_n > 0 && tebok)
+                    {
+                        static uint64_t img_lo, img_hi;
+                        uint64_t sp = arm_thread_state64_get_sp( st ), sbase = 0, slimit = 0, top, gsp0 = 0, gtop0 = 0;
+                        mach_vm_size_t sg = 0;
+                        int found = 0;
+                        char line[2048];
+                        int len = 0;
+
+                        if (!img_hi)
+                        {
+                            unsigned char h[0x200];
+                            mach_vm_size_t hg = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), 0x140000000ull, sizeof(h),
+                                                        (mach_vm_address_t)h, &hg ) == KERN_SUCCESS && hg == sizeof(h)
+                                && h[0] == 'M' && h[1] == 'Z')
+                            {
+                                uint32_t pe = *(uint32_t *)(h + 0x3c);
+                                if (pe < sizeof(h) - 0x58 && !memcmp( h + pe, "PE\0\0", 4 ))
+                                {
+                                    img_lo = 0x140000000ull;
+                                    img_hi = img_lo + *(uint32_t *)(h + pe + 24 + 56);   /* SizeOfImage */
+                                }
+                            }
+                        }
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 8), 8, (mach_vm_address_t)&sbase, &sg );
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rteb + 16), 8, (mach_vm_address_t)&slimit, &sg );
+                        /* A thread parked in a syscall runs on Wine's unix-side kernel stack, not
+                         * the guest stack (first version scanned that and found nothing, log
+                         * 2026-11-23 11:36). The guest sp saved in its syscall frame is somewhere
+                         * on that kernel stack: take the lowest qword there that points into the
+                         * guest stack [StackLimit, StackBase) as the guest sp. */
+                        if (!(sp >= slimit && sp < sbase) && sbase > slimit && sbase - slimit < 0x10000000)
+                        {
+                            uint64_t kq[512], kmin = 0, ko;
+                            for (ko = 0; ko < 0x10000; ko += sizeof(kq))
+                            {
+                                mach_vm_size_t kg = 0;
+                                unsigned kk;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)((sp & ~7ull) + ko), sizeof(kq),
+                                                            (mach_vm_address_t)kq, &kg ) != KERN_SUCCESS || kg != sizeof(kq))
+                                    break;
+                                for (kk = 0; kk < 512; kk++)
+                                    if (kq[kk] >= slimit && kq[kk] < sbase && (!kmin || kq[kk] < kmin)) kmin = kq[kk];
+                            }
+                            len = snprintf( line, sizeof(line), "[guest-stack] native sp=%#llx guest sp=%#llx (stack %#llx-%#llx):",
+                                            (unsigned long long)sp, (unsigned long long)kmin,
+                                            (unsigned long long)slimit, (unsigned long long)sbase );
+                            sp = kmin ? kmin : slimit;
+                        }
+                        else
+                            len = snprintf( line, sizeof(line), "[guest-stack] sp=%#llx (stack %#llx-%#llx):", (unsigned long long)sp,
+                                            (unsigned long long)slimit, (unsigned long long)sbase );
+                        sp = (sp + 7) & ~7ull;
+                        top = (sp >= slimit && sp < sbase) ? sbase : sp + 0x10000;
+                        if (top - sp > 0x40000) top = sp + 0x40000;
+                        gsp0 = sp; gtop0 = top;
+                        while (img_hi && sp < top && found < gs_n)
+                        {
+                            uint64_t q[512];
+                            mach_vm_size_t qg = 0;
+                            uint64_t n = (top - sp) / 8, k;
+                            if (n > 512) n = 512;
+                            if (!n) break;   /* < 8 bytes left: n = 0 never advanced sp (hung the dump, log 2026-11-23 12:32) */
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)sp, n * 8,
+                                                        (mach_vm_address_t)q, &qg ) != KERN_SUCCESS || qg != n * 8)
+                                break;
+                            for (k = 0; k < n && found < gs_n; k++)
+                            {
+                                unsigned char c[8];
+                                mach_vm_size_t cg = 0;
+                                uint64_t ra = q[k];
+                                int call = 0;
+                                if (ra < img_lo + 0x1000 || ra >= img_hi) continue;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ra - 8), 8,
+                                                            (mach_vm_address_t)c, &cg ) != KERN_SUCCESS || cg != 8)
+                                    continue;
+                                if (c[3] == 0xE8) call = 5;                                          /* call rel32 */
+                                else if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC7) == 0x05) call = 6; /* call [rip+d32] */
+                                else if (c[6] == 0xFF && (c[7] & 0xF8) == 0xD0) call = 2;             /* call reg */
+                                else if (c[5] == 0xFF && (c[6] & 0x38) == 0x10 && (c[6] & 0xC0) == 0x40) call = 3; /* call [reg+d8] */
+                                else if (c[2] == 0xFF && (c[3] & 0x38) == 0x10 && (c[3] & 0xC0) == 0x80) call = 6; /* call [reg+d32] */
+                                else if (c[6] == 0xFF && (c[7] & 0x38) == 0x10 && (c[7] & 0xC0) == 0x00) call = 2; /* call [reg] */
+                                if (!call) continue;
+                                found++;
+                                if (len < (int)sizeof(line) - 40)
+                                    len += snprintf( line + len, sizeof(line) - len, " +%#llx(%d)",
+                                                     (unsigned long long)(ra - img_lo), call );
+                            }
+                            sp += n * 8;
+                        }
+                        fprintf( stderr, "%s%s\n", line, img_hi ? "" : " (image not mapped)" );
+                        if (img_hi) gu_print( gsp0, gtop0, img_lo, img_hi );
+                    }
+                }
+            }
 
             /* ================= ml677 SPIN SNAPSHOT =========================
              *

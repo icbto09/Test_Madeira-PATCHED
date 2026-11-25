@@ -469,6 +469,151 @@ extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* S
   return 0;
 }
 
+/* ================== madeira kuser-remap: KUSER_SHARED_DATA reads, inline =================
+ * Windows keeps KUSER_SHARED_DATA at the constant 0x7ffe0000. iOS can't map anything below
+ * 4 GB, so ntdll registers that page as a sub-floor window (ml952) and every guest read of
+ * the constant faults and is emulated by the Mach handler, ~10 us each. PRAGMATA's
+ * protection code reads it ~100,000 times a second (21.8 M in one 4-minute run), which kept
+ * the game on a black loading screen.
+ *
+ * With env.MADEIRA_KUSER_REMAP = 1, ntdll hands the first fault at each JIT site to FEX
+ * (ResetToConsistentState) instead of emulating it. FEX records the guest instruction
+ * here and drops its compiled code; the faulting load itself is retried unchanged and
+ * emulated by ntdll. The recompile gives that instruction's memory LOADS the same inline
+ * window translation ml1057 uses for sub-floor images (no NZCV clobber).
+ *
+ * Learning is per 4 KB GUEST PAGE from the first fault (every load in that page gets the
+ * translation). The first version learned single instructions in an 8192-slot table:
+ * PRAGMATA's protection code has well over 6,000 distinct KUSER reads (6,144 learned in
+ * 15 s, ~4,000 a second at the end), the table filled and everything after it stayed on
+ * ntdll's emulation at ~100,000 traps a second (log 2026-11-22 14:42). Pages are far fewer
+ * and the table is 8x bigger.
+ * A fault from a page already learned is old compiled code (another thread, or a block
+ * still running) or a load path the translation misses. It is tracked per RIP:
+ *   1st/2nd time: drop the page's code again;  3rd+: give up (left to ntdll's emulation).
+ * A repeat within 20 ms doesn't count as a strike, but no RIP gets more than 8 re-drops.
+ * The tables only grow; learning runs under ThreadCreationMutex, lookups are lock-free.
+ * Stores are never translated: KUSER_SHARED_DATA is read-only to Windows programs. */
+static constexpr uint64_t kIosKuserLow = 0x7ffe0000ull;
+static constexpr unsigned kIosKuserRipSlots = 16384;  // power of two
+static constexpr unsigned kIosKuserPageSlots = 65536; // power of two
+struct IosKuserRipEnt {
+  uint64_t Rip;       // 0 = empty; published last
+  uint64_t LastTick;
+  uint32_t Strikes;
+  uint32_t Drops;     // times its page's code was dropped again for it
+};
+static IosKuserRipEnt g_IosKuserRips[kIosKuserRipSlots];
+static uint64_t g_IosKuserPages[kIosKuserPageSlots];   // guest page number + 1, 0 = empty
+static uint32_t g_IosKuserRipCount, g_IosKuserPageCount;
+
+static inline uint64_t IosKuserHash(uint64_t V) {
+  V ^= V >> 33;
+  V *= 0xff51afd7ed558ccdull;
+  V ^= V >> 33;
+  return V;
+}
+
+// The KUSER_SHARED_DATA window as ntdll registered it (ml952): 1 and the window, or 0.
+extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real) {
+  const int count = g_SubfloorCount;
+  for (int i = 0; i < count; i++) {
+    if (g_Subfloor[i].LowBase == kIosKuserLow && g_Subfloor[i].Size && g_Subfloor[i].RealBase) {
+      *Low = g_Subfloor[i].LowBase;
+      *Real = g_Subfloor[i].RealBase;
+      *Size = g_Subfloor[i].Size;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static IosKuserRipEnt* IosKuserFindRip(uint64_t Rip) {
+  const unsigned Mask = kIosKuserRipSlots - 1;
+  unsigned i = static_cast<unsigned>(IosKuserHash(Rip)) & Mask;
+  for (unsigned n = 0; n < kIosKuserRipSlots; n++, i = (i + 1) & Mask) {
+    const uint64_t R = __atomic_load_n(&g_IosKuserRips[i].Rip, __ATOMIC_ACQUIRE);
+    if (R == Rip) return &g_IosKuserRips[i];
+    if (!R) return nullptr;
+  }
+  return nullptr;
+}
+
+static bool IosKuserHasPage(uint64_t Page) {
+  const unsigned Mask = kIosKuserPageSlots - 1;
+  unsigned i = static_cast<unsigned>(IosKuserHash(Page)) & Mask;
+  for (unsigned n = 0; n < kIosKuserPageSlots; n++, i = (i + 1) & Mask) {
+    const uint64_t P = __atomic_load_n(&g_IosKuserPages[i], __ATOMIC_ACQUIRE);
+    if (P == Page + 1) return true;
+    if (!P) return false;
+  }
+  return false;
+}
+
+// JIT, per guest instruction: should this instruction's loads get the KUSER window?
+extern "C" int IosKuserWantsInsn(uint64_t Rip) {
+  if (!__atomic_load_n(&g_IosKuserPageCount, __ATOMIC_ACQUIRE)) {
+    return 0;   // the switch is off or nothing learned yet: one load per instruction
+  }
+  return IosKuserHasPage(Rip >> 12) ? 1 : 0;
+}
+
+/* Learn from a fault at guest Rip. Caller holds ThreadCreationMutex (single writer).
+ * Returns 2 = its page learned, 3 = page already learned: drop its code again,
+ * 0 = give up (leave the fault to ntdll). *Strikes gets the count. */
+extern "C" int IosKuserNote(uint64_t Rip, uint64_t Tick, uint32_t* Strikes) {
+  static constexpr uint64_t kRepeatTicks = 480000;   // 20 ms at the 24 MHz system counter
+  const uint64_t Page = Rip >> 12;
+  if (!IosKuserHasPage(Page)) {
+    if (g_IosKuserPageCount >= kIosKuserPageSlots * 3 / 4) {
+      *Strikes = 0;
+      return 0;
+    }
+    const unsigned Mask = kIosKuserPageSlots - 1;
+    unsigned i = static_cast<unsigned>(IosKuserHash(Page)) & Mask;
+    while (g_IosKuserPages[i]) i = (i + 1) & Mask;
+    __atomic_store_n(&g_IosKuserPages[i], Page + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_IosKuserPageCount, g_IosKuserPageCount + 1, __ATOMIC_RELEASE);
+    *Strikes = 1;
+    return 2;
+  }
+  IosKuserRipEnt* E = IosKuserFindRip(Rip);
+  if (!E) {
+    if (g_IosKuserRipCount >= kIosKuserRipSlots * 3 / 4) {
+      *Strikes = 0;
+      return 0;
+    }
+    const unsigned Mask = kIosKuserRipSlots - 1;
+    unsigned i = static_cast<unsigned>(IosKuserHash(Rip)) & Mask;
+    while (g_IosKuserRips[i].Rip) i = (i + 1) & Mask;
+    g_IosKuserRips[i].LastTick = Tick;
+    g_IosKuserRips[i].Strikes = 2;
+    g_IosKuserRips[i].Drops = 1;
+    __atomic_store_n(&g_IosKuserRips[i].Rip, Rip, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_IosKuserRipCount, g_IosKuserRipCount + 1, __ATOMIC_RELEASE);
+    *Strikes = 2;
+    return 3;
+  }
+  // Drops bounds the re-drops too: a load path the translation misses would otherwise
+  // recompile, fault at a new host PC within 20 ms, recompile again... forever.
+  if (++E->Drops > 8) {
+    *Strikes = E->Strikes;
+    return 0;
+  }
+  if (Tick - E->LastTick >= kRepeatTicks) {
+    E->LastTick = Tick;
+    E->Strikes++;
+  }
+  *Strikes = E->Strikes;
+  return E->Strikes <= 3 ? 3 : 0;
+}
+
+extern "C" void IosKuserCounts(uint32_t* Rips, uint32_t* Pages) {
+  *Rips = __atomic_load_n(&g_IosKuserRipCount, __ATOMIC_ACQUIRE);
+  *Pages = __atomic_load_n(&g_IosKuserPageCount, __ATOMIC_ACQUIRE);
+}
+/* ======================== end madeira kuser-remap ======================== */
+
 // real -> low, or Addr unchanged. Used to map a tracker result back into the
 // guest's own address domain so the guest RIP is never moved high.
 uint64_t IosSubfloorToLow(uint64_t Addr) {

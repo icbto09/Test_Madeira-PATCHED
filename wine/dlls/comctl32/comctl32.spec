@@ -61,6 +61,7 @@
 340 stdcall -ordinal DPA_CreateEx(long long)
 341 stdcall -noname SendNotify(long long long ptr)
 342 stdcall -noname SendNotifyEx(long long long ptr long)
+345 stub -noname TaskDialogIndirect
 350 stdcall -noname -private StrChrA(str long) kernelbase.StrChrA
 351 stdcall -noname -private StrRChrA(str str long) kernelbase.StrRChrA
 352 stdcall -noname -private StrCmpNA(str str long) kernelbase.StrCmpNA

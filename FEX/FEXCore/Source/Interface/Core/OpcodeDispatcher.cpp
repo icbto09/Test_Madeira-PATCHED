@@ -4232,6 +4232,7 @@ void OpDispatchBuilder::CreateJumpBlocks(const fextl::vector<FEXCore::Frontend::
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 }  // namespace FEXCore::IR
 extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64_t* Real);
+extern "C" int IosKuserWindow(uint64_t* Low, uint64_t* Size, uint64_t* Real);   // madeira kuser-remap
 namespace FEXCore::IR {
 #endif
 void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore::Frontend::Decoder::DecodedBlocks>* Blocks,
@@ -4243,6 +4244,12 @@ void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore:
     IosXl.On = false;
     if (IosSubfloorWindowForCode(RIP, &Low, &Sz, &Real) && Sz && Sz < (1ull << 40)) {
       IosXl.On = true; IosXl.Low = Low; IosXl.Size = Sz; IosXl.Delta = Real - Low;
+    }
+    // madeira kuser-remap: the window's numbers; Core.cpp switches it on per learned instruction.
+    IosKu.On = false;
+    IosKu.Known = false;
+    if (IosKuserWindow(&Low, &Sz, &Real) && Sz && Sz < (1ull << 32) && Real > Low) {
+      IosKu.Known = true; IosKu.Low = Low; IosKu.Size = Sz; IosKu.Delta = Real - Low;
     }
   }
 #endif

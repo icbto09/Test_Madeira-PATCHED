@@ -369,6 +369,12 @@ public:
     return HandledLock;
   }
 
+  // madeira kuser-remap: Core.cpp sets this per guest instruction (IosKuserWantsInsn); the
+  // window itself (IosKu, private below) is filled in BeginFunction.
+  void SetIosKuserInsn(bool Want) {
+    IosKu.On = Want && IosKu.Known;
+  }
+
   void SetForceTSO(ForceTSOMode Mode) {
     ForceTSO = Mode;
   }
@@ -2723,14 +2729,35 @@ private:
     bool On {false};
     uint64_t Low {0}, Size {0}, Delta {0};
   } IosXl;
-  Ref IosXlate(Ref EA) {
-    if (!IosXl.On) return EA;
-    Ref T = Sub(OpSize::i64Bit, EA, Constant(IosXl.Low));          // >= 2^63 when EA < Low
-    Ref U = Sub(OpSize::i64Bit, T, Constant(IosXl.Size));          // top bit set when T < Size (or T huge)
+  /* madeira kuser-remap: the KUSER_SHARED_DATA window (0x7ffe0000), applied to the LOADS of
+   * guest instructions FEX has learned read it (IosKuserWantsInsn, set per instruction from
+   * Core.cpp). Window known = Known; this instruction wants it = On. Never stores. */
+  struct {
+    bool Known {false};
+    bool On {false};
+    uint64_t Low {0}, Size {0}, Delta {0};
+  } IosKu;
+  Ref IosWindow(Ref EA, uint64_t Low, uint64_t Size, uint64_t Delta) {
+    Ref T = Sub(OpSize::i64Bit, EA, Constant(Low));                // >= 2^63 when EA < Low
+    Ref U = Sub(OpSize::i64Bit, T, Constant(Size));                // top bit set when T < Size (or T huge)
     Ref M = _Andn(OpSize::i64Bit, U, T);                           // U & ~T: top bit set only for 0 <= T < Size
     Ref S = _Ashr(OpSize::i64Bit, M, Constant(63));                // all ones inside the window, else zero
-    Ref D = _And(OpSize::i64Bit, S, Constant(IosXl.Delta));
+    Ref D = _And(OpSize::i64Bit, S, Constant(Delta));
     return Add(OpSize::i64Bit, EA, D);
+  }
+  // Stores: the sub-floor image window only.
+  Ref IosXlate(Ref EA) {
+    if (!IosXl.On) return EA;
+    return IosWindow(EA, IosXl.Low, IosXl.Size, IosXl.Delta);
+  }
+  // Loads: the image window, then the KUSER window for a learned instruction.
+  Ref IosXlateLoad(Ref EA) {
+    EA = IosXlate(EA);
+    if (IosKu.On) EA = IosWindow(EA, IosKu.Low, IosKu.Size, IosKu.Delta);
+    return EA;
+  }
+  bool IosXlateLoadOn() const {
+    return IosXl.On || IosKu.On;
   }
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
   // madeira [kuser-rebase]: a load from a constant address inside KUSER_SHARED_DATA (0x7ffe0000) goes to
@@ -2768,7 +2795,7 @@ private:
   }
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, Ref ssa0, OpSize Align = OpSize::i8Bit) {
-    ssa0 = IosXlate(ssa0);
+    ssa0 = IosXlateLoad(ssa0);
     if (IsTSOEnabled(Class)) {
       return _LoadMemTSO(Class, Size, ssa0, Invalid(), Align, MemOffsetType::SXTX, 1);
     } else {
@@ -2784,8 +2811,8 @@ private:
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    if (IosXl.On) {   // ml1057: the window test needs the EFFECTIVE address, so materialise it
-      Ref EA = IosXlate(LoadEffectiveAddress(this, A, GetGPROpSize(), true));
+    if (IosXlateLoadOn()) {   // ml1057 / kuser-remap: the window test needs the EFFECTIVE address, so materialise it
+      Ref EA = IosXlateLoad(LoadEffectiveAddress(this, A, GetGPROpSize(), true));
       return AtomicTSO ? _LoadMemTSO(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1)
                        : _LoadMem(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1);
     }
