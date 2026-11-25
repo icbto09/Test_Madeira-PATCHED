@@ -3685,6 +3685,15 @@ struct LibraryDetail: View {
             }
             // A and D-pad right open it (pad-pages): pushed through padConfigOpen (Form root).
             .padRow("ga-config", opens: true) { padConfigOpen = true }
+            // (graphics-versions) This game's DXVK / vkd3d-proton version and Direct3D routes, written to
+            // the same per-game lines as the editor above.
+            NavigationLink {
+                GraphicsVersionsView(scope: .game(windowsPath: entry.windowsPath))
+                    .onDisappear { reloadBCD() }
+                    .padSettingsSubpage()
+            } label: {
+                Label("Graphics versions", systemImage: "cube.transparent")
+            }
         } header: { Text("Advanced") } footer: {
             Text("Per-game madeira.cfg lines; they override the global file.")
         }
@@ -4661,6 +4670,13 @@ struct GraphicsSettings: View {
     static let d3d12Choices: [(String, String)] = [("", L("madeira-d3d12 (default)")), ("vkd3d", "vkd3d-proton on Vulkan")]
     static let vulkanChoices: [(String, String)] = [("", L("Automatic")), ("moltenvk", "MoltenVK"), ("kosmickrisp", "KosmicKrisp")]
 
+    /// The chosen DXVK / vkd3d-proton version for the Settings row: madeira.cfg's dxvk-version /
+    /// vkd3d-version, "Madeira's build" when unset or bundled.
+    static func versionSummary(_ kind: GraphicsKind) -> String {
+        let v = (MadeiraConfig.get(kind.key) ?? "").trimmingCharacters(in: .whitespaces)
+        return v.isEmpty || v.lowercased() == "bundled" ? L("Madeira's build") : v
+    }
+
     static func bundled(_ path: String) -> Bool {
         FileManager.default.fileExists(atPath: Bundle.main.bundleURL.appendingPathComponent(path).path)
     }
@@ -4774,18 +4790,33 @@ struct GraphicsSettings: View {
                 }
             }
 
+            // (graphics-versions) An imported DXVK / vkd3d-proton (GraphicsVersions.swift) makes the route
+            // usable on a build without the bundled DLLs too.
+            let dxvkAvailable = Self.hasDxvk || !GraphicsVersions.installed(.dxvk).isEmpty
+            let vkd3dAvailable = Self.hasVkd3d || !GraphicsVersions.installed(.vkd3d).isEmpty
             choicePicker(L("Direct3D 10/11"), key: "d3d11", value: $d3d11,
-                         choices: Self.hasDxvk || d3d11 == "dxvk" ? Self.d3d11Choices : Array(Self.d3d11Choices.prefix(1)))
+                         choices: dxvkAvailable || d3d11 == "dxvk" ? Self.d3d11Choices : Array(Self.d3d11Choices.prefix(1)))
             note(d3d11Note)
-            if !Self.hasDxvk { note(L("DXVK is not in this build."), warning: d3d11 == "dxvk") }
+            if !dxvkAvailable { note(L("DXVK is not in this build."), warning: d3d11 == "dxvk") }
             if d3d11 == "dxvk" && !d3d12.isEmpty && d3d12 != "vkd3d" {
                 note("Direct3D 12 is set to \(d3d12); with DXVK only vkd3d-proton can show Direct3D 12 games.", warning: true)
             }
 
             choicePicker(L("Direct3D 12"), key: "d3d12", value: $d3d12,
-                         choices: Self.hasVkd3d || d3d12 == "vkd3d" ? Self.d3d12Choices : Array(Self.d3d12Choices.prefix(1)))
+                         choices: vkd3dAvailable || d3d12 == "vkd3d" ? Self.d3d12Choices : Array(Self.d3d12Choices.prefix(1)))
             note(d3d12Note)
-            if !Self.hasVkd3d { note(L("vkd3d-proton is not in this build."), warning: d3d12 == "vkd3d") }
+            if !vkd3dAvailable { note(L("vkd3d-proton is not in this build."), warning: d3d12 == "vkd3d") }
+
+            // (graphics-versions) The Android-style version pickers: Madeira's build or an imported one.
+            ForEach(GraphicsKind.allCases) { kind in
+                NavigationLink {
+                    GraphicsVersionsView(scope: .global, only: kind)
+                        .onDisappear { reload() }
+                        .padSettingsSubpage()
+                } label: {
+                    LabeledContent("\(kind.title) version", value: Self.versionSummary(kind))
+                }
+            }
 
             choicePicker(L("Vulkan driver"), key: "vulkan", value: $vulkan,
                          choices: Self.hasKosmicKrisp || vulkan == "kosmickrisp" ? Self.vulkanChoices : Array(Self.vulkanChoices.prefix(2)),

@@ -20,6 +20,12 @@
 #                else toolchains/llvm-mingw)
 #   DEST         where the DLLs go (default app/Madeira/vulkan/arm64ec-windows)
 #   LIC_DEST     where the licence texts go (default app/Madeira/licenses)
+#   DXVK_REF     another DXVK tag, branch or commit to build instead of the pin below
+#                (graphics versions: .github/workflows/graphics-versions.yml packages the
+#                result for Settings › Graphics › DXVK version); unset: the pin
+#   DXVK_PATCHES all (default): every patch must apply; try: a patch that does not apply
+#                to DXVK_REF is skipped and listed; none: upstream as is. What was applied
+#                and skipped is written to $DXVK_WORK/patches.txt
 #
 # Host tools: meson, ninja, glslangValidator (DXVK's built-in shaders, --target-env
 # vulkan1.3, so glslang 11.8 or newer). Patches: build/dxvk/patches/*.patch, applied in
@@ -49,9 +55,19 @@ for t in meson ninja glslangValidator; do
     command -v $t >/dev/null || { echo "missing host tool: $t"; exit 1; }
 done
 
-# 1. Upstream source at the pinned release commit (tag $DXVK_TAG).
+# 1. Upstream source at the pinned release commit (tag $DXVK_TAG), or DXVK_REF.
 if [ ! -d "$DXVK_SRC/.git" ]; then
     git clone -q "$DXVK_URL" "$DXVK_SRC"
+fi
+if [ -n "${DXVK_REF:-}" ]; then
+    git -C "$DXVK_SRC" fetch -q --tags origin || true
+    resolved=$(git -C "$DXVK_SRC" rev-parse -q --verify "origin/$DXVK_REF^{commit}" ||
+               git -C "$DXVK_SRC" rev-parse -q --verify "$DXVK_REF^{commit}" ||
+               { git -C "$DXVK_SRC" fetch -q origin "$DXVK_REF" && git -C "$DXVK_SRC" rev-parse -q --verify "FETCH_HEAD^{commit}"; } ||
+               true)
+    [ -n "$resolved" ] || { echo "DXVK_REF $DXVK_REF: no such tag, branch or commit in $DXVK_URL"; exit 1; }
+    DXVK_TAG=$DXVK_REF
+    DXVK_COMMIT=$resolved
 fi
 if [ "$(git -C "$DXVK_SRC" rev-parse HEAD)" != "$DXVK_COMMIT" ]; then
     git -C "$DXVK_SRC" fetch -q origin "$DXVK_COMMIT" || git -C "$DXVK_SRC" fetch -q --tags origin || true
@@ -64,10 +80,17 @@ SRC="$DXVK_WORK/src"
 PE="$DXVK_WORK/arm64ec"
 mkdir -p "$DXVK_WORK"
 rsync -a --delete --exclude .git "$DXVK_SRC/" "$SRC/"
+PATCH_MODE="${DXVK_PATCHES:-all}"
+: > "$DXVK_WORK/patches.txt"
 for p in "$BUILD_DIR"/patches/[0-9]*.patch; do
     [ -f "$p" ] || continue
+    [ "$PATCH_MODE" = none ] && { echo "not applied (DXVK_PATCHES=none): $(basename "$p")" | tee -a "$DXVK_WORK/patches.txt"; continue; }
+    if [ "$PATCH_MODE" = try ] && ! patch -s -p1 --dry-run -d "$SRC" < "$p" > /dev/null 2>&1; then
+        echo "skipped, does not apply to $DXVK_TAG: $(basename "$p")" | tee -a "$DXVK_WORK/patches.txt"
+        continue
+    fi
     patch -s -p1 -d "$SRC" < "$p"
-    echo "applied $(basename "$p")"
+    echo "applied $(basename "$p")" | tee -a "$DXVK_WORK/patches.txt"
 done
 find "$SRC" -name "*.orig" -delete
 
@@ -94,8 +117,11 @@ CROSSFILE
 if [ ! -f "$PE/build.ninja" ] || ! cmp -s "$CROSS.new" "$CROSS"; then
     rm -rf "$PE"
     mv "$CROSS.new" "$CROSS"
+    # Older DXVK releases (DXVK_REF) have no D3D8 option.
+    d3d8=-Denable_d3d8=false
+    grep -qs enable_d3d8 "$SRC/meson_options.txt" "$SRC/meson.options" || d3d8=
     meson setup "$PE" "$SRC" --cross-file "$CROSS" --buildtype release \
-        -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=true -Denable_d3d11=true \
+        $d3d8 -Denable_d3d9=false -Denable_d3d10=true -Denable_d3d11=true \
         -Denable_dxgi=true > "$DXVK_WORK/setup.log" 2>&1 ||
         { tail -40 "$DXVK_WORK/setup.log"; exit 1; }
 else
@@ -113,6 +139,11 @@ else
 fi
 for d in src/d3d11/d3d11.dll src/d3d10/d3d10core.dll src/dxgi/dxgi.dll; do
     out="$DEST/dxvk-$(basename "$d")"
+    # d3d10core.dll is optional for a DXVK_REF that builds Direct3D 10 into d3d11.dll.
+    if [ ! -f "$PE/$d" ] && [ -n "${DXVK_REF:-}" ] && [ "$(basename "$d")" = d3d10core.dll ]; then
+        echo "d3d10core.dll: not built by $DXVK_TAG"
+        continue
+    fi
     "$M-strip" --strip-debug -o "$out" "$PE/$d"
     # Instruction forms ios_jit_patch_x18 rewrites: x18 as the base of a load/store
     # (immediate, register or pre/post-indexed, LDP/STP), as the index of a

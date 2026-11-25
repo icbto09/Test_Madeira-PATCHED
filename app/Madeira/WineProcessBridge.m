@@ -1455,6 +1455,96 @@ static int madeira_link_vulkan_file(NSFileManager *fm, NSString *dir, NSString *
     return [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil] ? 1 : 0;
 }
 
+/* A DLL's PE architecture: "ARM64EC", "x64", "ARM64", "ARM64X", "i386", or why there is none
+ * ("missing", "not a PE file", "unknown machine"). ARM64EC images carry the AMD64 machine
+ * value; their load config's CHPE metadata pointer is what tells them from x64. Same logic as
+ * GraphicsVersions.swift (peArch), which labels imported versions. Plain C (pread), so
+ * tests/host/check-vulkan-versions.py can compile it on its own. */
+static const char *madeira_pe_arch_path(const char *path)
+{
+    uint8_t h[0x40], peh[24], dd[16], sec[40], lc[0xd0];
+    uint32_t pe, lc_rva, lc_size, opt, secs;
+    uint16_t machine, nsec, optsz, magic;
+    uint64_t chpe = 0;
+    int fd = open(path, O_RDONLY);
+
+#define RD16(p, o) ((uint16_t)((p)[(o)] | ((p)[(o) + 1] << 8)))
+#define RD32(p, o) ((uint32_t)RD16(p, o) | ((uint32_t)RD16(p, (o) + 2) << 16))
+    if (fd < 0) return "missing";
+    if (pread(fd, h, sizeof h, 0) != sizeof h || h[0] != 'M' || h[1] != 'Z') { close(fd); return "not a PE file"; }
+    pe = RD32(h, 0x3c);
+    if (pread(fd, peh, sizeof peh, pe) != sizeof peh || memcmp(peh, "PE\0\0", 4)) { close(fd); return "not a PE file"; }
+    machine = RD16(peh, 4); nsec = RD16(peh, 6); optsz = RD16(peh, 20); opt = pe + 24;
+    if (machine == 0x14c) { close(fd); return "i386"; }
+    if (pread(fd, h, 2, opt) != 2 || (magic = RD16(h, 0)) != 0x20b ||
+        pread(fd, dd, sizeof dd, opt + 112 + 10 * 8) != sizeof dd) { close(fd); return "unknown machine"; }
+    lc_rva = RD32(dd, 0); lc_size = RD32(dd, 4);
+    secs = opt + optsz;
+    if (lc_rva && lc_size >= 0xd0)
+        for (uint16_t i = 0; i < nsec; i++) {
+            uint32_t vsz, va, rsz, raw, span;
+
+            if (pread(fd, sec, sizeof sec, secs + 40 * i) != sizeof sec) break;
+            vsz = RD32(sec, 8); va = RD32(sec, 12); rsz = RD32(sec, 16); raw = RD32(sec, 20);
+            span = vsz > rsz ? vsz : rsz;
+            if (lc_rva >= va && lc_rva - va < span) {
+                if (pread(fd, lc, sizeof lc, (off_t)raw + (lc_rva - va)) == sizeof lc && RD32(lc, 0) >= 0xd0)
+                    chpe = (uint64_t)RD32(lc, 0xc8) | ((uint64_t)RD32(lc, 0xcc) << 32);
+                break;
+            }
+        }
+    close(fd);
+#undef RD32
+#undef RD16
+    if (machine == 0x8664) return chpe ? "ARM64EC" : "x64";
+    if (machine == 0xaa64) return chpe ? "ARM64X" : "ARM64";
+    return "unknown machine";
+}
+
+static const char *madeira_pe_arch(NSString *path) { return madeira_pe_arch_path(path.fileSystemRepresentation); }
+
+/* dxvk-version / vkd3d-version (madeira.cfg, or a game's own lines, which win): the name of a
+ * folder in Documents/vulkan-versions/<kind> (Graphics versions in Settings or Game details
+ * imports them: GraphicsVersions.swift). Its DLLs, under their plain names, are linked in place
+ * of the bundle's for this session; the farm relinks the bundle's at the next session start.
+ * nil, and the bundle's build, when the key is unset or "bundled", when it is not a plain folder
+ * name, or when a required DLL is missing or is not a 64-bit x64 or ARM64EC PE (an x64 one runs
+ * emulated by FEX; ARM64EC runs natively, like the bundle's). */
+static NSString *madeira_vulkan_version_dir(const char *key, const char *kind, NSArray<NSString *> *required,
+                                            NSArray<NSString *> *optional)
+{
+    char v[256] = "";
+    NSString *docs, *dir;
+
+    if (!madeira_cfg_get(key, v, sizeof v) || !v[0] || !strcasecmp(v, "bundled")) return nil;
+    if (strchr(v, '/') || strchr(v, '\\') || !strcmp(v, ".") || !strcmp(v, "..")) {
+        dprintf(STDERR_FILENO, "[vulkan-version] %s = %s is not a folder name; using the bundle's build\n", key, v);
+        return nil;
+    }
+    docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    dir = [[[docs stringByAppendingPathComponent:@"vulkan-versions"] stringByAppendingPathComponent:@(kind)]
+           stringByAppendingPathComponent:@(v)];
+    for (NSString *dll in [required arrayByAddingObjectsFromArray:optional]) {
+        NSString *path = [dir stringByAppendingPathComponent:dll];
+        const char *arch;
+
+        if (![required containsObject:dll] && access(path.fileSystemRepresentation, F_OK) != 0) {
+            dprintf(STDERR_FILENO, "[vulkan-version] %s = %s has no %s; the bundle's farm copy stays for it\n",
+                    key, v, dll.UTF8String);
+            continue;
+        }
+        arch = madeira_pe_arch(path);
+        if (strcmp(arch, "ARM64EC") && strcmp(arch, "x64")) {
+            dprintf(STDERR_FILENO, "[vulkan-version] %s = %s: %s is %s (needs 64-bit x64 or ARM64EC); "
+                    "using the bundle's build\n", key, v, dll.UTF8String, arch);
+            return nil;
+        }
+        dprintf(STDERR_FILENO, "[vulkan-version] %s = %s: %s %s%s\n", key, v, dll.UTF8String, arch,
+                strcmp(arch, "x64") ? "" : " (emulated by FEX, slower than ARM64EC)");
+    }
+    return dir;
+}
+
 static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL use_arm64ec)
 {
     NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
@@ -1468,6 +1558,7 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
     BOOL vkd3d = madeira_d3d12_vkd3d_wanted();
     BOOL dxvk = madeira_d3d11_dxvk_wanted();
     int linked = 0, vkd3d_linked = 0, dxvk_linked = 0;
+    NSString *vkd3d_dir = nil;
 
     /* A previous session's Vulkan links (no farm pass replaces these two). */
     for (NSString *dir in @[@"system32", @"sysx64"])
@@ -1501,7 +1592,16 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
         for (NSString *dll in vulkan_dlls)
             linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
                                                [stack stringByAppendingPathComponent:dll]);
-    if (vkd3d) {
+    if (vkd3d && (vkd3d_dir = madeira_vulkan_version_dir("vkd3d-version", "vkd3d", @[@"d3d12.dll"],
+                                                          @[@"d3d12core.dll"]))) {
+        for (NSString *dir in dirs)
+            for (NSString *dll in vkd3d_dlls) {
+                NSString *src = [vkd3d_dir stringByAppendingPathComponent:dll];
+
+                if (access(src.fileSystemRepresentation, R_OK) == 0)
+                    vkd3d_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll, src);
+            }
+    } else if (vkd3d) {
         if (access([stack stringByAppendingPathComponent:@"d3d12.dll"].fileSystemRepresentation, R_OK) == 0 &&
             access([stack stringByAppendingPathComponent:@"d3d12core.dll"].fileSystemRepresentation, R_OK) == 0) {
             for (NSString *dir in dirs)
@@ -1515,28 +1615,36 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
     }
     if (dxvk) {
         BOOL have = YES;
+        NSString *dxvk_dir = madeira_vulkan_version_dir("dxvk-version", "dxvk", @[@"d3d11.dll", @"dxgi.dll"],
+                                                        @[@"d3d10core.dll"]);
 
-        for (NSString *dll in dxvk_dlls)
-            if (access([stack stringByAppendingPathComponent:[@"dxvk-" stringByAppendingString:dll]].fileSystemRepresentation,
-                       R_OK) != 0)
-                have = NO;
+        if (!dxvk_dir)
+            for (NSString *dll in dxvk_dlls)
+                if (access([stack stringByAppendingPathComponent:[@"dxvk-" stringByAppendingString:dll]].fileSystemRepresentation,
+                           R_OK) != 0)
+                    have = NO;
         if (have) {
             const char *level;
             char d3d12v[32] = "";
             BOOL d3d12_set = madeira_cfg_get("d3d12", d3d12v, sizeof d3d12v) && d3d12v[0];
 
             for (NSString *dir in dirs)
-                for (NSString *dll in dxvk_dlls)
-                    dxvk_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
-                                                            [stack stringByAppendingPathComponent:
-                                                                [@"dxvk-" stringByAppendingString:dll]]);
+                for (NSString *dll in dxvk_dlls) {
+                    /* A version folder holds plain names; the bundle's are dxvk-<name>. */
+                    NSString *src = dxvk_dir ? [dxvk_dir stringByAppendingPathComponent:dll]
+                                             : [stack stringByAppendingPathComponent:[@"dxvk-" stringByAppendingString:dll]];
+
+                    if (dxvk_dir && access(src.fileSystemRepresentation, R_OK) != 0) continue;   /* optional, logged */
+                    dxvk_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll, src);
+                }
             /* Under Wine DXVK logs through __wine_dbg_output (the session log),
              * and writes no log file unless DXVK_LOG_PATH names a folder;
              * overwrite=0 keeps a madeira.cfg env.DXVK_LOG_LEVEL. */
             setenv("DXVK_LOG_LEVEL", "info", 0);
             level = getenv("DXVK_LOG_LEVEL");   /* DXVK's log level (none, error, warn, info, debug, trace); d3d11 = dxvk makes it info unless set */
             dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk: DXVK's d3d11.dll, d3d10core.dll and dxgi.dll for this session "
-                    "(links %d in %s); D3D12 = %s%s; DXVK_LOG_LEVEL=%s\n", dxvk_linked,
+                    "(%s; links %d in %s); D3D12 = %s%s; DXVK_LOG_LEVEL=%s\n",
+                    dxvk_dir ? dxvk_dir.lastPathComponent.UTF8String : "the bundle's build", dxvk_linked,
                     use_arm64ec ? "system32 + sysx64" : "sysx64", vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12",
                     vkd3d_linked && !d3d12_set ? " (d3d12 unset: d3d11 = dxvk implies d3d12 = vkd3d)" : "",
                     level ? level : "(unset)");
@@ -1549,10 +1657,12 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
                     "dxvk-d3d10core.dll and dxvk-dxgi.dll (build/dxvk/build.sh): DXMT stays\n");
         }
     }
-    dprintf(STDERR_FILENO, "[vulkan] on: MADEIRA_VULKAN_LIBRARY=%s; %d Vulkan DLL links in %s; D3D12 = %s (%d links); "
+    dprintf(STDERR_FILENO, "[vulkan] on: MADEIRA_VULKAN_LIBRARY=%s; %d Vulkan DLL links in %s; D3D12 = %s%s%s%s (%d links); "
             "D3D10/11 = %s (%d links)\n",
             lib.UTF8String, linked, use_arm64ec ? "system32 + sysx64" : "sysx64",
-            vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12", vkd3d_linked,
+            vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12", vkd3d_linked && vkd3d_dir ? " (" : "",
+            vkd3d_linked && vkd3d_dir ? vkd3d_dir.lastPathComponent.UTF8String : "", vkd3d_linked && vkd3d_dir ? ")" : "",
+            vkd3d_linked,
             dxvk_linked ? "DXVK" : "DXMT", dxvk_linked);
 }
 

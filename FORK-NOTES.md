@@ -119,3 +119,23 @@ FEX patches.
   handler stops repeating its per-fault lines for 8-byte-aligned reads below 0x80 after 8
   (`build/ntdll-unix/signal_arm64_ios.c`). A workaround, not the cause: why the slot is empty
   is still open. The game is launched with `-d3d11` here; its PC requirements list DirectX 12.
+
+## Graphics versions (DXVK / vkd3d-proton picker, like the Android launchers')
+- Import and choose another DXVK or vkd3d-proton build without rebuilding the app:
+  Settings › Graphics › DXVK version / vkd3d-proton version (every game, madeira.cfg) or
+  Game details › Advanced › Graphics versions (one game, its own lines, which win). The game
+  page can also set that game's Direct3D 10/11 and 12 routes and the Vulkan driver.
+  See [docs/GRAPHICS-VERSIONS.md](docs/GRAPHICS-VERSIONS.md).
+- Keys: `dxvk-version`, `vkd3d-version` (a folder name in `Documents/vulkan-versions/dxvk` or
+  `.../vkd3d`; unset or `bundled` = Madeira's build). `WineProcessBridge.m`
+  (`madeira_vulkan_version_dir`) links that folder's DLLs for the session and logs
+  `[vulkan-version]` lines; a missing or 32-bit DLL falls back to the bundle's.
+- Import (`app/Madeira/GraphicsVersions.swift`): a folder, .zip, .7z, .rar, .tar(.gz/.xz/.zst)
+  or .wcp. Only 64-bit DLLs (x64 or ARM64EC, told apart by the CHPE pointer) are copied.
+- `.github/workflows/graphics-versions.yml` (run by hand only) builds a chosen DXVK /
+  vkd3d-proton tag with Madeira's patches (`try` skips the ones that no longer apply) into
+  artifacts the app imports as downloaded. `build/dxvk/build.sh` takes `DXVK_REF` and
+  `DXVK_PATCHES`, `build/vkd3d-proton/build.sh` takes `VKD3D_REF` and `VKD3D_PATCHES`.
+- The IPA's own DXVK and vkd3d-proton (runtime component `vulkan-pe`) are unchanged: with
+  `DXVK_REF`/`VKD3D_REF` unset the scripts build the pins with every patch, as before.
+- Test: `tests/host/check-vulkan-versions.py`.

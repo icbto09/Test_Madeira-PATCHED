@@ -56,6 +56,9 @@ licence texts copied in by hand, like vkd3d-proton's.
 
 ## Selecting it
 
+Another DXVK release than the bundled one: see [GRAPHICS-VERSIONS.md](GRAPHICS-VERSIONS.md)
+(`dxvk-version`).
+
 madeira.cfg, or a game's own lines (Settings › Display and Graphics › Direct3D 10/11 writes it):
 
 ```

@@ -901,6 +901,21 @@ OVERLAY = {
                        "Setting it turns Vulkan on for x64 programs (vulkan-1.dll and winevulkan.dll in the prefix); "
                        "unset, Vulkan is off unless d3d12 = vkd3d or d3d11 = dxvk. Read at session start; also from a "
                        "game's own lines."},
+    # (graphics-versions) app/Madeira/GraphicsVersions.swift, WineProcessBridge.m madeira_vulkan_version_dir.
+    "dxvk-version": {"category": "Vulkan routes", "title": "DXVK version", "kind": "text", "default": "",
+               "sources": ["app/Madeira/GraphicsVersions.swift", "app/Madeira/WineProcessBridge.m"],
+               "note": "The folder in Documents/vulkan-versions/dxvk whose d3d11.dll, dxgi.dll (and d3d10core.dll) "
+                       "replace the bundle's DXVK when d3d11 = dxvk. Unset or \"bundled\": Madeira's build. Import and "
+                       "choose in Settings > Graphics > DXVK version or a game's Graphics versions page. x64 or ARM64EC "
+                       "DLLs only; a folder without the DLLs falls back to Madeira's build. Read at session start; also "
+                       "from a game's own lines. [vulkan-version] lines in the log."},
+    "vkd3d-version": {"category": "Vulkan routes", "title": "vkd3d-proton version", "kind": "text", "default": "",
+               "sources": ["app/Madeira/GraphicsVersions.swift", "app/Madeira/WineProcessBridge.m"],
+               "note": "The folder in Documents/vulkan-versions/vkd3d whose d3d12.dll (and d3d12core.dll) replace the "
+                       "bundle's vkd3d-proton when d3d12 = vkd3d. Unset or \"bundled\": Madeira's build. Import and "
+                       "choose in Settings > Graphics > vkd3d-proton version or a game's Graphics versions page. x64 or "
+                       "ARM64EC DLLs only; a folder without d3d12.dll falls back to Madeira's build. Read at session "
+                       "start; also from a game's own lines. [vulkan-version] lines in the log."},
     "env.VKD3D_DEBUG": {"category": "Vulkan routes", "title": "vkd3d-proton log level",
                "note": "vkd3d-proton's log: none, err, warn, fixme (default), info, trace. Passed to the Windows "
                        "environment like any env line; only with d3d12 = vkd3d."},

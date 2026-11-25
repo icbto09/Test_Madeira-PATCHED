@@ -217,6 +217,7 @@
 		A1000E71 /* LogTrail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E71 /* LogTrail.swift */; };
 		A1000FA1 /* LogSlim.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000FA1 /* LogSlim.swift */; };
 		A1000D71 /* DirectXPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000D71 /* DirectXPill.swift */; };
+		A1000FF1 /* GraphicsVersions.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000FF1 /* GraphicsVersions.swift */; };
 		A1000F1A /* FluxLook.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000F1A /* FluxLook.swift */; };
 		A1000F1B /* FluxScreens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000F1B /* FluxScreens.swift */; };
 		A1000F2B /* RunStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000F2B /* RunStatus.swift */; };
@@ -541,6 +542,7 @@
 		A2000E71 /* LogTrail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LogTrail.swift"; sourceTree = "<group>"; };
 		A2000FA1 /* LogSlim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LogSlim.swift"; sourceTree = "<group>"; };
 		A2000D71 /* DirectXPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DirectXPill.swift"; sourceTree = "<group>"; };
+		A2000FF1 /* GraphicsVersions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GraphicsVersions.swift"; sourceTree = "<group>"; };
 		A2000F1A /* FluxLook.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "FluxLook.swift"; sourceTree = "<group>"; };
 		A2000F1B /* FluxScreens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "FluxScreens.swift"; sourceTree = "<group>"; };
 		A2000F2B /* RunStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "RunStatus.swift"; sourceTree = "<group>"; };
@@ -812,6 +814,7 @@
 				A2000E71 /* LogTrail.swift */,
 				A2000FA1 /* LogSlim.swift */,
 				A2000D71 /* DirectXPill.swift */,
+				A2000FF1 /* GraphicsVersions.swift */,
 				A2000F1A /* FluxLook.swift */,
 				A2000F1B /* FluxScreens.swift */,
 				A2000F2B /* RunStatus.swift */,
@@ -1307,6 +1310,7 @@
 				A1000E71 /* LogTrail.swift in Sources */,
 				A1000FA1 /* LogSlim.swift in Sources */,
 				A1000D71 /* DirectXPill.swift in Sources */,
+				A1000FF1 /* GraphicsVersions.swift in Sources */,
 				A1000F1A /* FluxLook.swift in Sources */,
 				A1000F1B /* FluxScreens.swift in Sources */,
 				A1000F2B /* RunStatus.swift in Sources */,

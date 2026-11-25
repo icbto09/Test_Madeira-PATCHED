@@ -14,6 +14,13 @@
 #   LLVM_MINGW   llvm-mingw (default toolchains/llvm-mingw-20260421-ucrt-macos-universal,
 #                else toolchains/llvm-mingw)
 #   DEST         where the DLLs go (default app/Madeira/vulkan/arm64ec-windows)
+#   LIC_DEST     where the licence texts go (default app/Madeira/licenses)
+#   VKD3D_REF    another vkd3d-proton tag, branch or commit to build instead of the pin below
+#                (graphics versions: .github/workflows/graphics-versions.yml packages the
+#                result for Settings › Graphics › vkd3d-proton version); unset: the pin
+#   VKD3D_PATCHES all (default): every patch must apply; try: a patch that does not apply
+#                to VKD3D_REF is skipped and listed; none: upstream as is. What was applied
+#                and skipped is written to $VKD3D_WORK/patches.txt
 #
 # Host tools: meson, ninja, glslangValidator (helper shaders) and the toolchain's widl.
 # Patches: build/vkd3d-proton/patches/*.patch, applied in order (see PATCHES.md there).
@@ -49,6 +56,17 @@ done
 if [ ! -d "$VKD3D_SRC/.git" ]; then
     git clone -q "$VKD3D_URL" "$VKD3D_SRC"
 fi
+VKD3D_NAME=$VKD3D_COMMIT
+if [ -n "${VKD3D_REF:-}" ]; then
+    git -C "$VKD3D_SRC" fetch -q --tags origin || true
+    resolved=$(git -C "$VKD3D_SRC" rev-parse -q --verify "origin/$VKD3D_REF^{commit}" ||
+               git -C "$VKD3D_SRC" rev-parse -q --verify "$VKD3D_REF^{commit}" ||
+               { git -C "$VKD3D_SRC" fetch -q origin "$VKD3D_REF" && git -C "$VKD3D_SRC" rev-parse -q --verify "FETCH_HEAD^{commit}"; } ||
+               true)
+    [ -n "$resolved" ] || { echo "VKD3D_REF $VKD3D_REF: no such tag, branch or commit in $VKD3D_URL"; exit 1; }
+    VKD3D_NAME="$VKD3D_REF ($resolved)"
+    VKD3D_COMMIT=$resolved
+fi
 if [ "$(git -C "$VKD3D_SRC" rev-parse HEAD)" != "$VKD3D_COMMIT" ]; then
     git -C "$VKD3D_SRC" fetch -q origin "$VKD3D_COMMIT" || true
     git -C "$VKD3D_SRC" checkout -q "$VKD3D_COMMIT"
@@ -60,10 +78,17 @@ SRC="$VKD3D_WORK/src"
 PE="$VKD3D_WORK/arm64ec"
 mkdir -p "$VKD3D_WORK"
 rsync -a --delete --exclude .git "$VKD3D_SRC/" "$SRC/"
+PATCH_MODE="${VKD3D_PATCHES:-all}"
+: > "$VKD3D_WORK/patches.txt"
 for p in "$BUILD_DIR"/patches/[0-9]*.patch; do
     [ -f "$p" ] || continue
+    [ "$PATCH_MODE" = none ] && { echo "not applied (VKD3D_PATCHES=none): $(basename "$p")" | tee -a "$VKD3D_WORK/patches.txt"; continue; }
+    if [ "$PATCH_MODE" = try ] && ! patch -s -p1 --dry-run -d "$SRC" < "$p" > /dev/null 2>&1; then
+        echo "skipped, does not apply to ${VKD3D_REF:-the pin}: $(basename "$p")" | tee -a "$VKD3D_WORK/patches.txt"
+        continue
+    fi
     patch -s -p1 -d "$SRC" < "$p"
-    echo "applied $(basename "$p")"
+    echo "applied $(basename "$p")" | tee -a "$VKD3D_WORK/patches.txt"
 done
 find "$SRC" -name "*.orig" -delete
 
@@ -137,4 +162,4 @@ if [ -d "$LIC" ]; then
     cp "$VKD3D_SRC/subprojects/dxil-spirv/LICENSE.MIT" "$LIC/dxil-spirv-MIT.txt"
     cp "$VKD3D_SRC/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE" "$LIC/dxbc-spirv-MIT.txt"
 fi
-echo "vkd3d-proton $VKD3D_COMMIT -> $DEST"
+echo "vkd3d-proton $VKD3D_NAME -> $DEST"
