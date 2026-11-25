@@ -135,6 +135,18 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     typedef struct { PEB *Peb; struct { HANDLE UniqueProcess, UniqueThread; } ClientId; } TEB;
     static _Thread_local TEB *active_teb;
     static TEB *NtCurrentTeb(void) { return active_teb; }
+    /* 0.2.100's exports fall back to these when there is no TEB; in Wine the thread data
+     * lives inside the TEB, so its tid is the TEB's thread id. */
+    static PEB *peb;
+    static unsigned int pid;
+    #define ULongToHandle(x) ((HANDLE)(uintptr_t)(x))
+    struct thread_data { unsigned int tid; };
+    static _Thread_local struct thread_data active_thread_data;
+    static struct thread_data *get_thread_data(void)
+    {
+        active_thread_data.tid = (unsigned int)(uintptr_t)active_teb->ClientId.UniqueThread;
+        return &active_thread_data;
+    }
     ''' + '\n'.join(function(env_source, head) for head in heads) + '''
     static void *check_guest(void *arg)
     {
