@@ -3852,7 +3852,12 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
 
     case SystemInterruptInformation: /* 23 */
     {
-        len = cpu_count * sizeof(SYSTEM_INTERRUPT_INFORMATION);
+        /* Madeira (ml1122): one entry per processor the PEB reports. cryptbase's RtlGenRandom
+         * (SystemFunction036, Wine 11) sizes its buffer from PEB->NumberOfProcessors, so with
+         * cpu-count below the host's (4 of 6) the host count made every call fail with
+         * STATUS_INFO_LENGTH_MISMATCH, and BCryptGenRandom with it ("called with unsupported
+         * parameters, returning error"): games that need random bytes never started. */
+        len = (madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count) * sizeof(SYSTEM_INTERRUPT_INFORMATION);
         if (size >= len)
         {
             if (!info) ret = STATUS_ACCESS_VIOLATION;
