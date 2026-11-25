@@ -7,6 +7,15 @@ winemetal_src = [
 
 winemetal_ld_args = []
 
+# MADEIRA (0.2.100, Wine 11): Wine's libwinecrt0 arm64ec.o now holds only
+# __icall_helper_arm64ec (winebuild emits the CHPE metadata for Wine's own modules),
+# so winemetal takes the metadata from llvm-mingw's libmingwex chpe.o, which defines
+# __icall_helper_arm64ec as well: "duplicate symbol: __icall_helper_arm64ec". Both
+# are the same thunk (call __os_arm64x_dispatch_icall, then br x11); keep the first.
+if is_arm64ec
+  winemetal_ld_args += ['-Wl,--allow-multiple-definition']
+endif
+
 winemetal_link_depends = []
 
 wine_build_path = get_option('wine_build_path')
