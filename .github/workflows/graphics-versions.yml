@@ -6,8 +6,9 @@ name: Build graphics versions (DXVK / vkd3d-proton)
 # Graphics › DXVK version (or vkd3d-proton version) › Import a version…, or a game's
 # Game details › Graphics versions. The artifact's name becomes the version's name.
 #
-# Run by hand only (Actions › Build graphics versions › Run workflow); nothing here runs on
-# a push or a pull request, and it does not touch the IPA build.
+# Run by hand only (Actions › Build graphics versions › Run workflow, "Use workflow from":
+# nightly-0.2.100); nothing here runs on a push or a pull request, and it does not touch the
+# IPA build.
 
 on:
   workflow_dispatch:
@@ -46,6 +47,14 @@ jobs:
       OUT: ${{ github.workspace }}/graphics-out
     steps:
       - uses: actions/checkout@v4
+      # The file is on main too (GitHub lists a by-hand workflow only from the default branch),
+      # but only a branch whose build scripts take DXVK_REF / VKD3D_REF can run it.
+      - name: Check the branch
+        run: |
+          if ! grep -q DXVK_REF build/dxvk/build.sh || ! grep -q VKD3D_REF build/vkd3d-proton/build.sh; then
+            echo "::error::${GITHUB_REF_NAME} has no graphics-versions support in build/dxvk and build/vkd3d-proton. Run this workflow from nightly-0.2.100 (Use workflow from)."
+            exit 1
+          fi
       - uses: actions/cache@v4
         with:
           key: mingw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build/setup-llvm-mingw.sh') }}
