@@ -1,0 +1,22 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 0831a70..6868c3f 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -952,7 +952,16 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+       const char* E = getenv("MADEIRA_BLOCK_RING_FIRST");
+       RingFirst = (E && *E == '1') ? 1 : 0;
+     }
+-    if (RingOn) {
++    // MADEIRA_SB_SLOT_TRACE=1: keep only the slot setter and slot-selection blocks in the ring so it
++    // holds a long history of slot writes instead of a few thousand unrelated blocks.
++    static const bool SlotOnly = [] {
++      const char* E = getenv("MADEIRA_SB_SLOT_TRACE");
++      return E && E[0] == '1' && !E[1];
++    }();
++    const uint64_t RingRIP = IosRingEntryRIP & 0xffffffffffffULL;
++    const bool RingWanted = !SlotOnly || RingRIP == 0x140f8cda0ULL || RingRIP == 0x142e3ebd0ULL ||
++                            RingRIP == 0x142e3ecd9ULL || RingRIP == 0x142e6be00ULL;
++    if (RingOn && RingWanted) {
+       ARMEmitter::ForwardLabel l_NoRing;
+       ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosBlockRing));
+       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NoRing);

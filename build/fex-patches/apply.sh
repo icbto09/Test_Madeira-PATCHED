@@ -13,14 +13,25 @@ set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 F="$R/FEX"
 shopt -s nullglob
+# FEX is a submodule upstream but an ordinary folder in this fork. git apply run inside a
+# subdirectory of a repository reads "diff --git" paths from the repository root and silently
+# skips them ("Skipped patch"), so a patch would be reported applied without being applied. When
+# FEX has no .git of its own, apply from the repository root with --directory=FEX instead.
+fex_apply() {
+    if [ -e "$F/.git" ]; then
+        git -C "$F" apply "$@"
+    else
+        git -C "$R" apply --directory=FEX "$@"
+    fi
+}
 patches=("$R"/build/fex-patches/*.patch)
 # Nothing to do without patches (and bash 3.2 under set -u rejects "${patches[@]}" when empty).
 [ ${#patches[@]} -gt 0 ] || exit 0
 if [ "${1:-}" = --revert ]; then
     for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
         p="${patches[$i]}"
-        if git -C "$F" apply --reverse --check "$p" 2>/dev/null; then
-            git -C "$F" apply --reverse "$p"
+        if fex_apply --reverse --check "$p" 2>/dev/null; then
+            fex_apply --reverse "$p"
             echo "fex-patches: reverted $(basename "$p")"
         fi
     done
@@ -32,17 +43,17 @@ fi
 # in order), report the ones up to it as applied, and apply the rest in order.
 last=-1
 for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
-    if git -C "$F" apply --reverse --check "${patches[$i]}" 2>/dev/null; then last=$i; break; fi
+    if fex_apply --reverse --check "${patches[$i]}" 2>/dev/null; then last=$i; break; fi
 done
 for ((i = 0; i < ${#patches[@]}; i++)); do
     p="${patches[$i]}"
     if [ $i -le $last ]; then
         echo "fex-patches: $(basename "$p") already applied"
-    elif git -C "$F" apply --check "$p" 2>/dev/null; then
-        git -C "$F" apply "$p"
+    elif fex_apply --check "$p" 2>/dev/null; then
+        fex_apply "$p"
         echo "fex-patches: applied $(basename "$p")"
     else
-        echo "fex-patches: $(basename "$p") does not apply on FEX $(git -C "$F" rev-parse --short HEAD)" >&2
+        echo "fex-patches: $(basename "$p") does not apply on FEX $(git -C "$F" rev-parse --short HEAD 2>/dev/null || echo "(folder)")" >&2
         exit 1
     fi
 done
