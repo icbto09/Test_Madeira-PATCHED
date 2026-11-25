@@ -41,6 +41,11 @@ old4 = "  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_orde
 old5 = old4.replace("__);", "__, __METAL_MEMORY_FLAGS_NONE__);")
 block = "#ifdef __METAL_MEMORY_FLAGS_NONE__\n" + old5 + "#else\n" + old4 + "#endif\n"
 want = old5 if five else old4
+# 0.2.100's DXMT already uses the standard atomic_fetch_add_explicit, which every
+# toolchain accepts: nothing to choose.
+portable = "return atomic_fetch_add_explicit(reinterpret_cast<threadgroup atomic_int *>(out_count), 1, memory_order_relaxed);"
+if portable in s:
+    raise SystemExit(0)
 if block in s:
     s = s.replace(block, want, 1)
 elif want not in s:
