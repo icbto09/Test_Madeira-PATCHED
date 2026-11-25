@@ -1,0 +1,143 @@
+name: Build graphics versions (DXVK / vkd3d-proton)
+
+# Builds a chosen DXVK and/or vkd3d-proton release as ARM64EC with Madeira's patches
+# (build/dxvk/patches, build/vkd3d-proton/patches) and uploads each as an artifact that
+# Madeira imports as it is: download the artifact's .zip on the device, then Settings ›
+# Graphics › DXVK version (or vkd3d-proton version) › Import a version…, or a game's
+# Game details › Graphics versions. The artifact's name becomes the version's name.
+#
+# Run by hand only (Actions › Build graphics versions › Run workflow, "Use workflow from":
+# nightly-0.2.100); nothing here runs on a push or a pull request, and it does not touch the
+# IPA build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "What to build"
+        type: choice
+        options: [both, dxvk, vkd3d-proton]
+        default: both
+      dxvk_ref:
+        description: "DXVK tag, branch or commit (empty: Madeira's pin, build/dxvk/build.sh)"
+        type: string
+        default: ""
+      vkd3d_ref:
+        description: "vkd3d-proton tag, branch or commit (empty: Madeira's pin, build/vkd3d-proton/build.sh)"
+        type: string
+        default: ""
+      patches:
+        description: "Madeira's patches: all (each must apply), try (skip the ones that do not apply), none"
+        type: choice
+        options: [try, all, none]
+        default: try
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graphics-versions-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/graphics-out
+    steps:
+      - uses: actions/checkout@v4
+      # The file is on main too (GitHub lists a by-hand workflow only from the default branch),
+      # but only a branch whose build scripts take DXVK_REF / VKD3D_REF can run it.
+      - name: Check the branch
+        run: |
+          if ! grep -q DXVK_REF build/dxvk/build.sh || ! grep -q VKD3D_REF build/vkd3d-proton/build.sh; then
+            echo "::error::${GITHUB_REF_NAME} has no graphics-versions support in build/dxvk and build/vkd3d-proton. Run this workflow from nightly-0.2.100 (Use workflow from)."
+            exit 1
+          fi
+      - uses: actions/cache@v4
+        with:
+          key: mingw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build/setup-llvm-mingw.sh') }}
+          path: toolchains/llvm-mingw-*
+      - name: Host tools and llvm-mingw
+        run: |
+          brew install meson ninja glslang || true
+          tools/build/setup-llvm-mingw.sh
+
+      - name: Build DXVK
+        id: dxvk
+        if: inputs.component != 'vkd3d-proton'
+        env:
+          DXVK_REF: ${{ inputs.dxvk_ref }}
+          DXVK_PATCHES: ${{ inputs.patches }}
+        run: |
+          ref="${DXVK_REF:-$(sed -n 's/^DXVK_TAG=//p' build/dxvk/build.sh)}"
+          safe=$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')
+          case "$DXVK_PATCHES" in none) tag=upstream ;; *) tag=madeira ;; esac
+          name="dxvk-$safe-$tag"
+          dest="$OUT/$name"
+          mkdir -p "$dest/licenses"
+          DEST="$dest" LIC_DEST="$dest/licenses" build/dxvk/build.sh
+          # Madeira's bundle names them dxvk-<dll>; an imported version holds plain names.
+          for f in "$dest"/dxvk-*.dll; do mv "$f" "$dest/${f##*/dxvk-}"; done
+          {
+            echo "DXVK $ref ($(git -C toolchains/dxvk-src rev-parse HEAD)), ARM64EC, built by $GITHUB_REPOSITORY run $GITHUB_RUN_ID"
+            echo "Patches ($DXVK_PATCHES):"
+            sed 's/^/  /' toolchains/dxvk-build/patches.txt
+            echo
+            echo "Import this folder or its .zip in Madeira: Settings > Graphics > DXVK version > Import a version."
+            echo "Used when d3d11 = dxvk. Applies at the next game start."
+          } > "$dest/README.txt"
+          cat "$dest/README.txt"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "dir=$dest" >> "$GITHUB_OUTPUT"
+      - if: failure() && steps.dxvk.conclusion == 'failure'
+        run: |
+          tail -60 toolchains/dxvk-build/setup.log 2>/dev/null || true
+          grep -E "error|FAILED" toolchains/dxvk-build/build.log 2>/dev/null | head -60 || true
+      - name: Upload DXVK
+        if: steps.dxvk.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dxvk.outputs.name }}
+          path: ${{ steps.dxvk.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build vkd3d-proton
+        id: vkd3d
+        if: inputs.component != 'dxvk' && !cancelled()
+        env:
+          VKD3D_REF: ${{ inputs.vkd3d_ref }}
+          VKD3D_PATCHES: ${{ inputs.patches }}
+        run: |
+          ref="${VKD3D_REF:-$(sed -n 's/^VKD3D_COMMIT=\([0-9a-f]\{12\}\).*/\1/p' build/vkd3d-proton/build.sh)}"
+          safe=$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')
+          case "$VKD3D_PATCHES" in none) tag=upstream ;; *) tag=madeira ;; esac
+          name="vkd3d-proton-$safe-$tag"
+          dest="$OUT/$name"
+          mkdir -p "$dest/licenses"
+          DEST="$dest" LIC_DEST="$dest/licenses" build/vkd3d-proton/build.sh
+          {
+            echo "vkd3d-proton $ref ($(git -C toolchains/vkd3d-proton rev-parse HEAD)), ARM64EC, built by $GITHUB_REPOSITORY run $GITHUB_RUN_ID"
+            echo "Patches ($VKD3D_PATCHES):"
+            sed 's/^/  /' toolchains/vkd3d-proton-build/patches.txt
+            echo
+            echo "Import this folder or its .zip in Madeira: Settings > Graphics > vkd3d-proton version > Import a version."
+            echo "Used when d3d12 = vkd3d (or d3d11 = dxvk with d3d12 unset). Applies at the next game start."
+          } > "$dest/README.txt"
+          cat "$dest/README.txt"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "dir=$dest" >> "$GITHUB_OUTPUT"
+      - if: failure() && steps.vkd3d.conclusion == 'failure'
+        run: |
+          tail -60 toolchains/vkd3d-proton-build/setup.log 2>/dev/null || true
+          grep -E "error|FAILED" toolchains/vkd3d-proton-build/build.log 2>/dev/null | head -60 || true
+      - name: Upload vkd3d-proton
+        if: "!cancelled() && steps.vkd3d.outcome == 'success'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.vkd3d.outputs.name }}
+          path: ${{ steps.vkd3d.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 30
