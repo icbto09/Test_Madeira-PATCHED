@@ -172,7 +172,7 @@ done
 LIC="${LIC_DEST:-$REPO_ROOT/app/Madeira/licenses}"
 if [ -d "$LIC" ]; then
     cp "$VKD3D_SRC/LICENSE" "$LIC/vkd3d-proton-LGPL-2.1.txt"
-    cp "$VKD3D_SRC/subprojects/dxil-spirv/LICENSE.MIT" "$LIC/dxil-spirv-MIT.txt"
-    cp "$VKD3D_SRC/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE" "$LIC/dxbc-spirv-MIT.txt"
+    if [ -f "$VKD3D_SRC/subprojects/dxil-spirv/LICENSE.MIT" ]; then cp "$VKD3D_SRC/subprojects/dxil-spirv/LICENSE.MIT" "$LIC/dxil-spirv-MIT.txt"; fi   # an older *_REF may not have it
+    if [ -f "$VKD3D_SRC/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE" ]; then cp "$VKD3D_SRC/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE" "$LIC/dxbc-spirv-MIT.txt"; fi   # an older *_REF may not have it
 fi
 echo "vkd3d-proton $VKD3D_NAME -> $DEST"

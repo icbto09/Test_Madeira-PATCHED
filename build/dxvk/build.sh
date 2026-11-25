@@ -172,7 +172,9 @@ done
 LIC="${LIC_DEST:-$REPO_ROOT/app/Madeira/licenses}"
 if [ -d "$LIC" ]; then
     cp "$DXVK_SRC/LICENSE" "$LIC/DXVK-zlib.txt"
-    cp "$DXVK_SRC/subprojects/libdisplay-info/LICENSE" "$LIC/libdisplay-info-MIT.txt"
-    [ -f "$LIC/dxbc-spirv-MIT.txt" ] || cp "$DXVK_SRC/subprojects/dxbc-spirv/LICENSE" "$LIC/dxbc-spirv-MIT.txt"
+    if [ -f "$DXVK_SRC/subprojects/libdisplay-info/LICENSE" ]; then cp "$DXVK_SRC/subprojects/libdisplay-info/LICENSE" "$LIC/libdisplay-info-MIT.txt"; fi   # an older *_REF may not have it
+    if [ ! -f "$LIC/dxbc-spirv-MIT.txt" ] && [ -f "$DXVK_SRC/subprojects/dxbc-spirv/LICENSE" ]; then
+        cp "$DXVK_SRC/subprojects/dxbc-spirv/LICENSE" "$LIC/dxbc-spirv-MIT.txt"   # an older DXVK_REF may not have it
+    fi
 fi
 echo "DXVK $DXVK_TAG ($DXVK_COMMIT) -> $DEST"
