@@ -65,6 +65,11 @@ if [ -n "${DXVK_REF:-}" ]; then
                git -C "$DXVK_SRC" rev-parse -q --verify "$DXVK_REF^{commit}" ||
                { git -C "$DXVK_SRC" fetch -q origin "$DXVK_REF" && git -C "$DXVK_SRC" rev-parse -q --verify "FETCH_HEAD^{commit}"; } ||
                true)
+    # "2.14" for the tag "v2.14": the releases are tagged with a leading v.
+    if [ -z "$resolved" ] && [ "${DXVK_REF#v}" = "$DXVK_REF" ]; then
+        resolved=$(git -C "$DXVK_SRC" rev-parse -q --verify "refs/tags/v$DXVK_REF^{commit}" || true)
+        [ -z "$resolved" ] || DXVK_REF="v$DXVK_REF"
+    fi
     [ -n "$resolved" ] || { echo "DXVK_REF $DXVK_REF: no such tag, branch or commit in $DXVK_URL"; exit 1; }
     DXVK_TAG=$DXVK_REF
     DXVK_COMMIT=$resolved

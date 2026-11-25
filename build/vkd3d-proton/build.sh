@@ -63,6 +63,11 @@ if [ -n "${VKD3D_REF:-}" ]; then
                git -C "$VKD3D_SRC" rev-parse -q --verify "$VKD3D_REF^{commit}" ||
                { git -C "$VKD3D_SRC" fetch -q origin "$VKD3D_REF" && git -C "$VKD3D_SRC" rev-parse -q --verify "FETCH_HEAD^{commit}"; } ||
                true)
+    # "2.14" for the tag "v2.14": the releases are tagged with a leading v.
+    if [ -z "$resolved" ] && [ "${VKD3D_REF#v}" = "$VKD3D_REF" ]; then
+        resolved=$(git -C "$VKD3D_SRC" rev-parse -q --verify "refs/tags/v$VKD3D_REF^{commit}" || true)
+        [ -z "$resolved" ] || VKD3D_REF="v$VKD3D_REF"
+    fi
     [ -n "$resolved" ] || { echo "VKD3D_REF $VKD3D_REF: no such tag, branch or commit in $VKD3D_URL"; exit 1; }
     VKD3D_NAME="$VKD3D_REF ($resolved)"
     VKD3D_COMMIT=$resolved
