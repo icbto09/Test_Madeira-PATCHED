@@ -38,7 +38,7 @@ fi
 
 make -C "$SRC/src" clean >/dev/null
 make -C "$SRC/src" -j"$(sysctl -n hw.ncpu)" \
-    HOST_CC="gcc" \
+    HOST_CC="xcrun clang" \
     CROSS=x86_64-w64-mingw32- \
     TARGET_SYS=Windows \
     BUILDMODE=dynamic \

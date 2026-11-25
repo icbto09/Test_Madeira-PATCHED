@@ -271,8 +271,6 @@ COLLISIONS=(
     # every process hung in server_init_process() the moment a client
     # connected -- guest ntdll init is exactly when the pointer was stolen.
     user_shared_data
-    # madeira-wsl: lld duplicates (also defined in ntdll-unix server_ios.c)
-    supported_machines_count supported_machines native_machine server_start_time
 )
 RENAME_ARGS=()
 for s in "${COLLISIONS[@]}"; do

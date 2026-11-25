@@ -20,6 +20,25 @@ if [ ! -f "$SRC/fetchDependencies" ]; then
 fi
 
 cd "$SRC"
+
+# Madeira patches to MoltenVK: build/moltenvk-ios/[0-9]*.patch, applied once (the marker
+# keeps re-runs idempotent). They change MoltenVK code and are offered under its licence
+# (Apache 2.0).
+#   0001-madeira-evict-pipeline-states.patch: with MADEIRA_MVK_EVICT_PIPELINES=1, an
+#   ordinary graphics pipeline (no tessellation, no multiview) is compiled when the game
+#   creates it, then its Metal state is released and rebuilt on first draw. For games that
+#   create every pipeline up front and keep them all (Detroit: Become Human, ~99,500).
+#   Off by default. The log shows "[mvk-madeira] pipeline eviction ON" and running counts.
+HERE="$R/build/moltenvk-ios"
+for p in "$HERE"/[0-9]*.patch; do
+    [ -e "$p" ] || continue
+    m="$SRC/.madeira-applied-$(basename "$p")"
+    if [ ! -f "$m" ]; then
+        patch -d "$SRC" -p1 --forward < "$p"
+        touch "$m"
+    fi
+done
+
 [ -d External/build ] || ./fetchDependencies --ios
 make ios
 

@@ -27,19 +27,20 @@ esac
 case "${1:-}" in
   windows)
     echo "runtime windows: initializing source dependencies"
-    git -C "$ROOT" submodule update --init --recursive wine dxmt FEX
+    # Fork build: wine, dxmt and FEX are ordinary folders here, not submodules.
     echo "runtime windows: checking Metal toolchain"
     xcodebuild -downloadComponent MetalToolchain
     echo "runtime windows: preparing shader headers"
     "$ROOT/tools/build/build-shader-headers.sh"
     ;;
-  dock) git -C "$ROOT" submodule update --init madeira-dock ;;
+  dock) : ;;  # Fork build: madeira-dock is an ordinary folder here
 esac
 case "${1:-}" in
   dock) bash "$ROOT/build/madeira-dock/build.sh" --check ;;
   windows) bash "$ROOT/build/windows-runtime/build.sh" ;;
-  moltenvk) bash "$HOME/madeira-shims/moltenvk-from-release.sh" ;;
-  zink|kosmickrisp) bash "$ROOT/tools/build/prepare-graphics.sh" "$1" ;;
+  # Fork build: MoltenVK is built from source (with build/moltenvk-ios patches), not
+  # taken from a release IPA by a shim on the release builder's machine.
+  moltenvk|zink|kosmickrisp) bash "$ROOT/tools/build/prepare-graphics.sh" "$1" ;;
   mesa-d3d12) bash "$ROOT/build/mesa-d3d12/build.sh" ;;
   vulkan-pe)
     bash "$ROOT/build/dxvk/build.sh"

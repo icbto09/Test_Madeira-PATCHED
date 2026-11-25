@@ -2626,6 +2626,45 @@ extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
 extern int ios_jit_pool_pc_is_fex( uintptr_t pc );   /* virtual_ios.c */
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 
+/* Repair sign-extended 32-bit addresses (0xffffffff80000000..0xfffffffffffeffff)
+ * that match a registered sub-floor window or ml1100/ml969 low-alias.
+ * Occurs when x64 code truncates a 64-bit pointer whose low 32 bits have bit 31
+ * set (e.g. 0x71fa7314b0 -> 0xfa7314b0) and sign-extends it back to 64 bits.
+ * Default ON; env.MADEIRA_SEXT_LOWALIAS = 0 disables. */
+static int ios_sext_lowalias_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SEXT_LOWALIAS" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+static uint64_t ios_sext_lowalias_resolve( uint64_t bad_addr, uint64_t len, void *peb )
+{
+    extern int ios_lowalloc_translate( unsigned long long addr, unsigned long long len,
+                                       unsigned long long *real_out, void **owner_out );
+    uint64_t lo32;
+    uintptr_t sf_real;
+    unsigned long long lo_real = 0;
+
+    if (!ios_sext_lowalias_enabled()) return 0;
+    /* Exclude the top 64 KB (0xffffffffffff0000..-1) so small negative
+     * sentinel values like (void*)-1 are never intercepted. */
+    if (bad_addr < 0xffffffff80000000ULL || bad_addr >= 0xffffffffffff0000ULL) return 0;
+
+    lo32 = (uint64_t)(uint32_t)bad_addr;
+    sf_real = ios_subfloor_translate( lo32, peb );
+    if (sf_real) return (uint64_t)sf_real;
+
+    if (ios_lowalloc_translate( lo32, len ? len : 1, &lo_real, NULL ) && lo_real)
+        return (uint64_t)lo_real;
+
+    return 0;
+}
+
 /* LSE read-modify-write atomics for the Mach alias-store emulator, each done as
  * ONE host atomic on the RW alias, which maps the same physical pages as the
  * view that faulted:
@@ -4100,6 +4139,9 @@ static void *ios_mach_exception_thread( void *arg )
                                                        void **owner_out );
                     sf_low = ios_lowalloc_translate( (uint64_t)fault_addr, 1, NULL, NULL );
                 }
+                if (!sf_real && !sf_low &&
+                    ios_sext_lowalias_resolve( (uint64_t)fault_addr, 1, sf_peb ))
+                    sf_low = 1;
 
                 if (sf_real || sf_low)
                 {
@@ -4787,6 +4829,56 @@ static void *ios_mach_exception_thread( void *arg )
                                 break;
                             }
                         }
+                    }
+                }
+            }
+
+            /* 3.4b. [sext-lowalias-rip]: recover sign-extended 32-bit jump/call targets
+             * at DispatcherLoopTop (lsr x11, x12, #18 ; ldr x10, [x10, x11, lsl #3]). */
+            if (!handled && req->exception == EXC_BAD_ACCESS &&
+                state.__x[12] >= 0xffffffff80000000ULL &&
+                state.__x[12] < 0xffffffffffff0000ULL)
+            {
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                uint32_t insn = 0, prev_insn = 0;
+                if (fault_pc >= 0x100000000ULL &&
+                    ios_fault_read_insn( fault_pc, &insn ) && insn == 0xf86b794aU &&
+                    ios_fault_read_insn( fault_pc - 4, &prev_insn ) && prev_insn == 0xd352fd8bU)
+                {
+                    uint64_t bad_rip = state.__x[12];
+                    uint64_t real_rip = 0;
+                    void *sf_peb = NULL;
+                    if (thread_teb)
+                    {
+                        mach_vm_size_t peb_got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(thread_teb + offsetof(TEB, Peb)),
+                                sizeof(sf_peb), (mach_vm_address_t)&sf_peb, &peb_got ) != KERN_SUCCESS ||
+                            peb_got != sizeof(sf_peb))
+                            sf_peb = NULL;
+                    }
+                    real_rip = ios_sext_lowalias_resolve( bad_rip, 1, sf_peb );
+                    if (real_rip >= 0x10000ULL && real_rip < 0x0000800000000000ULL)
+                    {
+                        static volatile int sext_rip_fixes;
+                        static const int fix_regs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22, 25, 26, 27 };
+                        int fn = __sync_add_and_fetch( &sext_rip_fixes, 1 );
+                        unsigned ri;
+
+                        for (ri = 0; ri < sizeof(fix_regs) / sizeof(fix_regs[0]); ri++)
+                            if (state.__x[fix_regs[ri]] == bad_rip)
+                                state.__x[fix_regs[ri]] = real_rip;
+                        state.__x[12] = real_rip;
+                        state.__x[11] = real_rip >> 18;
+                        if (state.__x[28] >= 0x100000ULL && state.__x[28] < 0x0000800000000000ULL)
+                            mach_vm_write( mach_task_self(), (mach_vm_address_t)(state.__x[28] + 0x18),
+                                           (vm_offset_t)(uintptr_t)&real_rip, sizeof(real_rip) );
+                        if (fn <= 16 || (fn % 256) == 0)
+                            dprintf( STDERR_FILENO,
+                                     "[sext-lowalias] #%d repaired sign-extended RIP 0x%llx -> 0x%llx (pc=0x%llx)\n",
+                                     fn, (unsigned long long)bad_rip, (unsigned long long)real_rip,
+                                     (unsigned long long)fault_pc );
+                        handled = 1;
                     }
                 }
             }
@@ -15640,8 +15732,10 @@ static int ios_subfloor_backing_probe( uintptr_t real, unsigned bytes, int need_
 
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb )
 {
-    uint64_t addr = (uint64_t)(uintptr_t)fault_addr;
-    uintptr_t real = ios_subfloor_translate( addr, peb );
+    uint64_t orig_addr = (uint64_t)(uintptr_t)fault_addr;
+    uint64_t addr = orig_addr;
+    int is_sext = 0;
+    uintptr_t real;
     uint32_t insn = 0;
     unsigned bytes = 0, span = 8;
     int is_write = 0, ok, cls = 0;
@@ -15649,6 +15743,14 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
     unsigned cur = 0, mx = 0;
     int kr = 0;
     mach_vm_size_t got = 0;
+
+    if (orig_addr >= 0xffffffff80000000ULL && orig_addr < 0xffffffffffff0000ULL &&
+        ios_sext_lowalias_enabled())
+    {
+        addr = (uint64_t)(uint32_t)orig_addr;
+        is_sext = 1;
+    }
+    real = ios_subfloor_translate( addr, peb );
 
     /* ml966: a translate miss is no longer fatal on its own -- a low guest
      * allocation is resolved further down, once the access span is known. But
@@ -15721,6 +15823,7 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         else
         {
             static int la_miss;
+            if (is_sext) return 0;
             /* A low address in the experiment's range that no live allocation
              * covers: either a span running off the end, or an access after
              * the translation was retired. Both must be refused, and both are
@@ -15857,7 +15960,7 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         return 0;
     }
 
-    ios_subfloor_writeback( ctx, insn, addr );
+    ios_subfloor_writeback( ctx, insn, orig_addr );
     /* ml1055: WHO is touching the window. One run serviced 12,029,953 of these
      * through the Mach exception path (~18,000 a second, a fifth of all running
      * CPU samples were in mach_msg). Whether the accessor is the sub-floor
