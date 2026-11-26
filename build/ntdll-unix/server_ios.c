@@ -2235,6 +2235,62 @@ static int ios_xp_cmp_u64( const void *a, const void *b )
     return x < y ? -1 : x > y;
 }
 
+/* Madeira [api-new] (env.MADEIRA_API_NEW = 1, off by default; measurement only).
+ * PRAGMATA (2026-11-25): after "Initial Settings -> Next" the screen stays black
+ * at 60 fps. Nothing blocks (every parked thread was parked before Next with the
+ * same last code), no file is opened, nothing is read, no texture or pipeline is
+ * made; the per-frame call mix in [xp-api-top] is unchanged. So the game polls
+ * something each frame and never gets the answer it wants. This prints every x64->EC
+ * call target (the Windows / D3D12 / DXGI function a guest call lands in) the
+ * first time the sampled ring shows it, with the wall time, so the functions the
+ * game starts calling after a given moment stand out. The ring keeps every 64th
+ * call, so a function called a few times a second shows up within seconds; one
+ * called once may be missed. The seen set restarts when [xp-api] follows another
+ * process. Up to MADEIRA_API_NEW_LIMIT lines (default 3000). */
+static void ios_xp_api_new( const uint64_t *s, uint64_t n, const char *wall )
+{
+    enum { CAP = 16384 };
+    static uint64_t *set; static int on = -1, limit; static unsigned printed, used, rebind_seen;
+    uint64_t k;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_API_NEW" ), *l = getenv( "MADEIRA_API_NEW_LIMIT" );
+        on = e && e[0] == '1';
+        limit = l ? atoi( l ) : 3000;
+        if (limit <= 0 || limit > 100000) limit = 3000;
+        if (on) wine_log_write( "[api-new] on: first sampled x64->EC call targets, %d lines (MADEIRA_API_NEW)", limit );
+    }
+    if (!on) return;
+    if (!set && !(set = calloc( CAP, sizeof(*set) ))) { on = 0; return; }
+    if (rebind_seen != ios_xp_rebind)
+    {
+        rebind_seen = ios_xp_rebind;
+        memset( set, 0, CAP * sizeof(*set) ); used = 0;
+        wine_log_write( "[api-new] %s following another process: seen set cleared", wall );
+    }
+    for (k = 0; k < n; k++)
+    {
+        uint64_t a = s[k], h;
+        char sym[160];
+        if (!a || a == ~0ull || (k && s[k - 1] == a)) continue;   /* sorted: one look per target */
+        h = (a >> 2) * 0x9E3779B97F4A7C15ull;
+        for (;;)
+        {
+            h &= CAP - 1;
+            if (set[h] == a) break;
+            if (!set[h]) break;
+            h++;
+        }
+        if (set[h] == a) continue;
+        if (used >= CAP * 3 / 4) return;   /* full: stop rather than slow the reporter */
+        set[h] = a; used++;
+        if ((int)printed >= limit) continue;
+        printed++;
+        ios_xp_symbol( a, sym, sizeof(sym) );
+        wine_log_write( "[api-new] %s #%u %s", wall, printed, sym );
+    }
+}
+
 /* Madeira [spin] ml1140 -- a guest thread that makes millions of the same cheap call a second.
  *
  * A .NET game: about 10 s after the process starts, one or two threads of the .NET runtime call GetLastError /
@@ -2574,6 +2630,7 @@ static void ios_xp_api_report( const char *wall, double wall_s )
                 if (newn > 4096) newn = 4096;
                 for (k = 0; k < newn; k++) sorted[k] = fex[400 + ((idx - 1 - k) & 4095)];
                 qsort( sorted, (size_t)newn, 8, ios_xp_cmp_u64 );
+                ios_xp_api_new( sorted, newn, wall );
                 n = snprintf( line, sizeof(line), "[xp-api-top] %s %llu samples:", wall, (unsigned long long)newn );
                 while (shown < 28 && newn)
                 {
