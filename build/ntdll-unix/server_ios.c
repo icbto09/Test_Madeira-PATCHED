@@ -2122,8 +2122,8 @@ static void ios_xp_fallback_pick( void )
     ios_xp_nfb = 0;
 }
 
-struct ios_xp_expc { uint64_t base; uint32_t exp_rva, exp_size, nfunc, nname; uint32_t *funcs, *names; uint16_t *ords; };
-static struct ios_xp_expc ios_xp_expcache[32];
+struct ios_xp_expc { uint64_t base; uint32_t exp_rva, exp_size, nfunc, nname; uint32_t *funcs, *names, *ec; uint16_t *ords; };
+static struct ios_xp_expc ios_xp_expcache[128];   /* PRAGMATA alone loads 105 modules */
 static int ios_xp_nexpc;
 
 static void ios_xp_modmap( uint64_t teb )
@@ -2167,7 +2167,7 @@ static struct ios_xp_expc *ios_xp_exports( uint64_t base )
     struct ios_xp_expc *c; uint32_t lfanew = 0, dir[2] = {0}, ed[10];
     int i;
     for (i = 0; i < ios_xp_nexpc; i++) if (ios_xp_expcache[i].base == base) return &ios_xp_expcache[i];
-    if (ios_xp_nexpc >= 32) return NULL;
+    if (ios_xp_nexpc >= 128) return NULL;
     if (!ios_ts_read( base + 0x3c, &lfanew, 4 ) || lfanew > 0x1000) return NULL;
     if (!ios_ts_read( base + lfanew + 24 + 112, dir, 8 ) || !dir[0] || dir[1] < 40) return NULL;   /* PE32+ export directory */
     if (!ios_ts_read( base + dir[0], ed, sizeof(ed) )) return NULL;
@@ -2183,6 +2183,29 @@ static struct ios_xp_expc *ios_xp_exports( uint64_t base )
     {
         free( c->funcs ); free( c->names ); free( c->ords ); memset( c, 0, sizeof(*c) );
         return NULL;
+    }
+    /* ARM64EC images (every Wine PE module here): an export's RVA is its x64
+     * entry stub in .hexpthk, the fast-forward sequence
+     *   48 8b c4  48 89 58 20  55  5d  e9 <rel32>
+     * whose jmp lands on the EC function. An x64->EC call target is that EC
+     * function, which sits below every stub, so the nearest-export search found
+     * nothing and every [xp-api-top] / [api-new] target printed as module+0x...
+     * Record each stub's jmp target next to it; ios_xp_symbol matches on those. */
+    c->ec = calloc( (size_t)c->nfunc + 1, 4 );
+    if (c->ec)
+    {
+        static const unsigned char ffs[10] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9 };
+        uint32_t k;
+        for (k = 0; k < c->nfunc; k++)
+        {
+            unsigned char b[14];
+            int32_t rel;
+            uint32_t f = c->funcs[k];
+            if (!f || (f >= c->exp_rva && f < c->exp_rva + c->exp_size)) continue;
+            if (!ios_ts_read( base + f, b, sizeof(b) ) || memcmp( b, ffs, sizeof(ffs) )) continue;
+            memcpy( &rel, b + 10, 4 );
+            c->ec[k] = (uint32_t)((int64_t)f + 14 + rel);
+        }
     }
     ios_xp_nexpc++;
     return c;
@@ -2213,7 +2236,9 @@ static void ios_xp_symbol( uint64_t a, char *out, size_t cap )
     for (i = 0; i < c->nfunc; i++)
     {
         uint32_t f = c->funcs[i];
-        if (!f || f > rva || (f >= c->exp_rva && f < c->exp_rva + c->exp_size)) continue;   /* forwarder strings */
+        if (!f || (f >= c->exp_rva && f < c->exp_rva + c->exp_size)) continue;   /* forwarder strings */
+        if (c->ec && c->ec[i]) f = c->ec[i];   /* ARM64EC: the EC function behind the x64 stub */
+        if (f > rva) continue;
         if (best == ~0u || f > bestrva) { best = i; bestrva = f; }
     }
     if (best == ~0u) { snprintf( out, cap, "%s+0x%x", m->name, rva ); return; }
