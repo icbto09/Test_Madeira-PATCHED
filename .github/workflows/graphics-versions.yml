@@ -31,9 +31,14 @@ on:
         type: choice
         options: [try, all, none]
         default: try
+      release:
+        description: "Also publish each build as a .zip on a pre-release (Releases page); the artifact stays as before"
+        type: boolean
+        default: true
 
+# contents: write only for the optional pre-release (gh release create); nothing is pushed.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: graphics-versions-${{ github.ref }}
@@ -141,3 +146,34 @@ jobs:
           path: ${{ steps.vkd3d.outputs.dir }}
           if-no-files-found: error
           retention-days: 30
+
+      # Artifact downloads come from Azure blob storage, and on 2026-11-27 an iPhone got a
+      # cut-off copy of a vkd3d-proton artifact every time (Madeira: "not a .zip archive",
+      # Files: "Bad message"), five downloads over two builds, while the artifact on GitHub
+      # was whole. Release assets come from github.com's own download host, so each build
+      # is also attached as a .zip to a pre-release named after the run: open the run's
+      # release on the Releases page on the device and tap the .zip. The zip holds the same
+      # folder the artifact does (ditto --keepParent), so Madeira imports it the same way.
+      - name: Publish as release files
+        if: "!cancelled() && inputs.release && (steps.dxvk.outcome == 'success' || steps.vkd3d.outcome == 'success')"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DXVK_DIR: ${{ steps.dxvk.outputs.dir }}
+          VKD3D_DIR: ${{ steps.vkd3d.outputs.dir }}
+        run: |
+          set -e
+          files=()
+          for d in "$DXVK_DIR" "$VKD3D_DIR"; do
+            [ -n "$d" ] && [ -d "$d" ] || continue
+            z="$OUT/$(basename "$d").zip"
+            rm -f "$z"
+            ditto -c -k --keepParent "$d" "$z"
+            unzip -tq "$z"
+            files+=("$z")
+          done
+          [ ${#files[@]} -gt 0 ] || { echo "nothing to publish"; exit 0; }
+          tag="graphics-${GITHUB_RUN_ID}"
+          notes="Built by run $GITHUB_RUN_ID on $GITHUB_REF_NAME ($GITHUB_SHA). On the device: tap the .zip, then Madeira › Import a version…"
+          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --prerelease --title "Graphics versions: $(for f in "${files[@]}"; do basename "$f" .zip; done | paste -sd ' ' -)" --notes "$notes"
+          echo "Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag"
