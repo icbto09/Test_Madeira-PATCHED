@@ -1,0 +1,52 @@
+vkd3d-proton: VKD3D_FEATURE_LEVEL keeps the tiled tier when the driver has no sparse binding
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton.
+
+VKD3D_FEATURE_LEVEL=12_0 or higher raises TiledResourcesTier to 2 (3 for 12_2).
+On a driver without sparse binding (KosmicKrisp on Apple GPUs) the device has no
+internal sparse queue, so when a game created a reserved resource because of that
+claim, binding its memory called vkd3d_queue_acquire(NULL) in resource.c and
+crashed in AcquireSRWLockExclusive (PRAGMATA, vkd3d-proton 2.14.1, after the
+display queries that precede its swapchain). The override now leaves
+TiledResourcesTier at the driver's own value when sparseBinding is missing, with
+an INFO line; everything else the override claims is unchanged.
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index bf8aabf..abda26d 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -8576,6 +8576,7 @@ static void d3d12_device_caps_override_application(struct d3d12_device *device)
+ 
+ static void d3d12_device_caps_override(struct d3d12_device *device)
+ {
++    D3D12_TILED_RESOURCES_TIER tiled_tier_before;
+     D3D_FEATURE_LEVEL fl_override = (D3D_FEATURE_LEVEL)0;
+     struct d3d12_caps *caps = &device->d3d12_caps;
+     char fl_string[VKD3D_PATH_MAX];
+@@ -8613,6 +8614,8 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
+         return;
+     }
+ 
++    tiled_tier_before = caps->options.TiledResourcesTier;
++
+     if (fl_override >= D3D_FEATURE_LEVEL_11_1)
+         caps->options.OutputMergerLogicOp = TRUE;
+ 
+@@ -8642,6 +8645,17 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
+         caps->options7.SamplerFeedbackTier = max(caps->options7.SamplerFeedbackTier, D3D12_SAMPLER_FEEDBACK_TIER_1_0);
+     }
+ 
++    /* Madeira: a driver without sparse binding (KosmicKrisp on Apple GPUs) has
++     * no internal sparse queue, so a reserved resource created because the
++     * override claimed a tiled tier crashed binding its memory
++     * (vkd3d_queue_acquire(NULL) in resource.c). Keep the driver's own tier. */
++    if (!device->device_info.features2.features.sparseBinding &&
++            caps->options.TiledResourcesTier != tiled_tier_before)
++    {
++        INFO("Feature level override: tiled resources stay at tier %u (no sparse binding).\n", tiled_tier_before);
++        caps->options.TiledResourcesTier = tiled_tier_before;
++    }
++
+     caps->max_feature_level = fl_override;
+     WARN("Overriding feature level: %#x.\n", fl_override);
+ }
