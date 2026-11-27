@@ -14,3 +14,4 @@ comments were reworded to leave out application names.
 | 0003-kosmickrisp-shader-model-gates.patch | 2026-10-06 | On VK_DRIVER_ID_MESA_KOSMICKRISP only: feature level 12_0 without tiled resources, shader model past 6.0 without float32 denormal control, the compute-derivatives fallback for 6.6; plus one INFO line with the feature-level inputs (every driver) |
 | 0004-kosmickrisp-small-occlusion-pool.patch | Madeira, 2026-11-20 | Smaller occlusion query pools (env MADEIRA_KK_OCCLUSION_POOL = 0 turns it off; 64-4096 sets the size) |
 | 0005-placed-buffer-offset.patch | Madeira, 2026-11-20 | Placed buffers at the offset the heap needs (env MADEIRA_VKD3D_PLACED_BUFFER_OFFSET = 0 turns it off) |
+| 0006-madeira-atomic64-caps.patch | Madeira, 2026-11-27 | Off by default: env MADEIRA_VKD3D_ATOMIC64 = 1 reports the 64-bit atomic caps (options11 descriptor-heap, options9 typed and groupshared) the driver lacks, for RE Engine's startup check |
