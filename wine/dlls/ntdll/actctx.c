@@ -595,7 +595,18 @@ static const xmlstr_t empty_xmlstr;
 
 #ifdef __i386__
 static const WCHAR current_archW[] = L"x86";
-#elif defined __aarch64__ || defined __arm64ec__
+#elif defined __arm64ec__
+/* iOS-Madeira (pragmata-taskdialog): an x64 program's processorArchitecture="*"
+ * dependency is looked up as amd64, which lookup_manifest_file turns into "a??"
+ * (amd64_ or arm64_). Every game session's main program is the native ARM64
+ * explorer.exe, and a native process looks for arm64_ only, so the app seeds the
+ * x64 Common-Controls 6.0 (the ARM64EC comctl32_v6.dll) as amd64_ where native
+ * programs never see it (WineProcessBridge.m, madeira_seed_winsxs_amd64_comctl).
+ * Before this, "*" meant arm64_ here too, that entry is removed in a native-target
+ * session, and PRAGMATA's error TaskDialogIndirect landed on comctl32 v5's stub:
+ * "unimplemented function comctl32.dll.TaskDialogIndirect, aborting". */
+static const WCHAR current_archW[] = L"amd64";
+#elif defined __aarch64__
 static const WCHAR current_archW[] = L"arm64";
 #elif defined __x86_64__
 static const WCHAR current_archW[] = L"amd64";

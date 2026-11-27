@@ -1965,6 +1965,63 @@ static void madeira_seed_winsxs_arm64_comctl(NSFileManager *fm, NSString *prefix
     dprintf(STDERR_FILENO, "[WineProc] winsxs: 64-bit Common-Controls 6.0 seeded (arm64_, ARM64EC comctl32_v6)\n");
 }
 
+/* pragmata-taskdialog: Common-Controls 6.0 for x64 programs in every session.
+ *
+ * PRAGMATA (2026-11-26, vkd3d-proton 2.14.1 on KosmicKrisp) wanted to report a
+ * startup problem with TaskDialogIndirect and died instead:
+ *   wine: Call from ... to unimplemented function comctl32.dll.TaskDialogIndirect, aborting
+ * Game sessions run the native ARM64 explorer.exe as their main program, so
+ * madeira_seed_winsxs_arm64_comctl above (use_arm64ec NO) removes its arm64_
+ * entry: a native program looks for arm64_ and cannot load the ARM64EC DLL. An
+ * x64 game started from that shell therefore never had comctl32 v6, which is the
+ * only comctl32 here with TaskDialog / TaskDialogIndirect, its v6 window classes
+ * and the rest.
+ *
+ * The ARM64EC ntdll now resolves processorArchitecture="*" as amd64 (actctx.c,
+ * current_archW), and its lookup turns amd64_ into "a??", so an amd64_ entry
+ * reaches x64 programs only: native processes, which look for arm64_, never see
+ * it. Seeded in every session whose bundle has the ARM64EC comctl32_v6.dll,
+ * whatever the main program is. In an x64-target session it sits beside the
+ * arm64_ entry, both naming the same DLL. env.MADEIRA_WINSXS_X64_COMCTL = 0
+ * removes it, as it does the arm64_ one. */
+static void madeira_seed_winsxs_amd64_comctl(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    NSString *winsxs = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
+    NSString *manifests = [winsxs stringByAppendingPathComponent:@"manifests"];
+    NSString *dirName = @"amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef";
+    NSString *asmDir = [winsxs stringByAppendingPathComponent:dirName];
+    NSString *manifest = [manifests stringByAppendingPathComponent:[dirName stringByAppendingString:@".manifest"]];
+    NSString *src = [[bundle stringByAppendingPathComponent:@"arm64ec-windows"] stringByAppendingPathComponent:@"comctl32_v6.dll"];
+    NSString *link = [asmDir stringByAppendingPathComponent:@"comctl32.dll"];
+    const char *e = getenv("MADEIRA_WINSXS_X64_COMCTL");
+
+    /* The link names the bundle path, which changes on reinstall: always rebuild. */
+    [fm removeItemAtPath:manifest error:nil];
+    [fm removeItemAtPath:link error:nil];
+    if (e && e[0] == '0') return;   /* logged by madeira_seed_winsxs_arm64_comctl in an x64-target session */
+    if (![fm fileExistsAtPath:src])
+    {
+        dprintf(STDERR_FILENO, "[WineProc] winsxs: x64 Common-Controls 6.0 (amd64_) skipped, arm64ec-windows has no comctl32_v6.dll\n");
+        return;
+    }
+    [fm createDirectoryAtPath:manifests withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *text = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        @"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+        @"  <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.2600.2982\" "
+        @"processorArchitecture=\"amd64\" publicKeyToken=\"6595b64144ccf1df\"/>\n"
+        @"  <file name=\"comctl32.dll\">\n%s  </file>\n</assembly>\n", madeira_comctl32_v6_body];
+    if (![fm createSymbolicLinkAtPath:link withDestinationPath:src error:nil] ||
+        ![[text dataUsingEncoding:NSUTF8StringEncoding] writeToFile:manifest atomically:YES])
+    {
+        [fm removeItemAtPath:manifest error:nil];
+        dprintf(STDERR_FILENO, "[WineProc] winsxs: x64 Common-Controls 6.0 (amd64_) FAILED\n");
+        return;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] winsxs: x64 Common-Controls 6.0 seeded (amd64_, ARM64EC comctl32_v6, any session)\n");
+}
+
 /* FEX's WOW64 module cannot call sysctl, and without an answer it assumes the
  * newest cores' feature set. A wrong "present" is silent corruption, not a
  * crash (FEAT_AFP claimed on a core without it leaves FPCR.NEP RES0, so every
@@ -2936,6 +2993,7 @@ static void *wine_process_thread(void *arg) {
                 madeira_overlay_xaudio2(fm, prefix, YES);   /* VCRedist.swift's XAudio2 2.7 */
             }
             madeira_seed_winsxs_arm64_comctl(fm, prefix, bundlePath, use_arm64ec);   /* hoi4-comctl-v6-x64 */
+            madeira_seed_winsxs_amd64_comctl(fm, prefix, bundlePath);   /* pragmata-taskdialog: x64 programs in any session */
             madeira_overlay_openal(fm, prefix, bundlePath, has_i386_set, use_arm64ec);   /* OpenAL Soft, only where the prefix has none */
             madeira_ensure_wine_inf_dirs(fm, prefix, has_i386_set);
             madeira_link_wine_mono(fm, prefix, bundlePath);
