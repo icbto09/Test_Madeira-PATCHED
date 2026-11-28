@@ -1,0 +1,122 @@
+vkd3d-proton: log every CheckFeatureSupport answer as Madeira's D3D12 does; MADEIRA_VKD3D_CAPS_ZERO, MADEIRA_VKD3D_BINDING_TIER
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton.
+
+PRAGMATA (RE Engine) on vkd3d-proton crashes after its first ResourceBarrier batch,
+looking up a buffer in a table it never fills; on Madeira's D3D12 it gets past that
+point. Shader model 6.6, UMA FALSE and no GPU upload heap left the crash unchanged.
+Madeira's D3D12 logs each answer ("[d3d12-caps] madeira-bcd CheckFeatureSupport(feature
+N, S bytes) -> HR hex"); this logs vkd3d-proton's in the same form as "[vkd3d-caps]"
+lines (format and MSAA queries left out, 160 at most; MADEIRA_VKD3D_CAPS_LOG=0 off), so
+two logs compare line by line. To make answers match without a rebuild:
+MADEIRA_VKD3D_CAPS_ZERO = comma-separated feature numbers whose D3D12_OPTIONS* answer
+reads all zero (output-only structs only), MADEIRA_VKD3D_BINDING_TIER = 1/2/3 sets
+D3D12_OPTIONS.ResourceBindingTier. Both off unless set. The original function is
+renamed d3d12_device_CheckFeatureSupport_vkd3d and called first.
+
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4217,7 +4217,7 @@
+     }
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
++static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport_vkd3d(d3d12_device_iface *iface,
+         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+ {
+     struct d3d12_device *device = impl_from_ID3D12Device(iface);
+@@ -5035,6 +5035,94 @@
+     }
+ }
+ 
++/* Madeira: PRAGMATA (RE Engine) crashes on vkd3d-proton after its first
++ * ResourceBarrier batch, looking up a buffer in a table it never fills, and
++ * gets past that point on Madeira's own D3D12. Shader model 6.6 and UMA FALSE
++ * did not change it. Madeira's D3D12 logs every answer a game gets as
++ * "[d3d12-caps] madeira-bcd CheckFeatureSupport(feature N, S bytes) -> HR hex";
++ * this logs vkd3d-proton's answers in the same form ("[vkd3d-caps]"), so the two
++ * logs compare line by line (format and MSAA queries left out, 160 lines at most;
++ * MADEIRA_VKD3D_CAPS_LOG=0 turns it off), and lets a run make answers match:
++ * MADEIRA_VKD3D_CAPS_ZERO = comma-separated feature numbers whose OPTIONS*
++ * answer reads all zero (every field "not supported"; only the output-only
++ * D3D12_OPTIONS structs are touched), and MADEIRA_VKD3D_BINDING_TIER = 1/2/3
++ * sets D3D12_OPTIONS.ResourceBindingTier. Off unless set. */
++static bool madeira_caps_zero_listed(D3D12_FEATURE feature)
++{
++    char list[256], *p, *end;
++
++    if (!vkd3d_get_env_var("MADEIRA_VKD3D_CAPS_ZERO", list, sizeof(list)))
++        return false;
++    for (p = list; *p; )
++    {
++        unsigned long n = strtoul(p, &end, 0);
++        if (end == p)
++        {
++            p++;
++            continue;
++        }
++        if (n == (unsigned long)feature)
++            return true;
++        p = end;
++    }
++    return false;
++}
++
++static bool madeira_caps_output_only(D3D12_FEATURE feature)
++{
++    switch ((unsigned int)feature)
++    {
++        case 0: case 8: case 18: case 21: case 23: case 27: case 30: case 32:
++        case 36: case 37: case 39: case 40: case 41: case 42: case 43: case 44:
++        case 45: case 46: case 47: case 48: case 49: case 53:
++            return true;
++        default:
++            return false;
++    }
++}
++
++static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
++        D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
++{
++    static unsigned int logged;
++    char env[16], hex[64 * 2 + 1];
++    const uint8_t *bytes = feature_data;
++    unsigned int i, n;
++    HRESULT hr;
++
++    hr = d3d12_device_CheckFeatureSupport_vkd3d(iface, feature, feature_data, feature_data_size);
++
++    if (SUCCEEDED(hr) && feature_data && madeira_caps_output_only(feature) && madeira_caps_zero_listed(feature))
++    {
++        memset(feature_data, 0, feature_data_size);
++        INFO("MADEIRA_VKD3D_CAPS_ZERO: feature %u answered all zero.\n", (unsigned int)feature);
++    }
++    if (SUCCEEDED(hr) && feature == D3D12_FEATURE_D3D12_OPTIONS && feature_data &&
++            feature_data_size >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS) &&
++            vkd3d_get_env_var("MADEIRA_VKD3D_BINDING_TIER", env, sizeof(env)) && env[0] >= '1' && env[0] <= '3')
++    {
++        D3D12_FEATURE_DATA_D3D12_OPTIONS *o = feature_data;
++        INFO("MADEIRA_VKD3D_BINDING_TIER: ResourceBindingTier %u -> %c.\n", (unsigned int)o->ResourceBindingTier, env[0]);
++        o->ResourceBindingTier = (D3D12_RESOURCE_BINDING_TIER)(env[0] - '0');
++    }
++
++    if (feature == D3D12_FEATURE_FORMAT_SUPPORT || feature == D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS ||
++            feature == D3D12_FEATURE_FORMAT_INFO)
++        return hr;
++    if (vkd3d_get_env_var("MADEIRA_VKD3D_CAPS_LOG", env, sizeof(env)) && env[0] == '0')
++        return hr;
++    if (logged >= 160)
++        return hr;
++    logged++;
++    hex[0] = 0;
++    n = SUCCEEDED(hr) && feature_data ? (feature_data_size < 64 ? feature_data_size : 64) : 0;
++    for (i = 0; i < n; i++)
++        snprintf(hex + i * 2, 3, "%02x", bytes[i]);
++    INFO("[vkd3d-caps] CheckFeatureSupport(feature %u, %u bytes) -> 0x%08x %s\n",
++            (unsigned int)feature, feature_data_size, (unsigned int)hr, hex);
++    return hr;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_iface *iface,
+         const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **descriptor_heap)
+ {
