@@ -1,0 +1,107 @@
+vkd3d-proton: MADEIRA_VKD3D_CAPS_SET and MADEIRA_VKD3D_CAPS_REFUSE
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton. Builds on 0009.
+
+With 0009's zero list and binding tier 2, PRAGMATA's answers on vkd3d-proton matched
+Madeira's D3D12 except single fields: D3D12_OPTIONS (logic op, PS stencil ref, typed
+UAV load formats, ROVs, conservative rasterization, GPU VA bits per resource),
+OPTIONS1.TotalLaneCount, SHADER_CACHE.SupportFlags, the tile-based flag, and features
+49/53/54, which Madeira's D3D12 refuses. The crash did not move.
+MADEIRA_VKD3D_CAPS_SET = "feature:offset=value,..." writes a 32-bit value at a byte
+offset of vkd3d-proton's answer (aligned, inside the structure passed); one INFO line
+each. MADEIRA_VKD3D_CAPS_REFUSE = feature numbers answered E_INVALIDARG without asking
+vkd3d-proton. Both off unless set.
+
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -5047,11 +5047,11 @@
+  * answer reads all zero (every field "not supported"; only the output-only
+  * D3D12_OPTIONS structs are touched), and MADEIRA_VKD3D_BINDING_TIER = 1/2/3
+  * sets D3D12_OPTIONS.ResourceBindingTier. Off unless set. */
+-static bool madeira_caps_zero_listed(D3D12_FEATURE feature)
++static bool madeira_caps_listed(const char *name, D3D12_FEATURE feature)
+ {
+     char list[256], *p, *end;
+ 
+-    if (!vkd3d_get_env_var("MADEIRA_VKD3D_CAPS_ZERO", list, sizeof(list)))
++    if (!vkd3d_get_env_var(name, list, sizeof(list)))
+         return false;
+     for (p = list; *p; )
+     {
+@@ -5081,6 +5081,49 @@
+     }
+ }
+ 
++/* MADEIRA_VKD3D_CAPS_SET = "feature:offset=value,...": after vkd3d-proton
++ * answers, write the 32-bit value at that byte offset of the answer (offset and
++ * value in C notation, e.g. "0:28=0,8:12=0x1000,19:0=1"). Entries past the
++ * structure the game passed are skipped. MADEIRA_VKD3D_CAPS_REFUSE = feature
++ * numbers answered E_INVALIDARG without asking vkd3d-proton, as Madeira's D3D12
++ * does for the features it does not implement. */
++static void madeira_caps_set(D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
++{
++    char list[512], *p, *end;
++    unsigned long f, off, value;
++
++    if (!vkd3d_get_env_var("MADEIRA_VKD3D_CAPS_SET", list, sizeof(list)))
++        return;
++    for (p = list; *p; )
++    {
++        f = strtoul(p, &end, 0);
++        if (end == p || *end != ':')
++            goto next;
++        p = end + 1;
++        off = strtoul(p, &end, 0);
++        if (end == p || *end != '=')
++            goto next;
++        p = end + 1;
++        value = strtoul(p, &end, 0);
++        if (end == p)
++            goto next;
++        p = end;
++        if (f == (unsigned long)feature && off + 4 <= feature_data_size && !(off & 3))
++        {
++            uint32_t old;
++            memcpy(&old, (uint8_t *)feature_data + off, 4);
++            memcpy((uint8_t *)feature_data + off, &(uint32_t){ (uint32_t)value }, 4);
++            INFO("MADEIRA_VKD3D_CAPS_SET: feature %lu offset %lu: %#x -> %#lx.\n", f, off, old, value);
++        }
++        continue;
++next:
++        while (*p && *p != ',')
++            p++;
++        if (*p)
++            p++;
++    }
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+ {
+@@ -5090,9 +5133,15 @@
+     unsigned int i, n;
+     HRESULT hr;
+ 
+-    hr = d3d12_device_CheckFeatureSupport_vkd3d(iface, feature, feature_data, feature_data_size);
++    if (madeira_caps_listed("MADEIRA_VKD3D_CAPS_REFUSE", feature))
++    {
++        hr = E_INVALIDARG;
++        INFO("MADEIRA_VKD3D_CAPS_REFUSE: feature %u refused.\n", (unsigned int)feature);
++    }
++    else
++        hr = d3d12_device_CheckFeatureSupport_vkd3d(iface, feature, feature_data, feature_data_size);
+ 
+-    if (SUCCEEDED(hr) && feature_data && madeira_caps_output_only(feature) && madeira_caps_zero_listed(feature))
++    if (SUCCEEDED(hr) && feature_data && madeira_caps_output_only(feature) && madeira_caps_listed("MADEIRA_VKD3D_CAPS_ZERO", feature))
+     {
+         memset(feature_data, 0, feature_data_size);
+         INFO("MADEIRA_VKD3D_CAPS_ZERO: feature %u answered all zero.\n", (unsigned int)feature);
+@@ -5105,6 +5154,8 @@
+         INFO("MADEIRA_VKD3D_BINDING_TIER: ResourceBindingTier %u -> %c.\n", (unsigned int)o->ResourceBindingTier, env[0]);
+         o->ResourceBindingTier = (D3D12_RESOURCE_BINDING_TIER)(env[0] - '0');
+     }
++    if (SUCCEEDED(hr) && feature_data)
++        madeira_caps_set(feature, feature_data, feature_data_size);
+ 
+     if (feature == D3D12_FEATURE_FORMAT_SUPPORT || feature == D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS ||
+             feature == D3D12_FEATURE_FORMAT_INFO)
