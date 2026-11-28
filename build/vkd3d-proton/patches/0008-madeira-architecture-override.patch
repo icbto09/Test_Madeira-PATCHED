@@ -1,0 +1,67 @@
+vkd3d-proton: MADEIRA_VKD3D_UMA=0 / MADEIRA_VKD3D_TILE_BASED=1 change the ARCHITECTURE answers
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton.
+
+Every memory type KosmicKrisp exposes on Apple GPUs is host visible, so
+D3D12_FEATURE_ARCHITECTURE(1) reports UMA and CacheCoherentUMA TRUE; Madeira's own
+D3D12 reports FALSE (and TileBasedRenderer TRUE). PRAGMATA (RE Engine) on vkd3d-proton
+crashes on its render thread after its first ResourceBarrier batch, looking up a
+buffer in a table it never fills (no buckets allocated); on Madeira's D3D12 it gets
+past that point. GPU upload heaps (VKD3D_CONFIG=no_gpu_upload_heap) were ruled out.
+MADEIRA_VKD3D_UMA=0 reports UMA and CacheCoherentUMA FALSE; MADEIRA_VKD3D_TILE_BASED=1
+reports TileBasedRenderer TRUE. Only the answers change. The first query logs one INFO
+line with the reported and the driver's values, which also shows whether the game
+asks at all. Off by default.
+
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4190,6 +4190,33 @@
+     return S_OK;
+ }
+ 
++/* Madeira: ARCHITECTURE(1) answers the game may need to see as on a discrete GPU.
++ * MADEIRA_VKD3D_UMA=0 reports UMA and CacheCoherentUMA FALSE (every KosmicKrisp
++ * memory type is host visible, so vkd3d-proton answers TRUE on Apple GPUs, while
++ * Madeira's own D3D12 answers FALSE). RE Engine (PRAGMATA) crashes on its render
++ * thread looking up a buffer in a table it never fills on this device, after its
++ * first ResourceBarrier batch; the run on Madeira's D3D12 gets past it.
++ * MADEIRA_VKD3D_TILE_BASED=1 reports TileBasedRenderer TRUE, Madeira's D3D12 default.
++ * Only the reported caps change; memory is allocated as before. */
++static void madeira_architecture_override(BOOL *tile_based, BOOL *uma, BOOL *coherent_uma)
++{
++    static int logged;
++    char env[8];
++    BOOL was_uma = *uma, was_coherent = *coherent_uma, was_tbr = *tile_based;
++
++    if (vkd3d_get_env_var("MADEIRA_VKD3D_UMA", env, sizeof(env)) && env[0] == '0')
++        *uma = *coherent_uma = FALSE;
++    if (vkd3d_get_env_var("MADEIRA_VKD3D_TILE_BASED", env, sizeof(env)) && env[0] == '1')
++        *tile_based = TRUE;
++    if (!logged)
++    {
++        logged = 1;
++        INFO("Architecture queried: tile based %u, UMA %u, cache coherent UMA %u (driver: %u, %u, %u; "
++                "MADEIRA_VKD3D_UMA=0 / MADEIRA_VKD3D_TILE_BASED=1 change them).\n",
++                *tile_based, *uma, *coherent_uma, was_tbr, was_uma, was_coherent);
++    }
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+ {
+@@ -4253,6 +4280,7 @@
+ 
+             data->UMA = d3d12_device_is_uma(device, &coherent);
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
++            madeira_architecture_override(&data->TileBasedRenderer, &data->UMA, &data->CacheCoherentUMA);
+ 
+             TRACE("Tile based renderer %#x, UMA %#x, cache coherent UMA %#x.\n",
+                     data->TileBasedRenderer, data->UMA, data->CacheCoherentUMA);
+@@ -4472,6 +4500,7 @@
+             data->UMA = d3d12_device_is_uma(device, &coherent);
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
+             data->IsolatedMMU = TRUE; /* Appears to be true Windows drivers */
++            madeira_architecture_override(&data->TileBasedRenderer, &data->UMA, &data->CacheCoherentUMA);
+ 
+             TRACE("Tile based renderer %#x, UMA %#x, cache coherent UMA %#x, isolated MMU %#x.\n",
+                     data->TileBasedRenderer, data->UMA, data->CacheCoherentUMA, data->IsolatedMMU);
