@@ -1,0 +1,123 @@
+vkd3d-proton: MADEIRA_VKD3D_MAX_DEVICE / MADEIRA_VKD3D_MAX_LIST cap the interfaces QueryInterface hands out
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton.
+
+Madeira's D3D12 answers QueryInterface for ID3D12Device1-8 and ID3D12GraphicsCommandList1-8;
+vkd3d-proton 2.14.1 goes to ID3D12Device12 and GraphicsCommandList9. PRAGMATA asks for
+ID3D12Device9 on Madeira's D3D12 and is refused; here it gets it and creates its queues
+with CreateCommandQueue1. With every CheckFeatureSupport answer (0008-0010) and every
+resource creation (0011) identical to Madeira's D3D12, the game still crashes on a table
+it never fills, so the interface level is the next difference.
+MADEIRA_VKD3D_MAX_DEVICE = N refuses ID3D12Device(N+1) and up; MADEIRA_VKD3D_MAX_LIST = N
+refuses ID3D12GraphicsCommandList(N+1) and up (E_NOINTERFACE, one INFO line each, 64 at
+most). Off unless set.
+
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3583,6 +3583,51 @@
+ extern ULONG STDMETHODCALLTYPE d3d12_dxvk_interop_device_AddRef(d3d12_dxvk_interop_device_iface *iface);
+ extern ULONG STDMETHODCALLTYPE d3d12_low_latency_device_AddRef(ID3DLowLatencyDevice *iface);
+ 
++/* Madeira: Madeira's D3D12 answers QueryInterface for ID3D12Device1-8 and
++ * ID3D12GraphicsCommandList1-8 only; vkd3d-proton 2.14.1 goes to Device12 and
++ * GraphicsCommandList9. PRAGMATA asks for ID3D12Device9 on Madeira's D3D12 (refused)
++ * and gets it here (it then calls CreateCommandQueue1 with a creator id), so it
++ * may run a different engine path. With every CheckFeatureSupport answer and
++ * every resource creation identical, it still crashes here on a table it never
++ * fills. MADEIRA_VKD3D_MAX_DEVICE = N refuses ID3D12Device(N+1) and up, and
++ * MADEIRA_VKD3D_MAX_LIST = N refuses ID3D12GraphicsCommandList(N+1) and up,
++ * with E_NOINTERFACE and one INFO line each (64 at most). Off unless set. */
++static int madeira_iid_level(REFIID riid, const GUID * const *iids, unsigned int count)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; i++)
++        if (IsEqualGUID(riid, iids[i]))
++            return (int)i + 1;
++    return 0;
++}
++
++bool madeira_qi_refused(const char *env_name, const char *what, REFIID riid,
++        const GUID * const *iids, unsigned int count)
++{
++    static LONG logged;
++    char env[8];
++    int level, max;
++
++    if (!(level = madeira_iid_level(riid, iids, count)))
++        return false;
++    if (!vkd3d_get_env_var(env_name, env, sizeof(env)) || !env[0])
++        return false;
++    max = atoi(env);
++    if (level <= max)
++        return false;
++    if (InterlockedIncrement(&logged) <= 64)
++        INFO("%s=%d: %s%d refused.\n", env_name, max, what, level);
++    return true;
++}
++
++static const GUID * const madeira_device_iids[] =
++{
++    &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
++    &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8,
++    &IID_ID3D12Device9, &IID_ID3D12Device10, &IID_ID3D12Device11, &IID_ID3D12Device12,
++};
++
+ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
+         REFIID riid, void **object)
+ {
+@@ -3593,6 +3638,13 @@
+     if (!object)
+         return E_POINTER;
+ 
++    if (madeira_qi_refused("MADEIRA_VKD3D_MAX_DEVICE", "ID3D12Device", riid,
++            madeira_device_iids, ARRAY_SIZE(madeira_device_iids)))
++    {
++        *object = NULL;
++        return E_NOINTERFACE;
++    }
++
+     if (IsEqualGUID(riid, &IID_ID3D12Device)
+             || IsEqualGUID(riid, &IID_ID3D12Device1)
+             || IsEqualGUID(riid, &IID_ID3D12Device2)
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -5074,6 +5074,12 @@
+ HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_iface *iface,
+         REFIID iid, void **object)
+ {
++    static const GUID * const madeira_list_iids[] =
++    {
++        &IID_ID3D12GraphicsCommandList1, &IID_ID3D12GraphicsCommandList2, &IID_ID3D12GraphicsCommandList3,
++        &IID_ID3D12GraphicsCommandList4, &IID_ID3D12GraphicsCommandList5, &IID_ID3D12GraphicsCommandList6,
++        &IID_ID3D12GraphicsCommandList7, &IID_ID3D12GraphicsCommandList8, &IID_ID3D12GraphicsCommandList9,
++    };
+     struct d3d12_command_list *command_list = impl_from_ID3D12GraphicsCommandList(iface);
+ 
+     TRACE("iface %p, iid %s, object %p.\n", iface, debugstr_guid(iid), object);
+@@ -5081,6 +5087,14 @@
+     if (!object)
+         return E_POINTER;
+ 
++    /* Madeira: MADEIRA_VKD3D_MAX_LIST, see madeira_qi_refused in device.c. */
++    if (madeira_qi_refused("MADEIRA_VKD3D_MAX_LIST", "ID3D12GraphicsCommandList", iid,
++            madeira_list_iids, ARRAY_SIZE(madeira_list_iids)))
++    {
++        *object = NULL;
++        return E_NOINTERFACE;
++    }
++
+     if (IsEqualGUID(iid, &IID_ID3D12GraphicsCommandList)
+             || IsEqualGUID(iid, &IID_ID3D12GraphicsCommandList1)
+             || IsEqualGUID(iid, &IID_ID3D12GraphicsCommandList2)
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -927,6 +927,8 @@
+     struct d3d_destruction_notifier destruction_notifier;
+ };
+ 
++bool madeira_qi_refused(const char *env_name, const char *what, REFIID riid,
++        const GUID * const *iids, unsigned int count);
+ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
+         void *host_address, struct d3d12_heap **heap);
+ HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
