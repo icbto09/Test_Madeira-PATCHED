@@ -12777,6 +12777,175 @@ static void ios_guest_fault_context( uint64_t rip, uint64_t rsp, uint64_t gregs_
     }
 }
 
+/* ml-guest-obj (PRAGMATA on vkd3d-proton 2.14.1, 2026-11-27): the render thread dies
+ * in the game's own hash lookup (PRAGMATA rva 0x4fdabe3, called from 0x87b2a83 just
+ * after its first ResourceBarrier batch) because a key it expects is not in a small
+ * table; the same run on madeira-d3d12 gets past it. The log showed where, not what
+ * the key is. At the first 4 guest faults this names the objects the live guest
+ * registers point at: for each register holding a readable user pointer, its first
+ * qwords and, when the first qword lies in an image, that image's export name and
+ * the RVA (a vtable: d3d12core.dll = vkd3d-proton, dxgi.dll = DXVK, the game's own
+ * image = an engine object). When the faulting code is that lookup
+ * (4a 8b 0c c1 48 8b 09 48 39 41 10), it also walks the table the caller passed,
+ * [[r13+0x108]+8]: its header, every bucket, and each chain's nodes (+0x08 flag,
+ * +0x10 key, +0x18 value), with each key described the same way, so the log shows
+ * what the game did register next to what it looked for. Reads go through Mach.
+ * LOG ONLY. Off: MADEIRA_GUEST_OBJ=0. Register names follow FEX's static map
+ * (the [regs] ml1200 labels). */
+static void ios_guest_obj_modname( uint64_t base, char *out, size_t n )
+{
+    uint32_t lfanew = 0, exp = 0, name = 0;
+    size_t i;
+
+    out[0] = 0;
+    if (!ios_guest_ctx_read( base + 0x3c, &lfanew, 4 ) || lfanew > 0x1000 - 0x100) return;
+    if (!ios_guest_ctx_read( base + lfanew + 0x88, &exp, 4 ) || !exp) return;   /* PE32+ export directory */
+    if (!ios_guest_ctx_read( base + exp + 0x0c, &name, 4 ) || !name) return;
+    for (i = 0; i + 1 < n; i++)
+    {
+        char c;
+        if (!ios_guest_ctx_read( base + name + i, &c, 1 ) || !c || c < 0x20 || c > 0x7e) break;
+        out[i] = c;
+    }
+    out[i] = 0;
+}
+
+static void ios_guest_obj_describe( const char *what, uint64_t p, int words )
+{
+    uint64_t q[8], base;
+    uint32_t size = 0;
+    char mod[48] = "";
+
+    if (words > 8) words = 8;
+    if (p < 0x10000 || p >= 0x8000000000ull || !ios_guest_ctx_read( p, q, words * 8 ))
+    {
+        ERR("  [guest-obj] %s=%p (not a readable pointer)\n", what, (void *)p);
+        return;
+    }
+    base = (q[0] >= 0x10000 && q[0] < 0x8000000000ull) ? ios_guest_ctx_image( q[0], &size ) : 0;
+    if (base) ios_guest_obj_modname( base, mod, sizeof(mod) );
+    if (words < 4) { q[1] = q[2] = q[3] = 0; }
+    ERR("  [guest-obj] %s=%p [0]=%llx [1]=%llx [2]=%llx [3]=%llx\n", what, (void *)p,
+        (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3]);
+    if (base)
+    {
+        uint64_t fn[3] = {0};
+        ERR("  [guest-obj]   %s [0] is in %s image=%p rva=%#llx (a vtable when the slots below are code)\n", what,
+            mod[0] ? mod : "an unnamed", (void *)base, (unsigned long long)(q[0] - base));
+        if (ios_guest_ctx_read( q[0], fn, sizeof(fn) ))
+        {
+            uint32_t s2 = 0;
+            uint64_t fb = ios_guest_ctx_image( fn[0], &s2 );
+            ERR("  [guest-obj]   %s vtbl slots: %llx %llx %llx (slot0 rva %#llx)\n", what, (unsigned long long)fn[0],
+                (unsigned long long)fn[1], (unsigned long long)fn[2], fb ? (unsigned long long)(fn[0] - fb) : 0ull);
+        }
+    }
+    if (words > 4)
+    {
+        char line[8 * 17 + 1];
+        int k, len = 0;
+        for (k = 4; k < words; k++) len += snprintf( line + len, sizeof(line) - len, " %llx", (unsigned long long)q[k] );
+        ERR("  [guest-obj]   %s [4..]%s\n", what, line);
+    }
+}
+
+static void ios_guest_obj_probe( ucontext_t *context, uint64_t rip )
+{
+    static const struct { const char *name; int x; } gpr[] = {
+        {"rax", 8}, {"rbx", 27}, {"rcx", 0}, {"rdx", 1}, {"rsi", 25}, {"rdi", 26}, {"rbp", 29},
+        {"r8", 2}, {"r9", 3}, {"r10", 4}, {"r11", 5}, {"r12", 19}, {"r13", 20}, {"r14", 21}, {"r15", 22},
+    };
+    static const uint8_t lookup_sig[11] = { 0x4a,0x8b,0x0c,0xc1, 0x48,0x8b,0x09, 0x48,0x39,0x41,0x10 };
+    static int count = -1;
+    uint8_t code[11];
+    unsigned int i;
+
+    if (count < 0)
+    {
+        const char *e = getenv( "MADEIRA_GUEST_OBJ" );
+        count = (e && *e == '0') ? 4 : 0;
+    }
+    if (count >= 4) return;
+    count++;
+
+    ERR("  [guest-obj] ml-guest-obj rip=%p: objects behind the live guest registers\n", (void *)rip);
+    for (i = 0; i < sizeof(gpr) / sizeof(gpr[0]); i++)
+    {
+        uint64_t v = REGn_sig( gpr[i].x, context );
+        if (v < 0x10000 || v >= 0x8000000000ull) continue;
+        ios_guest_obj_describe( gpr[i].name, v, 6 );
+    }
+
+    if (!ios_guest_ctx_read( rip, code, sizeof(code) ) || memcmp( code, lookup_sig, sizeof(code) )) return;
+    {
+        uint64_t key = REGn_sig( 8, context ), r13 = REGn_sig( 20, context );
+        uint64_t a = 0, src = 0, b = 0, map = 0, hdr[16], nb = 0, buckets = 0;
+        unsigned int described = 0;
+
+        ERR("  [guest-obj] hash lookup: key (rax)=%llx, bucket index (r8)=%llx, caller object (r13)=%llx\n",
+            (unsigned long long)key, (unsigned long long)REGn_sig( 2, context ), (unsigned long long)r13);
+        if (ios_guest_ctx_read( r13 + 0x98, &a, 8 ) && ios_guest_ctx_read( a + 0x20, &src, 8 ))
+            ERR("  [guest-obj] key source [[r13+0x98]+0x20]: [r13+0x98]=%llx -> %llx (%s rax)\n",
+                (unsigned long long)a, (unsigned long long)src, src == key ? "matches" : "differs from");
+        if (a) ios_guest_obj_describe( "[r13+0x98]", a, 8 );
+        if (!ios_guest_ctx_read( r13 + 0x108, &b, 8 ) || !ios_guest_ctx_read( b + 8, &map, 8 ) ||
+            !ios_guest_ctx_read( map, hdr, sizeof(hdr) ))
+        {
+            ERR("  [guest-obj] table [[r13+0x108]+8] unreadable ([r13+0x108]=%llx map=%llx)\n",
+                (unsigned long long)b, (unsigned long long)map);
+            return;
+        }
+        ios_guest_obj_describe( "[r13+0x108]", b, 4 );
+        ERR("  [guest-obj] table=%llx enabled(byte +4)=%u count(+0x10)=%llx buckets(+0x30)=%llx\n",
+            (unsigned long long)map, (unsigned)((const uint8_t *)hdr)[4], (unsigned long long)hdr[2],
+            (unsigned long long)hdr[6]);
+        for (i = 0; i < 16; i += 4)
+            ERR("  [guest-obj] table +%#x: %llx %llx %llx %llx\n", i * 8, (unsigned long long)hdr[i],
+                (unsigned long long)hdr[i + 1], (unsigned long long)hdr[i + 2], (unsigned long long)hdr[i + 3]);
+        nb = hdr[2];
+        buckets = hdr[6];
+        if (nb > 64) { ERR("  [guest-obj] %llu buckets: walking the first 64\n", (unsigned long long)nb); nb = 64; }
+        for (i = 0; i < nb; i++)
+        {
+            uint64_t head = 0, node = 0, seen[24];
+            int steps;
+
+            if (!ios_guest_ctx_read( buckets + i * 8, &head, 8 )) { ERR("  [guest-obj] bucket %u unreadable\n", i); break; }
+            if (!head || !ios_guest_ctx_read( head, &node, 8 ))
+            {
+                ERR("  [guest-obj] bucket %u: head=%llx (no chain)\n", i, (unsigned long long)head);
+                continue;
+            }
+            ERR("  [guest-obj] bucket %u: head=%llx first=%llx\n", i, (unsigned long long)head, (unsigned long long)node);
+            for (steps = 0; steps < 24 && node; steps++)
+            {
+                uint64_t n[4];
+                int k, loop = 0;
+
+                for (k = 0; k < steps; k++) if (seen[k] == node) loop = 1;
+                if (loop) { ERR("  [guest-obj]   node %llx again: chain loops\n", (unsigned long long)node); break; }
+                seen[steps] = node;
+                if (!ios_guest_ctx_read( node, n, sizeof(n) ))
+                {
+                    ERR("  [guest-obj]   node %llx unreadable\n", (unsigned long long)node);
+                    break;
+                }
+                ERR("  [guest-obj]   node %llx next=%llx flag(+8)=%llx key(+0x10)=%llx value(+0x18)=%llx%s\n",
+                    (unsigned long long)node, (unsigned long long)n[0], (unsigned long long)n[1],
+                    (unsigned long long)n[2], (unsigned long long)n[3], n[2] == key ? "  <- the key looked up" : "");
+                if ((int64_t)n[1] >= 0 && described < 12)
+                {
+                    char what[40];
+                    snprintf( what, sizeof(what), "b%u key %llx", i, (unsigned long long)n[2] );
+                    ios_guest_obj_describe( what, n[2], 4 );
+                    described++;
+                }
+                node = n[0];
+            }
+        }
+    }
+}
+
 /* ml-tls-probe: the faulting thread's TLS slots at a fatal guest fault (TEB in x18;
  * x64 layout: TlsSlots[64] at +0x1480, TlsExpansionSlots pointer at +0x1780, the
  * offsets Raft's Mono reads just before its crash). Non-zero entries only, read
@@ -13512,6 +13681,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             else
                                 ERR("  [guest-exact] ml885 block=%p rip=%p (bytes unreadable)\n", (void*)bb, (void*)xrip);
                             ios_guest_fault_context( xrip, REGn_sig(23, context), cs[5] );   /* ml1291 */
+                            ios_guest_obj_probe( context, xrip );   /* ml-guest-obj */
                             ios_sb_fault_state( context, xrip, siginfo->si_addr );
                             ios_tls_probe_dump( REGn_sig(18, context) );   /* ml-tls-probe */
                         }
