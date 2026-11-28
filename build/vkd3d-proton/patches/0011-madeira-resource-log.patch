@@ -1,0 +1,176 @@
+vkd3d-proton: log every resource and heap created ([vkd3d-res], [vkd3d-heap])
+
+Madeira, 2026-11-27. LGPL-2.1-or-later like vkd3d-proton.
+
+PRAGMATA (RE Engine) on vkd3d-proton crashes after its first ResourceBarrier batch,
+looking up a 56 KB, 64 KiB-aligned buffer in a table it never fills. With every
+CheckFeatureSupport answer made identical to Madeira's D3D12 (0009/0010) the crash
+stays, so the difference is in what the API calls do. On Madeira's D3D12 those
+buffers are placed resources in 16 MB heaps. This logs each committed, placed and
+reserved resource (desc, heap properties or heap pointer and offset, initial state,
+result, object pointer) and each heap, so the key the ml-guest-obj probe reports can
+be found and compared with Madeira's "[placed]" lines. 800 resource and 200 heap lines
+at most; MADEIRA_VKD3D_RES_LOG=0 turns it off. The original functions are renamed
+*_vkd3d and called first.
+
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -3644,7 +3644,7 @@
+     return hr;
+ }
+ 
+-HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
++static HRESULT d3d12_resource_create_committed_vkd3d(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+@@ -3886,7 +3886,7 @@
+     return S_OK;
+ }
+ 
+-HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
++static HRESULT d3d12_resource_create_placed_vkd3d(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+@@ -4095,7 +4095,7 @@
+     return hr;
+ }
+ 
+-HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
++static HRESULT d3d12_resource_create_reserved_vkd3d(struct d3d12_device *device,
+         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+@@ -9197,3 +9197,91 @@
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->resource.device_allocation);
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->sampler.device_allocation);
+ }
++
++/* Madeira: PRAGMATA (RE Engine) on vkd3d-proton crashes after its first
++ * ResourceBarrier batch, looking up a 56 KB buffer (64 KiB aligned) in a table it
++ * never fills; with every CheckFeatureSupport answer identical to Madeira's D3D12
++ * (0009/0010) the crash stays. On Madeira's D3D12 those buffers are placed
++ * resources in 16 MB heaps ("[placed] r#N buf 57344 in heapN ..."). Log every
++ * resource and heap vkd3d-proton creates, with the object pointer the game gets,
++ * so the key the guest-obj probe reports can be found here and compared:
++ * "[vkd3d-res] #N committed|placed|reserved dim W x H x D mips fmt flags
++ * align ... heap ... state ... -> hr obj". 800 resource lines and 200 heap lines
++ * at most; MADEIRA_VKD3D_RES_LOG=0 turns it off. Log only. */
++static bool madeira_res_log_on(void)
++{
++    static int on = -1;
++    char env[8];
++
++    if (on < 0)
++        on = !(vkd3d_get_env_var("MADEIRA_VKD3D_RES_LOG", env, sizeof(env)) && env[0] == '0');
++    return on > 0;
++}
++
++static void madeira_res_log(const char *kind, const D3D12_RESOURCE_DESC1 *desc, const char *where,
++        D3D12_RESOURCE_STATES initial_state, HRESULT hr, const struct d3d12_resource *object)
++{
++    static LONG count;
++    LONG n;
++
++    if (!madeira_res_log_on())
++        return;
++    if ((n = InterlockedIncrement(&count)) > 800)
++        return;
++    INFO("[vkd3d-res] #%d %s dim %u %"PRIu64" x %u x %u mips %u fmt %u flags %#x align %#"PRIx64" layout %u %s state %#x -> %#x obj %p\n",
++            (int)n, kind, desc ? (unsigned int)desc->Dimension : 0u, desc ? (uint64_t)desc->Width : 0,
++            desc ? (unsigned int)desc->Height : 0u, desc ? (unsigned int)desc->DepthOrArraySize : 0u,
++            desc ? (unsigned int)desc->MipLevels : 0u, desc ? (unsigned int)desc->Format : 0u,
++            desc ? (unsigned int)desc->Flags : 0u, desc ? (uint64_t)desc->Alignment : 0,
++            desc ? (unsigned int)desc->Layout : 0u, where, (unsigned int)initial_state, (unsigned int)hr,
++            (void *)object);
++}
++
++HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
++        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
++        const D3D12_CLEAR_VALUE *optimized_clear_value,
++        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
++        HANDLE shared_handle, struct d3d12_resource **resource)
++{
++    char where[96];
++    HRESULT hr;
++
++    hr = d3d12_resource_create_committed_vkd3d(device, desc, heap_properties, heap_flags, initial_state,
++            optimized_clear_value, num_castable_formats, castable_formats, shared_handle, resource);
++    snprintf(where, sizeof(where), "heap type %u cpu %u pool %u flags %#x",
++            heap_properties ? (unsigned int)heap_properties->Type : 0u,
++            heap_properties ? (unsigned int)heap_properties->CPUPageProperty : 0u,
++            heap_properties ? (unsigned int)heap_properties->MemoryPoolPreference : 0u, (unsigned int)heap_flags);
++    madeira_res_log("committed", desc, where, initial_state, hr, SUCCEEDED(hr) && resource ? *resource : NULL);
++    return hr;
++}
++
++HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
++        struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
++        const D3D12_CLEAR_VALUE *optimized_clear_value,
++        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
++        struct d3d12_resource **resource)
++{
++    char where[96];
++    HRESULT hr;
++
++    hr = d3d12_resource_create_placed_vkd3d(device, desc, heap, heap_offset, initial_state,
++            optimized_clear_value, num_castable_formats, castable_formats, resource);
++    snprintf(where, sizeof(where), "in heap %p at +%#"PRIx64, (void *)heap, heap_offset);
++    madeira_res_log("placed", desc, where, initial_state, hr, SUCCEEDED(hr) && resource ? *resource : NULL);
++    return hr;
++}
++
++HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
++        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
++        const D3D12_CLEAR_VALUE *optimized_clear_value,
++        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
++        struct d3d12_resource **resource)
++{
++    HRESULT hr;
++
++    hr = d3d12_resource_create_reserved_vkd3d(device, desc, initial_state,
++            optimized_clear_value, num_castable_formats, castable_formats, resource);
++    madeira_res_log("reserved", desc, "-", initial_state, hr, SUCCEEDED(hr) && resource ? *resource : NULL);
++    return hr;
++}
+--- a/libs/vkd3d/heap.c
++++ b/libs/vkd3d/heap.c
+@@ -369,7 +369,7 @@
+     return S_OK;
+ }
+ 
+-HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
++static HRESULT d3d12_heap_create_vkd3d(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
+         void* host_address, struct d3d12_heap **heap)
+ {
+     struct d3d12_heap *object;
+@@ -389,3 +389,28 @@
+     *heap = object;
+     return S_OK;
+ }
++
++/* Madeira: each heap vkd3d-proton creates, next to 0011's [vkd3d-res] lines
++ * (placed resources name the heap pointer). 200 lines at most;
++ * MADEIRA_VKD3D_RES_LOG=0 turns it off. Log only. */
++HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
++        void* host_address, struct d3d12_heap **heap)
++{
++    static LONG count;
++    static int on = -1;
++    char env[8];
++    HRESULT hr;
++    LONG n;
++
++    hr = d3d12_heap_create_vkd3d(device, desc, host_address, heap);
++    if (on < 0)
++        on = !(vkd3d_get_env_var("MADEIRA_VKD3D_RES_LOG", env, sizeof(env)) && env[0] == '0');
++    if (on && (n = InterlockedIncrement(&count)) <= 200)
++        INFO("[vkd3d-heap] #%d size %"PRIu64" type %u cpu %u pool %u align %#"PRIx64" flags %#x host %p -> %#x heap %p\n",
++                (int)n, desc ? (uint64_t)desc->SizeInBytes : 0, desc ? (unsigned int)desc->Properties.Type : 0u,
++                desc ? (unsigned int)desc->Properties.CPUPageProperty : 0u,
++                desc ? (unsigned int)desc->Properties.MemoryPoolPreference : 0u,
++                desc ? (uint64_t)desc->Alignment : 0, desc ? (unsigned int)desc->Flags : 0u,
++                host_address, (unsigned int)hr, SUCCEEDED(hr) && heap ? (void *)*heap : NULL);
++    return hr;
++}
